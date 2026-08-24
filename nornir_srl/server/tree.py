@@ -16,6 +16,7 @@ leaves merged in) by :func:`materialize`.
 from __future__ import annotations
 
 import copy
+import fnmatch
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -28,7 +29,9 @@ __all__ = [
     "insert",
     "delete",
     "get_node",
+    "key_matches",
     "materialize",
+    "select_path",
     "strip_module",
     "strip_values",
 ]
@@ -50,9 +53,12 @@ class ListNode:
     __slots__ = ("entries",)
 
     def __init__(self) -> None:
-        self.entries: Dict[str, Tuple[Dict[str, str], Dict[str, Any]]] = {}
+        # Key values keep the type the device reported them with where it is
+        # known: a Get payload types them, a gNMI path can only spell them out.
+        # Identity goes through _key_ident, so the two forms still collide.
+        self.entries: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
 
-    def entry(self, keys: Dict[str, str]) -> Dict[str, Any]:
+    def entry(self, keys: Dict[str, Any]) -> Dict[str, Any]:
         """Return (creating if needed) the child node for *keys*."""
         ident = _key_ident(keys)
         found = self.entries.get(ident)
@@ -62,18 +68,18 @@ class ListNode:
             return child
         return found[1]
 
-    def put(self, ident: str, keys: Dict[str, str], child: Dict[str, Any]) -> None:
+    def put(self, ident: str, keys: Dict[str, Any], child: Dict[str, Any]) -> None:
         """Store *child* under an explicit identity (used when re-keying)."""
         self.entries[ident] = (dict(keys), child)
 
-    def pop(self, keys: Dict[str, str]) -> None:
+    def pop(self, keys: Dict[str, Any]) -> None:
         self.entries.pop(_key_ident(keys), None)
 
     def __len__(self) -> int:
         return len(self.entries)
 
 
-def _key_ident(keys: Dict[str, str]) -> str:
+def _key_ident(keys: Dict[str, Any]) -> str:
     return ",".join(f"{k}={keys[k]}" for k in sorted(keys))
 
 
@@ -135,7 +141,7 @@ def _as_list_node(parent: Dict[str, Any], name: str, key_names: List[str]) -> Li
             if not isinstance(item, dict):
                 continue
             if key_names and all(k in item for k in key_names):
-                item_keys = {k: str(item[k]) for k in key_names}
+                item_keys = {k: item[k] for k in key_names}
                 entry = node.entry(item_keys)
                 entry.update({k: v for k, v in item.items() if k not in item_keys})
             else:
@@ -145,7 +151,7 @@ def _as_list_node(parent: Dict[str, Any], name: str, key_names: List[str]) -> Li
     elif isinstance(current, dict) and key_names:
         # A single (unkeyed) entry previously stored as a dict.
         if all(k in current for k in key_names):
-            item_keys = {k: str(current[k]) for k in key_names}
+            item_keys = {k: current[k] for k in key_names}
             entry = node.entry(item_keys)
             entry.update({k: v for k, v in current.items() if k not in item_keys})
     parent[name] = node
@@ -255,7 +261,7 @@ def _set_child(
         node = _as_list_node(parent, name, key_names)
         for index, item in enumerate(value):
             if all(k in item for k in key_names):
-                item_keys = {k: str(item[k]) for k in key_names}
+                item_keys = {k: item[k] for k in key_names}
                 # Merge rather than replace: two subscriptions can share an
                 # envelope (``/interface[name=*]/statistics`` and
                 # ``/interface[name=*]/oper-state`` both return ``interface``),
@@ -351,3 +357,112 @@ def materialize(node: Any) -> Any:
     if isinstance(node, list):
         return copy.deepcopy(node)
     return node
+
+
+def key_matches(pattern: str, value: str) -> bool:
+    """Whether a gNMI key predicate matches a list entry's key value.
+
+    Besides literals and the ``*`` wildcard, SR Linux accepts globs in a key
+    value, which the reports use to select a family of entries at once
+    (``interface[name=lag*]``).
+    """
+    if pattern == "*" or pattern == value:
+        return True
+    if "*" in pattern or "?" in pattern:
+        return fnmatch.fnmatchcase(value, pattern)
+    return False
+
+
+def select_path(value: Any, request: str, envelope: str) -> Any:
+    """Restrict a materialized envelope to what the path *request* selects.
+
+    A node's state tree merges every subscription into one structure, so an
+    envelope routinely holds more than the requesting path asked for: once
+    something subscribes to ``/interface[name=*]/statistics``, every interface
+    lives under ``interface``, where a report reading ``/interface[name=lag*]``
+    would otherwise see them all. Re-applying the key predicates of *request*
+    narrows the view back down to what a real ``Get`` on it would have returned.
+
+    The same merging also leaves whole branches behind that *request* never
+    mentions: subscribing to ``.../rib-in-out/rib-in-post/mac-ip-route`` makes
+    SR Linux stream its siblings ``rib-in-pre`` and ``rib-out-post`` as well, and
+    two reports reading different branches of one envelope each see the other's.
+    Getters that walk their response recursively then trip over entries a ``Get``
+    would never have handed them, so the branches off the requested path are
+    dropped too.
+
+    *envelope* is the path the value sits at, so its length says how much of
+    *request* has already been consumed by reaching it.
+    """
+    elems = parse_path(request)
+    depth = len(parse_path(envelope)) if envelope else 0
+    if depth == 0:
+        selected = _select_children(value, elems)
+    else:
+        selected = _select(value, elems[depth - 1 :])
+    if selected is None:  # nothing along the path survived
+        return [] if isinstance(value, list) else {}
+    return selected
+
+
+def _select(value: Any, elems: List[Tuple[str, Dict[str, str]]]) -> Any:
+    """Restrict *value*, which stands for ``elems[0]``, to what *elems* select.
+
+    ``None`` means nothing along the path survived, which lets callers leave the
+    entry out the way a ``Get`` would have.
+    """
+    if not elems:
+        return value
+    value = _matching_entries(value, elems[0][1])
+    rest = elems[1:]
+    if not rest:
+        return value
+    if isinstance(value, list):
+        kept = [_select_children(item, rest) for item in value]
+        return [item for item in kept if item is not None] or None
+    return _select_children(value, rest)
+
+
+def _select_children(container: Any, elems: List[Tuple[str, Dict[str, str]]]) -> Any:
+    """Restrict *container* to the child that ``elems[0]`` names.
+
+    Sibling branches are dropped, since a ``Get`` only ever returns the one the
+    path points at, and a *container* that does not hold the named child at all
+    is dropped with them: the shared tree lists every network-instance an
+    unrelated report ever touched, where a ``Get`` for a BGP RIB path would only
+    have named the ones that actually run BGP. Leaves stay, since they carry the
+    list keys a report projects and cannot confuse a getter that recurses looking
+    for dictionaries.
+    """
+    if not elems or not isinstance(container, dict):
+        return container
+    name = elems[0][0]
+    if name not in container:
+        return None
+    child = _select(container[name], elems)
+    if child is None or child == [] or child == {}:
+        return None
+    leaves = {k: v for k, v in container.items() if not _is_branch(v)}
+    return {**leaves, name: child}
+
+
+def _is_branch(value: Any) -> bool:
+    """Whether *value* is a subtree rather than a leaf or a leaf-list."""
+    if isinstance(value, dict):
+        return True
+    return isinstance(value, list) and any(isinstance(item, dict) for item in value)
+
+
+def _matching_entries(value: Any, keys: Dict[str, str]) -> Any:
+    """Drop the list entries that do not match the key predicates *keys*."""
+    if not keys or not isinstance(value, list):
+        return value
+    return [
+        item
+        for item in value
+        if not isinstance(item, dict)
+        or all(
+            key_matches(pattern, str(item.get(key, "")))
+            for key, pattern in keys.items()
+        )
+    ]

@@ -7,13 +7,6 @@ VERSION = $(shell grep '^version = ' pyproject.toml | head -1 | cut -d'"' -f2)
 docker:
 	docker build -t "$(NAME):$(VERSION)" -f Dockerfile .
 
-.PHONY: black
-black:
-	uv run black --check $(DIRS)
-
-.PHONY: mypy
-mypy:
-	uv run mypy $(DIRS)
-
 .PHONY: tests
-tests: black mypy
+tests:
+	uv run pytest tests

@@ -29,16 +29,23 @@ class FabricStore:
         sample_interval: Optional[int] = None,
         resync_interval: int = 300,
         workers: int = 20,
+        restart_debounce: float = 1.0,
+        idle_timeout: float = 900.0,
     ) -> None:
         self.nornir = nornir
         self.sample_interval = sample_interval
         self.resync_interval = resync_interval
+        self.restart_debounce = restart_debounce
+        self.idle_timeout = idle_timeout
         self._pool = ThreadPoolExecutor(
             max_workers=max(workers, 1), thread_name_prefix="fcli-srv"
         )
         self._streams: Dict[str, HostStream] = {}
         self._connect_errors: Dict[str, str] = {}
-        self._activated: Dict[Tuple[str, str], bool] = {}
+        #: Discovered paths per (node, report). Discovery runs the report getter
+        #: against the live device, so its result is cached; re-asserting the
+        #: paths themselves is cheap and happens on every render.
+        self._specs: Dict[Tuple[str, str], List[SubscriptionSpec]] = {}
         self._activation_errors: Dict[Tuple[str, str], str] = {}
         self._lock = threading.RLock()
         self._stop = threading.Event()
@@ -74,15 +81,34 @@ class FabricStore:
                 name,
                 device,
                 default_sample_interval=self.sample_interval or 15,
+                restart_debounce=self.restart_debounce,
+                idle_timeout=self.idle_timeout,
             )
 
     def _resync_loop(self) -> None:
-        while not self._stop.wait(self.resync_interval):
-            for stream in list(self._streams.values()):
-                try:
-                    stream.resync()
-                except Exception as exc:  # noqa: BLE001 - best effort
-                    logger.debug("%s: resync failed: %s", stream.name, exc)
+        """Re-read one node per tick, spreading a sweep over ``resync_interval``.
+
+        SAMPLE subscriptions refresh the values they carry but rely on the target
+        reporting deletes for entries that disappear, so a periodic full re-read
+        is the safety net. It costs one ``Get`` per subscribed path, which is
+        why nodes are walked round-robin rather than all at once.
+        """
+        cursor = 0
+        while True:
+            names = list(self._streams)
+            if self._stop.wait(self.resync_interval / max(len(names), 1)):
+                return
+            names = list(self._streams)
+            if not names:
+                continue
+            stream = self._streams.get(names[cursor % len(names)])
+            cursor += 1
+            if stream is None:
+                continue
+            try:
+                stream.resync()
+            except Exception as exc:  # noqa: BLE001 - best effort
+                logger.debug("%s: resync failed: %s", stream.name, exc)
 
     def stop(self) -> None:
         self._stop.set()
@@ -124,16 +150,14 @@ class FabricStore:
     # ------------------------------------------------------------------ #
 
     def activate(self, report: Report, hosts: Optional[List[str]] = None) -> None:
-        """Make sure every node streams the paths *report* needs."""
+        """Make sure every node streams the paths *report* needs.
+
+        This runs on every render, not just the first one: re-asserting the paths
+        is what marks them as still in use, so a report someone is watching is
+        never retired from under it.
+        """
         names = hosts if hosts is not None else list(self._streams)
-        pending = []
-        with self._lock:
-            for name in names:
-                if name not in self._streams:
-                    continue
-                if self._activated.get((name, report.name)):
-                    continue
-                pending.append(name)
+        pending = [n for n in names if n in self._streams]
         if not pending:
             return
         list(self._pool.map(lambda n: self._activate_host(report, n), pending))
@@ -143,8 +167,16 @@ class FabricStore:
         if stream is None:
             return
         key = (name, report.name)
+        with self._lock:
+            if key in self._activation_errors:
+                # A node that cannot serve this report is not re-probed.
+                return
+            specs = self._specs.get(key)
         try:
-            specs = self._discover(report, stream)
+            if specs is None:
+                specs = self._discover(report, stream)
+                with self._lock:
+                    self._specs[key] = specs
             stream.ensure_paths(specs)
         except Exception as exc:  # noqa: BLE001 - reported per node in the UI
             logger.warning(
@@ -152,13 +184,6 @@ class FabricStore:
             )
             with self._lock:
                 self._activation_errors[key] = str(exc)
-                # Mark as done so a device that does not support the report is
-                # not re-probed on every refresh.
-                self._activated[key] = True
-            return
-        with self._lock:
-            self._activation_errors.pop(key, None)
-            self._activated[key] = True
 
     def _discover(self, report: Report, stream: HostStream) -> List[SubscriptionSpec]:
         """Determine which gNMI paths a report needs on this node."""
@@ -258,6 +283,10 @@ class FabricStore:
                 {"node": n, "error": e} for n, e in self._connect_errors.items()
             ],
             "subscriptions": sum(len(s["paths"]) for s in streams),
+            # The gRPC sessions a single node spends on us. SR Linux allows 20
+            # per gRPC server by default, shared with every other client, so
+            # this is the number to watch.
+            "max_sessions_per_node": max((s["sessions"] for s in streams), default=0),
             "resync_interval": self.resync_interval,
         }
 

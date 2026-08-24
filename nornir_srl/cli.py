@@ -618,6 +618,12 @@ def server(
         "--resync",
         help="Interval (seconds) for a full gNMI re-read per node; 0 disables it",
     ),
+    idle_timeout: int = typer.Option(
+        900,
+        "--idle-timeout",
+        help="Stop streaming paths no report has read for this long (seconds); "
+        "0 keeps every path subscribed for the lifetime of the server",
+    ),
 ) -> None:
     """Serves live report tables over HTTP, fed by gNMI subscriptions"""
     from .server.app import serve
@@ -637,6 +643,7 @@ def server(
         sample_interval=sample_interval,
         resync_interval=resync,
         refresh=refresh,
+        idle_timeout=idle_timeout,
         log_level=ctx.obj["log_level"],
     )
 

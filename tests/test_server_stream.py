@@ -1,5 +1,7 @@
 """Tests for the per-host gNMI subscription session and the device facades."""
 
+import time
+
 import pytest
 
 from nornir_srl.server.devices import CachedDevice, RecordingDevice
@@ -10,17 +12,28 @@ from .fakes import (
     IFSTATE_RESPONSE,
     IFSTATS_PATH,
     IFSTATS_RESPONSE,
+    LAG_PATH,
+    LAG_RESPONSE,
+    MAC_EMPTY,
+    MAC_PATH,
+    MAC_RESPONSE,
+    RIB_PATH,
+    RIB_RESPONSE,
     LLDP_PATH,
     LLDP_RESPONSE,
     FakeDevice,
     wait_for,
 )
 
+#: The production debounce collapses a page load's worth of report activations
+#: into one re-subscription; tests only need it to be non-blocking.
+TEST_DEBOUNCE = 0.02
+
 
 @pytest.fixture
 def lldp_stream():
     device = FakeDevice({LLDP_PATH: LLDP_RESPONSE})
-    stream = HostStream("leaf1", device)
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
     stream.ensure_paths([SubscriptionSpec(LLDP_PATH, "state", sample_interval=20)])
     yield stream, device
     stream.stop()
@@ -55,7 +68,7 @@ def test_unsubscribed_path_is_not_snapshotted(lldp_stream):
 
 def test_bootstrap_failure_marks_the_path_unstreamable():
     device = FakeDevice({})
-    stream = HostStream("leaf1", device)
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
     stream.ensure_paths([SubscriptionSpec("/does/not/exist")])
     try:
         assert stream.snapshot("/does/not/exist") is None
@@ -73,6 +86,122 @@ def test_status_reports_connection_and_paths(lldp_stream):
     assert status["node"] == "leaf1"
     assert status["paths"][0]["path"] == LLDP_PATH
     assert status["paths"][0]["streaming"] is True
+
+
+def test_status_counts_one_session_for_the_subscription(lldp_stream):
+    stream, _device = lldp_stream
+    assert wait_for(lambda: stream.status()["sessions"] == 1)
+
+
+# --------------------------------------------------------------------------- #
+# keeping the session count down
+# --------------------------------------------------------------------------- #
+
+
+def test_a_burst_of_path_additions_causes_one_resubscribe():
+    """Opening several reports must not cost one Subscribe RPC per report."""
+    device = FakeDevice(
+        {
+            LLDP_PATH: LLDP_RESPONSE,
+            IFSTATS_PATH: IFSTATS_RESPONSE,
+            IFSTATE_PATH: IFSTATE_RESPONSE,
+        }
+    )
+    stream = HostStream("leaf1", device, restart_debounce=0.2)
+    try:
+        for path in (LLDP_PATH, IFSTATS_PATH, IFSTATE_PATH):
+            stream.ensure_paths([SubscriptionSpec(path, "state")])
+        assert wait_for(lambda: device.subscribe_requests)
+        time.sleep(0.5)
+        assert len(device.subscribe_requests) == 1
+        subscribed = {s["path"] for s in device.subscribe_requests[0]["subscription"]}
+        assert subscribed == {LLDP_PATH, IFSTATS_PATH, IFSTATE_PATH}
+    finally:
+        stream.stop()
+
+
+def test_re_asserting_known_paths_does_not_resubscribe(lldp_stream):
+    stream, device = lldp_stream
+    assert wait_for(lambda: device.subscribe_requests)
+    for _ in range(5):
+        stream.ensure_paths([SubscriptionSpec(LLDP_PATH, "state", sample_interval=20)])
+    time.sleep(0.3)
+    assert len(device.subscribe_requests) == 1
+
+
+def test_idle_paths_are_retired():
+    device = FakeDevice({LLDP_PATH: LLDP_RESPONSE})
+    stream = HostStream(
+        "leaf1", device, restart_debounce=TEST_DEBOUNCE, idle_timeout=0.01
+    )
+    try:
+        stream.ensure_paths([SubscriptionSpec(LLDP_PATH, "state")])
+        assert wait_for(lambda: device.subscribe_requests)
+        assert wait_for(lambda: stream.status()["paths"] == [], timeout=5)
+        assert stream.snapshot(LLDP_PATH) is None
+        # the subscription carrying the retired path is torn down as well
+        assert wait_for(lambda: device.subscribers[0].closed)
+    finally:
+        stream.stop()
+
+
+def test_a_glob_path_does_not_see_what_other_paths_added():
+    """The LAG report reads ``interface[name=lag*]``; ifstats reads them all.
+
+    Both land in the same ``interface`` envelope of the shared state tree, so
+    the snapshot has to re-apply the glob or the LAG report grows a row per
+    ethernet interface.
+    """
+    device = FakeDevice(
+        {
+            LAG_PATH: LAG_RESPONSE,
+            IFSTATS_PATH: IFSTATS_RESPONSE,
+            IFSTATE_PATH: IFSTATE_RESPONSE,
+        }
+    )
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    try:
+        stream.ensure_paths([SubscriptionSpec(LAG_PATH, "all")])
+        assert [i["name"] for i in stream.snapshot(LAG_PATH)[0]["interface"]] == [
+            "lag1"
+        ]
+
+        stream.ensure_paths(
+            [SubscriptionSpec(IFSTATS_PATH), SubscriptionSpec(IFSTATE_PATH)]
+        )
+        assert [i["name"] for i in stream.snapshot(LAG_PATH)[0]["interface"]] == [
+            "lag1"
+        ]
+        # the tree holds both, but each path only sees the entries that carry
+        # what it asked for, exactly as its own Get would have reported them
+        assert set(stream.interfaces()) == {"lag1", "ethernet-1/1"}
+        streamed = {i["name"] for i in stream.snapshot(IFSTATS_PATH)[0]["interface"]}
+        assert streamed == {"ethernet-1/1"}
+    finally:
+        stream.stop()
+
+
+def test_a_glob_path_ignores_streamed_entries_it_did_not_ask_for():
+    device = FakeDevice({LAG_PATH: LAG_RESPONSE})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    try:
+        stream.ensure_paths([SubscriptionSpec(LAG_PATH, "all")])
+        assert wait_for(lambda: device.subscribe_requests)
+        device.push("", [("interface[name=ethernet-1/5]/oper-state", "up")])
+        assert wait_for(lambda: "ethernet-1/5" in stream.interfaces())
+        assert [i["name"] for i in stream.snapshot(LAG_PATH)[0]["interface"]] == [
+            "lag1"
+        ]
+    finally:
+        stream.stop()
+
+
+def test_paths_a_report_still_reads_are_not_retired(lldp_stream):
+    stream, _device = lldp_stream
+    stream.idle_timeout = 60.0
+    assert stream.snapshot(LLDP_PATH) is not None
+    assert stream._retire_idle_paths() is False
+    assert stream.status()["paths"][0]["path"] == LLDP_PATH
 
 
 # --------------------------------------------------------------------------- #
@@ -134,6 +263,125 @@ def test_resync_drops_state_the_target_stopped_reporting(lldp_stream):
     )
     stream.resync()
     assert len(stream.snapshot(LLDP_PATH)[0]["system/lldp"]["interface"]) == 2
+
+
+def test_a_report_does_not_see_the_sibling_branches_srlinux_streams():
+    """Subscribing to one branch of ``rib-in-out`` gets the others streamed too.
+
+    The BGP RIB getters recurse through their response to attach path attributes
+    to every route they find, and only the ``rib-in-post`` routes carry the
+    fields they read, so the siblings must not reach them.
+    """
+    device = FakeDevice({RIB_PATH: RIB_RESPONSE})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    try:
+        stream.ensure_paths([SubscriptionSpec(RIB_PATH, "state")])
+        assert wait_for(lambda: device.subscribe_requests)
+        before = stream.status()["last_update"]
+        device.push(
+            "network-instance[name=default]/bgp-rib/"
+            "afi-safi[afi-safi-name=evpn]/evpn/rib-in-out",
+            [("rib-in-pre/mac-ip-route[path-id=0]/attr-id", 2)],
+        )
+        assert wait_for(lambda: stream.status()["last_update"] != before)
+
+        rib_in_out = stream.snapshot(RIB_PATH)[0]["network-instance"][0]["bgp-rib"][
+            "afi-safi"
+        ][0]["evpn"]["rib-in-out"]
+        assert list(rib_in_out) == ["rib-in-post"]
+    finally:
+        stream.stop()
+
+
+# --------------------------------------------------------------------------- #
+# paths that are empty when the report is opened
+# --------------------------------------------------------------------------- #
+
+
+def test_an_empty_path_is_pending_rather_than_unstreamable():
+    """A table with no entries yet says nothing about its envelope shape."""
+    device = FakeDevice({MAC_PATH: MAC_EMPTY})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE, get_ttl=0)
+    try:
+        stream.ensure_paths([SubscriptionSpec(MAC_PATH, "state")])
+        path = stream.status()["paths"][0]
+        assert path["pending"] is True
+        assert path["streaming"] is False
+        assert path["error"] is None
+        # there is nothing to subscribe to yet, so no RPC is spent on it
+        time.sleep(0.2)
+        assert device.subscribe_requests == []
+        # the report still renders, off a TTL-cached Get
+        assert stream.snapshot(MAC_PATH) is None
+        assert stream.direct_get(MAC_PATH, "state") == MAC_EMPTY
+    finally:
+        stream.stop()
+
+
+def test_the_bootstrap_response_serves_the_first_render():
+    device = FakeDevice({MAC_PATH: MAC_EMPTY})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    try:
+        stream.ensure_paths([SubscriptionSpec(MAC_PATH, "state")])
+        after_bootstrap = len(device.gets)
+        CachedDevice(stream).get(paths=[MAC_PATH], datatype="state")
+        assert len(device.gets) == after_bootstrap
+    finally:
+        stream.stop()
+
+
+def test_a_pending_path_starts_streaming_once_it_has_entries():
+    device = FakeDevice({MAC_PATH: MAC_EMPTY})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE, get_ttl=0)
+    try:
+        stream.ensure_paths([SubscriptionSpec(MAC_PATH, "state")])
+        assert stream.status()["paths"][0]["pending"] is True
+
+        # the network learns a MAC; the next render's fallback Get picks it up
+        device.responses[MAC_PATH] = MAC_RESPONSE
+        cached = CachedDevice(stream)
+        assert cached.get(paths=[MAC_PATH], datatype="state") == MAC_RESPONSE
+
+        assert wait_for(lambda: stream.status()["paths"][0]["streaming"])
+        assert wait_for(lambda: device.subscribe_requests)
+        assert device.subscribe_requests[0]["subscription"][0]["path"] == MAC_PATH
+        assert stream.snapshot(MAC_PATH) == MAC_RESPONSE
+    finally:
+        stream.stop()
+
+
+def test_a_promoted_path_then_tracks_streamed_updates():
+    device = FakeDevice({MAC_PATH: MAC_RESPONSE})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    try:
+        stream.ensure_paths([SubscriptionSpec(MAC_PATH, "state")])
+        assert wait_for(lambda: device.subscribe_requests)
+        device.push(
+            "network-instance[name=vrf-1]/bridge-table/mac-table",
+            [("mac[address=00:AA:BB:CC:DD:EE]/destination", "lag2")],
+        )
+        assert wait_for(
+            lambda: len(
+                stream.snapshot(MAC_PATH)[0]["network-instance"][0]["bridge-table"][
+                    "mac-table"
+                ]["mac"]
+            )
+            == 2
+        )
+    finally:
+        stream.stop()
+
+
+def test_a_response_that_cannot_be_placed_in_the_tree_is_not_streamable():
+    device = FakeDevice({"/odd": [{"first": 1, "second": 2}]})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    try:
+        stream.ensure_paths([SubscriptionSpec("/odd", "state")])
+        path = stream.status()["paths"][0]
+        assert path["streaming"] is False
+        assert path["pending"] is False
+    finally:
+        stream.stop()
 
 
 # --------------------------------------------------------------------------- #
@@ -211,7 +459,7 @@ def test_ifstats_report_uses_streamed_counter_samples():
     device = FakeDevice(
         {IFSTATS_PATH: IFSTATS_RESPONSE, IFSTATE_PATH: IFSTATE_RESPONSE}
     )
-    stream = HostStream("leaf1", device)
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
     stream.ensure_paths(
         [
             SubscriptionSpec(IFSTATS_PATH, sample_interval=1),

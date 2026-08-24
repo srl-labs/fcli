@@ -168,6 +168,83 @@ IFSTATE_RESPONSE: List[Dict[str, Any]] = [
     {"interface": [{"name": "ethernet-1/1", "oper-state": "up"}]}
 ]
 
+#: The LAG report selects a family of interfaces by glob, so it shares the
+#: ``interface`` envelope with the wildcard interface subscriptions above.
+LAG_PATH = "/interface[name=lag*]"
+LAG_RESPONSE: List[Dict[str, Any]] = [
+    {
+        "interface": [
+            {
+                "name": "lag1",
+                "oper-state": "up",
+                "lag": {"lag-type": "lacp", "member": [{"name": "ethernet-1/1"}]},
+            }
+        ]
+    }
+]
+
+#: A BGP RIB report reads one branch of ``rib-in-out``, but a subscription on it
+#: makes SR Linux stream the sibling branches too, and the getter walks whatever
+#: it is handed looking for routes to augment.
+RIB_PATH = (
+    "/network-instance[name=*]/bgp-rib/afi-safi[afi-safi-name=evpn]/evpn/"
+    "rib-in-out/rib-in-post/mac-ip-route"
+)
+RIB_RESPONSE: List[Dict[str, Any]] = [
+    {
+        "network-instance": [
+            {
+                "name": "default",
+                "bgp-rib": {
+                    "afi-safi": [
+                        {
+                            "afi-safi-name": "evpn",
+                            "evpn": {
+                                "rib-in-out": {
+                                    "rib-in-post": {
+                                        "mac-ip-route": [
+                                            {
+                                                "path-id": 0,
+                                                "attr-id": 1,
+                                                "used-route": True,
+                                            }
+                                        ]
+                                    }
+                                }
+                            },
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+]
+
+#: A control-plane driven table. SR Linux answers a Get for a subtree that holds
+#: nothing with a notification carrying no updates, which normalizes to ``[{}]``.
+MAC_PATH = "/network-instance[name=*]/bridge-table/mac-table/mac"
+MAC_EMPTY: List[Dict[str, Any]] = [{}]
+MAC_RESPONSE: List[Dict[str, Any]] = [
+    {
+        "network-instance": [
+            {
+                "name": "vrf-1",
+                "bridge-table": {
+                    "mac-table": {
+                        "mac": [
+                            {
+                                "address": "00:11:22:33:44:55",
+                                "destination": "lag1",
+                                "type": "learnt",
+                            }
+                        ]
+                    }
+                },
+            }
+        ]
+    }
+]
+
 SYS_INFO_RESPONSES: Dict[str, List[Dict[str, Any]]] = {
     "/platform/chassis": [
         {

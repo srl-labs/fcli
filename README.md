@@ -492,6 +492,11 @@ to a subset of the fabric (`-i`):
 │ --resync                   INTEGER  Interval (seconds) for a full gNMI       │
 │                                     re-read per node; 0 disables it          │
 │                                     [default: 300]                           │
+│ --idle-timeout             INTEGER  Stop streaming paths no report has read  │
+│                                     for this long (seconds); 0 keeps every   │
+│                                     path subscribed for the lifetime of the  │
+│                                     server                                   │
+│                                     [default: 900]                           │
 │ --help                              Show this message and exit.              │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
@@ -531,13 +536,56 @@ to a subset of the fabric (`-i`):
 3. A gNMI `Subscribe` (STREAM/SAMPLE) then keeps that tree current. Report
    getters run against the tree instead of the device, so a rendered table costs
    no device round-trip at all.
+   One tree per node holds every subscription, so reading it back is not simply a
+   matter of handing over the subtree: reports overlap (`/interface[name=lag*]`
+   and `/interface[name=*]/statistics` both live under `interface`), and SR Linux
+   streams whole subtrees for a subscription on one branch of them. What a report
+   sees is therefore narrowed back down to what its own path selects — matching
+   key predicates, the named branch, and nothing beside it — so a report reads
+   what its own `Get` would have returned rather than what its neighbours put
+   there.
 4. A path that cannot be subscribed to falls back to a short-TTL `Get`, and every
-   node is fully re-read every `--resync` seconds so a missed delete cannot leave
-   a stale row behind.
+   node is re-read every `--resync` seconds so a missed delete cannot leave a
+   stale row behind. Nodes are re-read round-robin rather than all at once, so a
+   sweep spreads its `Get`s over the interval.
+
+Step 2 needs data to work with: SR Linux answers a `Get` for a subtree that holds
+nothing with an empty response, which does not reveal the shape the report getter
+expects. Control-plane driven tables regularly start out that way — no MACs
+learned yet, no ES destinations, no IPv6 neighbours, or a spine that has no
+bridge table at all. Such a path is *pending* rather than broken: it is left out
+of the subscription and served by the short-TTL `Get` of step 4, so the report
+renders as empty instead of failing. The first of those `Get`s that comes back
+with an entry pins down the shape, and the path joins the subscription from then
+on — the table starts streaming by itself, within the `Get` TTL of the first
+entry appearing, with no extra round-trip spent on polling for it. `GET
+/api/status` marks these paths `pending`, and `streaming` once they are live.
 
 The per-report SAMPLE intervals are tuned per report (5s for interface counters,
 60s for system info); `--sample-interval` overrides them all at once.
 `GET /api/status` shows what each node is currently subscribed to.
+
+## gNMI sessions
+
+SR Linux accepts a limited number of concurrent gRPC sessions per gRPC server —
+`/system/grpc-server[name=mgmt]/session-limit`, 20 by default — and that budget
+is shared with every other gRPC client of the node. Every in-flight RPC counts,
+including a long-running `Subscribe`.
+
+The server is built to stay at **one session per node**: all opened reports share
+a single `Subscribe` RPC, and at most one `Get` is in flight per node at a time.
+Since gNMI cannot add paths to a running subscription, growing the path set means
+replacing the RPC; those restarts are batched, so opening a page full of reports
+costs one re-subscribe rather than one per report. Paths that no report has read
+for `--idle-timeout` are dropped again, which keeps the streaming load on the
+node proportional to what is actually being watched.
+
+`GET /api/status` reports `max_sessions_per_node`, and each node's own view is
+available on the device with:
+
+```
+❯ info from state /system grpc-server mgmt client *
+```
 
 ## HTTP API
 

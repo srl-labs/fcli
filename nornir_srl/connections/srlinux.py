@@ -14,6 +14,7 @@ from .interfaces import NetworkInstanceMixin
 from .routing import RoutingMixin
 from .layer2 import Layer2Mixin
 from .neighbor_discovery import NeighborDiscoveryMixin
+from .subscription import GnmiSubscription
 from .system import SystemMixin
 from .ifstats import InterfaceStatsMixin
 
@@ -109,17 +110,18 @@ class SrLinux(
     def gnmi_set(self, **kw):
         return self._connection.set(**kw)
 
-    def gnmi_subscribe(self, subscribe: Dict[str, Any]) -> Any:
+    def gnmi_subscribe(self, subscribe: Dict[str, Any]) -> GnmiSubscription:
         """Open a gNMI Subscribe RPC on this connection.
 
-        Returns the pygnmi subscriber object, which yields parsed telemetry
-        notifications and is closed with ``.close()``. The subscription runs on
-        the same gRPC channel as ``get``/``set``, so it stays tied to the
-        lifetime of this connection.
+        Returns a subscription that yields parsed telemetry notifications and is
+        torn down with ``.close()``. The RPC runs on the same gRPC channel as
+        ``get``/``set``, so it stays tied to the lifetime of this connection.
         """
         if not self._connection:
             raise ConnectionException("no active connection")
-        return self._connection.subscribe2(subscribe=subscribe)
+        return GnmiSubscription(
+            self._connection, subscribe, name=self.hostname or "target"
+        )
 
     def close(self) -> None:
         self._connection.close()

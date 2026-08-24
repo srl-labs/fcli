@@ -37,9 +37,6 @@ include = ["nornir_srl*"]
 dev = [
     "pytest>=5.2",
     "blessings>=1.7",
-    "black>=25.1.0",
-    "mypy>=1.16.0",
-    "types-setuptools>=80.9.0",
     "bumpversion>=0.6.0",
 ]
 

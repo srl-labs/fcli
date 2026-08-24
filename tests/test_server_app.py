@@ -10,7 +10,7 @@ from nornir import InitNornir
 from starlette.testclient import TestClient
 
 from nornir_srl.server.app import create_app, parse_kv, table_digest, table_events
-from nornir_srl.server.reports import REPORTS_BY_NAME, get_report
+from nornir_srl.server.reports import REPORTS, REPORTS_BY_NAME, get_report
 from nornir_srl.server.rows import flatten, get_fields, is_scalar
 from nornir_srl.server.store import FabricStore
 
@@ -67,7 +67,7 @@ def fabric(monkeypatch):
 @pytest.fixture
 def store(fabric):
     nornir, devices = fabric
-    store = FabricStore(nornir, resync_interval=0)
+    store = FabricStore(nornir, resync_interval=0, restart_debounce=0.02)
     store.start()
     yield store, devices
     store.stop()
@@ -76,7 +76,7 @@ def store(fabric):
 @pytest.fixture
 def client(fabric):
     nornir, devices = fabric
-    app = create_app(nornir, resync_interval=0, refresh=0.5)
+    app = create_app(nornir, resync_interval=0, refresh=0.5, restart_debounce=0.02)
     with TestClient(app) as test_client:
         yield test_client, devices
 
@@ -212,6 +212,50 @@ def test_status_lists_subscriptions(store):
     status = fabric_store.status()
     assert status["subscriptions"] == 2
     assert {node["node"] for node in status["nodes"]} == set(HOSTS)
+
+
+# --------------------------------------------------------------------------- #
+# gNMI session budget
+# --------------------------------------------------------------------------- #
+
+
+def test_repeated_renders_do_not_hit_the_node_again(store):
+    """Renders come out of the streamed state, not out of fresh Gets."""
+    fabric_store, devices = store
+    fabric_store.table(get_report("lldp"))
+    settled = len(devices["leaf1"].gets)
+    for _ in range(3):
+        fabric_store.table(get_report("lldp"))
+    assert len(devices["leaf1"].gets) == settled
+
+
+def test_opening_every_report_costs_one_session_per_node(store):
+    """The whole report catalogue shares a single Subscribe RPC per node.
+
+    SR Linux allows 20 concurrent gRPC sessions per server by default, shared
+    with every other client of the node, so the path set growing must not grow
+    the session count with it.
+    """
+    fabric_store, devices = store
+    for report in REPORTS:
+        fabric_store.table(report)
+    assert wait_for(
+        lambda: fabric_store.status()["max_sessions_per_node"] == 1, timeout=10
+    )
+    for device in devices.values():
+        live = [s for s in device.subscribers if not s.closed]
+        assert len(live) == 1
+
+
+def test_rendering_a_report_keeps_its_paths_subscribed(store):
+    fabric_store, devices = store
+    fabric_store.table(get_report("lldp"))
+    assert wait_for(lambda: devices["leaf1"].subscribe_requests)
+    stream = fabric_store._streams["leaf1"]
+    stream.idle_timeout = 60.0
+    fabric_store.table(get_report("lldp"))
+    assert stream._retire_idle_paths() is False
+    assert stream.status()["paths"][0]["path"] == LLDP_PATH
 
 
 # --------------------------------------------------------------------------- #

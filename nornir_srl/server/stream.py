@@ -20,7 +20,15 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..connections.helpers import strip_modules
-from .tree import delete, get_node, insert, join_path, materialize, parse_path
+from .tree import (
+    delete,
+    get_node,
+    insert,
+    join_path,
+    materialize,
+    parse_path,
+    select_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +72,8 @@ class PathState:
     bootstrapped: bool = False
     error: Optional[str] = None
     streamable: bool = True
+    #: When a report last read this path, used to retire unwatched paths.
+    last_read: float = field(default_factory=time.time)
 
 
 class RateTracker:
@@ -102,7 +112,16 @@ class RateTracker:
 
 
 class HostStream:
-    """Streaming state for a single SR Linux node."""
+    """Streaming state for a single SR Linux node.
+
+    Every node is served by exactly one ``Subscribe`` RPC carrying the union of
+    the paths the opened reports need. gNMI cannot add paths to a running
+    subscription, so growing that set means replacing the RPC; restarts are
+    therefore coalesced by a background reconciler instead of being done once
+    per report, and paths nobody reads any more are retired again. That keeps
+    the number of gRPC sessions this node spends near the one-per-node floor,
+    well inside SR Linux's default ``session-limit`` of 20.
+    """
 
     def __init__(
         self,
@@ -112,12 +131,16 @@ class HostStream:
         default_sample_interval: int = 10,
         get_ttl: float = 30.0,
         reconnect_delay: float = 5.0,
+        restart_debounce: float = 1.0,
+        idle_timeout: float = 900.0,
     ) -> None:
         self.name = name
         self.device = device
         self.default_sample_interval = default_sample_interval
         self.get_ttl = get_ttl
         self.reconnect_delay = reconnect_delay
+        self.restart_debounce = restart_debounce
+        self.idle_timeout = idle_timeout
 
         self._lock = threading.RLock()
         self._get_lock = threading.Lock()
@@ -130,34 +153,55 @@ class HostStream:
 
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._closed = threading.Event()
         self._generation = 0
         self._subscription: Any = None
+        self._gets = 0
         self.last_update: Optional[float] = None
         self.connected = False
         self.error: Optional[str] = None
+
+        self._dirty = threading.Event()
+        self._reconciler = threading.Thread(
+            target=self._reconcile,
+            name=f"gnmi-reconcile-{self.name}",
+            daemon=True,
+        )
+        self._reconciler.start()
 
     # ------------------------------------------------------------------ #
     # subscription lifecycle
     # ------------------------------------------------------------------ #
 
     def ensure_paths(self, specs: List[SubscriptionSpec]) -> None:
-        """Make sure every spec in *specs* is subscribed, restarting if needed."""
+        """Make sure every spec in *specs* is subscribed.
+
+        Newly added paths are bootstrapped with a ``Get`` right away so the
+        report that asked for them can be rendered immediately, but replacing
+        the ``Subscribe`` RPC is left to the reconciler, which batches the
+        restarts caused by opening several reports in a row.
+        """
         added = []
+        now = time.time()
         with self._lock:
             for spec in specs:
-                if spec.path in self._paths:
+                state = self._paths.get(spec.path)
+                if state is not None:
+                    state.last_read = now
                     continue
-                self._paths[spec.path] = PathState(spec=spec)
+                self._paths[spec.path] = PathState(spec=spec, last_read=now)
                 added.append(spec)
         if not added:
             return
         for spec in added:
             self._bootstrap(spec, self._tree)
-        self._restart()
+        self._dirty.set()
 
     def _bootstrap(self, spec: SubscriptionSpec, tree: Dict[str, Any]) -> None:
         """Seed *tree* with a gNMI Get and learn the response envelope keys."""
-        state = self._paths[spec.path]
+        state = self._paths.get(spec.path)
+        if state is None:  # retired while we were getting to it
+            return
         try:
             resp = self._raw_get(spec.path, spec.datatype)
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI
@@ -167,15 +211,41 @@ class HostStream:
                 "%s: bootstrap Get failed for %s: %s", self.name, spec.path, exc
             )
             return
+        # Serve the first render from this response instead of repeating the Get
+        # while the path is still pending.
+        self._direct_cache[(spec.path, spec.datatype)] = (time.time(), resp)
+        self._absorb(spec, resp, tree)
+
+    def _absorb(
+        self, spec: SubscriptionSpec, resp: List[Dict[str, Any]], tree: Dict[str, Any]
+    ) -> bool:
+        """Learn the envelope keys of *resp* and seed *tree* with its state.
+
+        Returns whether the path is now bootstrapped, i.e. ready to be streamed.
+
+        SR Linux answers a ``Get`` for a subtree that holds nothing with a
+        notification carrying no updates, which says nothing about the envelope
+        key a ``Get`` caller expects to find. Such a path stays *pending*: it is
+        left out of the subscription and served by a TTL-cached ``Get`` until its
+        first entry appears. Control-plane driven tables (MAC, ES destinations)
+        routinely start out that way.
+        """
+        state = self._paths.get(spec.path)
+        if state is None:
+            return False
         envelopes: List[str] = []
         streamable = True
         hints = _key_hints(spec.path)
         for item in resp:
-            if not isinstance(item, dict) or len(item) != 1:
+            if not isinstance(item, dict):
+                streamable = False
+                break
+            if not item:  # empty subtree: nothing to learn from yet
+                continue
+            if len(item) != 1:
                 # Keyless yang-list responses cannot be placed in the tree;
                 # such a path is served by a TTL-cached Get instead.
                 streamable = False
-                envelopes = []
                 break
             env_key = next(iter(item))
             env_path = "" if env_key in ("/", "") else env_key
@@ -184,10 +254,15 @@ class HostStream:
                 envelopes.append(env_path)
         with self._lock:
             state.streamable = streamable
-            if streamable:
+            if not streamable:
+                state.envelopes = []
+                state.bootstrapped = False
+                return False
+            state.error = None
+            if envelopes:
                 state.envelopes = envelopes
                 state.bootstrapped = True
-                state.error = None
+            return state.bootstrapped
 
     def resync(self) -> None:
         """Rebuild the whole tree from gNMI Gets, dropping any stale state.
@@ -211,8 +286,49 @@ class HostStream:
             self._tree = fresh
         self.last_update = time.time()
 
+    def _reconcile(self) -> None:
+        """Apply pending path-set changes, one restart per burst.
+
+        Opening a report adds its paths and flags the set dirty. Waiting for the
+        flag to stay clear for ``restart_debounce`` before re-subscribing turns
+        the burst of activations that a page load produces into a single new
+        ``Subscribe`` RPC, instead of one per report.
+        """
+        while not self._closed.is_set():
+            if not self._dirty.wait(timeout=1.0):
+                if self._retire_idle_paths():
+                    self._restart()
+                continue
+            while self._dirty.is_set():
+                self._dirty.clear()
+                if self._closed.wait(self.restart_debounce):
+                    return
+            self._restart()
+
+    def _retire_idle_paths(self) -> bool:
+        """Drop paths no report has read for ``idle_timeout``.
+
+        The streamed values stay behind in the tree, but they are unreachable
+        without a :class:`PathState` and get overwritten by a fresh bootstrap if
+        the path is ever asked for again. Returns whether anything was dropped.
+        """
+        if self.idle_timeout <= 0:
+            return False
+        cutoff = time.time() - self.idle_timeout
+        with self._lock:
+            idle = [
+                path for path, state in self._paths.items() if state.last_read < cutoff
+            ]
+            for path in idle:
+                del self._paths[path]
+        if idle:
+            logger.info("%s: retired %d idle path(s)", self.name, len(idle))
+        return bool(idle)
+
     def _restart(self) -> None:
         """(Re)start the subscription thread with the current path set."""
+        if self._closed.is_set():
+            return
         with self._lock:
             self._generation += 1
             generation = self._generation
@@ -222,7 +338,7 @@ class HostStream:
         self._close_subscription()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
-        if not specs:
+        if not specs or self._closed.is_set():
             return
         self._stop.clear()
         self._thread = threading.Thread(
@@ -248,14 +364,14 @@ class HostStream:
             "mode": "stream",
             "encoding": "json_ietf",
         }
-        while not self._stop.is_set() and generation == self._generation:
+        while self._alive(generation):
             try:
                 subscription = self.device.gnmi_subscribe(request)
                 self._subscription = subscription
                 self.connected = True
                 self.error = None
                 logger.info("%s: subscribed to %d path(s)", self.name, len(specs))
-                while not self._stop.is_set() and generation == self._generation:
+                while self._alive(generation):
                     try:
                         message = subscription.get_update(timeout=1.0)
                     except TimeoutError:
@@ -270,18 +386,34 @@ class HostStream:
                 logger.warning("%s: subscription failed: %s", self.name, exc)
             finally:
                 self._close_subscription()
-            if self._stop.is_set() or generation != self._generation:
+            if not self._alive(generation):
                 break
             self._stop.wait(self.reconnect_delay)
         self.connected = False
 
+    def _alive(self, generation: int) -> bool:
+        """Whether the subscription of *generation* should still be running.
+
+        ``_stop`` is cleared again by every restart, so a subscription that
+        raced with :meth:`stop` also has to check ``_closed`` - otherwise it
+        would reconnect and hold a session on the target until the process ends.
+        """
+        return (
+            not self._stop.is_set()
+            and not self._closed.is_set()
+            and generation == self._generation
+        )
+
     def stop(self) -> None:
+        self._closed.set()
         self._stop.set()
         with self._lock:
             self._generation += 1
         self._close_subscription()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
+        if self._reconciler.is_alive():
+            self._reconciler.join(timeout=3)
 
     # ------------------------------------------------------------------ #
     # update handling
@@ -319,11 +451,17 @@ class HostStream:
             state = self._paths.get(path)
             if state is None or not state.bootstrapped or not state.streamable:
                 return None
-            result = []
+            state.last_read = time.time()
+            result: List[Dict[str, Any]] = []
             for env in state.envelopes:
                 node = self._tree if env == "" else get_node(self._tree, env)
                 key = env if env else "/"
-                result.append({key: materialize(node) if node is not None else {}})
+                if node is None:
+                    result.append({key: {}})
+                    continue
+                # The tree is shared by every subscription of this node, so the
+                # envelope can hold entries this path never asked for.
+                result.append({key: select_path(materialize(node), path, env)})
             return result
 
     def interfaces(self) -> List[str]:
@@ -349,10 +487,37 @@ class HostStream:
             return cached[1]
         resp = self._raw_get(path, datatype)
         self._direct_cache[cache_key] = (now, resp)
+        self._promote(path, datatype, resp)
         return resp
 
+    def _promote(self, path: str, datatype: str, resp: List[Dict[str, Any]]) -> None:
+        """Start streaming a pending path once its first data shows up.
+
+        A path that was empty when the report was opened is served by these
+        TTL-cached Gets, so the response that finally carries data is also the
+        one that reveals the envelope key. Learning it here means the path joins
+        the subscription without spending a Get of its own on probing.
+        """
+        with self._lock:
+            state = self._paths.get(path)
+            if (
+                state is None
+                or state.bootstrapped
+                or not state.streamable
+                or state.spec.datatype != datatype
+            ):
+                return
+            spec = state.spec
+        if self._absorb(spec, resp, self._tree):
+            logger.info("%s: %s now has state, subscribing to it", self.name, path)
+            self._dirty.set()
+
     def _raw_get(self, path: str, datatype: str) -> List[Dict[str, Any]]:
+        # Serialized on purpose: an in-flight Get holds a gRPC session on the
+        # target just like the subscription does, and the node's budget is
+        # shared with every other gRPC client.
         with self._get_lock:
+            self._gets += 1
             resp = self.device.get(paths=[path], datatype=datatype)
         return [strip_modules(d) for d in resp] if resp else []
 
@@ -368,6 +533,9 @@ class HostStream:
                     "mode": state.spec.mode,
                     "sample_interval": state.spec.sample_interval,
                     "streaming": state.streamable and state.bootstrapped,
+                    # Empty when the report was opened, so the envelope shape is
+                    # not known yet; served by TTL-cached Gets until it fills up.
+                    "pending": state.streamable and not state.bootstrapped,
                     "error": state.error,
                 }
                 for state in self._paths.values()
@@ -377,6 +545,11 @@ class HostStream:
             "connected": self.connected,
             "error": self.error,
             "last_update": self.last_update,
+            # gRPC sessions this node currently spends on us: the Subscribe RPC
+            # plus at most one in-flight Get.
+            "sessions": (1 if self.connected else 0)
+            + (1 if self._get_lock.locked() else 0),
+            "gets": self._gets,
             "paths": paths,
         }
 

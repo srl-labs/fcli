@@ -105,6 +105,8 @@ def create_app(
     resync_interval: int = 300,
     refresh: float = DEFAULT_REFRESH,
     workers: int = 20,
+    idle_timeout: float = 900.0,
+    restart_debounce: float = 1.0,
 ) -> Starlette:
     """Build the fcli server application around an initialized Nornir inventory."""
     store = FabricStore(
@@ -112,6 +114,8 @@ def create_app(
         sample_interval=sample_interval,
         resync_interval=resync_interval,
         workers=workers,
+        idle_timeout=idle_timeout,
+        restart_debounce=restart_debounce,
     )
 
     @contextlib.asynccontextmanager
@@ -187,6 +191,7 @@ def serve(
     resync_interval: int = 300,
     refresh: float = DEFAULT_REFRESH,
     workers: int = 20,
+    idle_timeout: float = 900.0,
     log_level: str = "info",
 ) -> None:
     """Run the fcli server with uvicorn (blocking)."""
@@ -198,6 +203,7 @@ def serve(
         resync_interval=resync_interval,
         refresh=refresh,
         workers=workers,
+        idle_timeout=idle_timeout,
     )
     uvicorn.run(
         app, host=host, port=port, log_level=log_level.lower(), access_log=False
