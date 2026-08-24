@@ -583,6 +583,17 @@ blanking, dated by the `generated` and `oldest_update` stamps the API returns, a
 the failing `Get` is remembered for the cache TTL so an unreachable node is not
 asked again by every report on every refresh.
 
+Losing a node is noticed in three independent ways, because no one of them
+catches the others: the `Subscribe` RPC reporting an error, a `Get` failing or
+hanging, and updates that were due never arriving. The last one matters more than
+it sounds — if the *route* to a node disappears rather than the node refusing
+connections, the TCP connection simply falls silent, and with no keepalive on it
+gRPC goes on considering the call healthy. Since every path is subscribed in
+SAMPLE mode the target reports on a known interval whether anything changed or
+not, so updates going missing is the signal. This is what the node pane counts:
+`up` means the node is answering, not merely that a connection object exists for
+it.
+
 Underneath that, the gRPC channel is given a `max_reconnect_backoff_ms` of 10s,
 because the default caps the reconnect backoff at two minutes — long enough that a
 node which is briefly gone reads as permanently gone while every call on it fails

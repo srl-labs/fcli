@@ -121,7 +121,16 @@ class FabricStore:
                 stream = self._streams.get(name)
                 if stream is not None:
                     failing = stream.failing_since
-                    if failing is None or now - failing < self.connect_retry_interval:
+                    # Updates that stopped arriving count as much as calls that
+                    # fail: a silently dead subscription is only recovered by a
+                    # new connection, since nothing about it looks broken.
+                    stale = stream.stale_for
+                    if failing is None and stale is None:
+                        continue  # the node is answering
+                    bad_for = max(
+                        now - failing if failing is not None else 0.0, stale or 0.0
+                    )
+                    if bad_for < self.connect_retry_interval:
                         continue
                 last = self._connect_attempts.get(name)
                 if last is not None and now - last < self.connect_retry_interval:

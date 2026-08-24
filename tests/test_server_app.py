@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import time
 
 import pytest
 import yaml
@@ -336,6 +337,29 @@ def test_a_node_whose_subscription_dropped_is_not_counted_as_up(store):
     stream = fabric_store._streams["leaf1"]
     stream.connected = False
     stream.error = "GRPC ERROR: Stream removed"
+
+    hosts = {host["name"]: host for host in fabric_store.inventory()}
+    assert hosts["leaf1"]["connected"] is False
+    assert hosts["spine1"]["connected"] is True
+
+
+def test_a_node_whose_updates_stopped_arriving_is_not_counted_as_up(store):
+    """A subscription can fall silent without the transport reporting anything.
+
+    That is what a vanished route looks like: the connection stays open, gRPC
+    keeps considering the call healthy, and only the missing SAMPLE updates say
+    the node is gone.
+    """
+    fabric_store, _devices = store
+    fabric_store.table(get_report("lldp"))
+    assert wait_for(lambda: all(h["streaming"] for h in fabric_store.inventory()))
+    assert all(host["connected"] for host in fabric_store.inventory())
+
+    stream = fabric_store._streams["leaf1"]
+    interval = min(s.spec.sample_interval for s in stream._paths.values())
+    # Nothing has arrived for well past the interval the node reports on.
+    stream.last_update = time.time() - (interval * 3 + 30)
+    stream._subscribed_at = stream.last_update
 
     hosts = {host["name"]: host for host in fabric_store.inventory()}
     assert hosts["leaf1"]["connected"] is False
