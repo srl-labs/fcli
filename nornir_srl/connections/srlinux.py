@@ -109,6 +109,18 @@ class SrLinux(
     def gnmi_set(self, **kw):
         return self._connection.set(**kw)
 
+    def gnmi_subscribe(self, subscribe: Dict[str, Any]) -> Any:
+        """Open a gNMI Subscribe RPC on this connection.
+
+        Returns the pygnmi subscriber object, which yields parsed telemetry
+        notifications and is closed with ``.close()``. The subscription runs on
+        the same gRPC channel as ``get``/``set``, so it stays tied to the
+        lifetime of this connection.
+        """
+        if not self._connection:
+            raise ConnectionException("no active connection")
+        return self._connection.subscribe2(subscribe=subscribe)
+
     def close(self) -> None:
         self._connection.close()
 

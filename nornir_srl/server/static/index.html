@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>fcli - SR Linux fabric</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230f766e'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='18' fill='white' text-anchor='middle'%3Ef%3C/text%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar">
+        <header class="brand">
+          <span class="brand-mark">fcli</span>
+          <span class="brand-sub">SR Linux fabric</span>
+        </header>
+
+        <div class="side-block">
+          <input
+            id="report-search"
+            class="input"
+            type="search"
+            placeholder="Filter reports…"
+            autocomplete="off"
+          />
+          <nav id="report-list" class="report-list" aria-label="Reports"></nav>
+        </div>
+
+        <div class="side-block nodes-block">
+          <div class="side-title">
+            <span>Nodes</span>
+            <span id="node-summary" class="muted"></span>
+          </div>
+          <ul id="node-list" class="node-list"></ul>
+        </div>
+
+        <footer class="side-foot">
+          <button id="theme-toggle" class="btn btn-ghost" type="button" title="Toggle theme">
+            ◐ theme
+          </button>
+          <span id="version" class="muted"></span>
+        </footer>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div class="topbar-title">
+            <h1 id="report-title">Select a report</h1>
+            <p id="report-desc" class="muted"></p>
+          </div>
+          <div class="topbar-state">
+            <span id="live-dot" class="dot" aria-hidden="true"></span>
+            <span id="live-label" class="muted">idle</span>
+          </div>
+        </header>
+
+        <section class="toolbar">
+          <input
+            id="global-search"
+            class="input grow"
+            type="search"
+            placeholder="Search all columns (regex supported)…"
+            autocomplete="off"
+          />
+          <input
+            id="inv-filter"
+            class="input"
+            type="search"
+            placeholder="Inventory filter, e.g. role=leaf"
+            autocomplete="off"
+            title="Nornir inventory filter: key=value pairs, comma separated"
+          />
+          <label class="field">
+            <span class="muted">refresh</span>
+            <select id="refresh" class="input">
+              <option value="1">1s</option>
+              <option value="2" selected>2s</option>
+              <option value="5">5s</option>
+              <option value="10">10s</option>
+            </select>
+          </label>
+          <button id="pause" class="btn" type="button">⏸ Pause</button>
+          <div class="menu">
+            <button id="columns-btn" class="btn" type="button">⚙ Columns</button>
+            <div id="columns-menu" class="menu-panel" hidden></div>
+          </div>
+          <button id="export" class="btn" type="button">⭳ CSV</button>
+        </section>
+
+        <section id="errors" class="errors" hidden></section>
+
+        <div class="table-wrap" id="table-wrap">
+          <table class="grid" id="grid">
+            <thead>
+              <tr id="head-row"></tr>
+              <tr id="filter-row" class="filter-row"></tr>
+            </thead>
+            <tbody id="grid-body"></tbody>
+          </table>
+          <p id="empty" class="empty" hidden>No data.</p>
+        </div>
+
+        <footer class="statusbar">
+          <span id="row-count" class="muted">—</span>
+          <span id="stream-info" class="muted"></span>
+          <span id="updated" class="muted"></span>
+        </footer>
+      </main>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

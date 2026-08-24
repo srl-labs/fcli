@@ -558,6 +558,7 @@ def main(
     ctx.obj["i_filter"] = i_filter
     ctx.obj["box_type"] = box_type.upper() if box_type else None
     ctx.obj["output"] = output
+    ctx.obj["log_level"] = log_level.value
 
 
 # ------------------------- command helpers -------------------------
@@ -588,6 +589,56 @@ def run_show(
 
 
 # ------------------------- commands -------------------------
+
+
+@app.command()
+def server(
+    ctx: typer.Context,
+    listen: str = typer.Option(
+        "127.0.0.1",
+        "--listen",
+        "-L",
+        help="Address to bind the web server to. Use 0.0.0.0 to expose it on all interfaces",
+    ),
+    port: int = typer.Option(8080, "--port", "-P", help="TCP port to listen on"),
+    sample_interval: Optional[int] = typer.Option(
+        None,
+        "--sample-interval",
+        "-S",
+        help="Override the gNMI SAMPLE interval (seconds) of every subscription",
+    ),
+    refresh: float = typer.Option(
+        2.0,
+        "--refresh",
+        "-R",
+        help="How often (seconds) a table is re-rendered and pushed to the browser",
+    ),
+    resync: int = typer.Option(
+        300,
+        "--resync",
+        help="Interval (seconds) for a full gNMI re-read per node; 0 disables it",
+    ),
+) -> None:
+    """Serves live report tables over HTTP, fed by gNMI subscriptions"""
+    from .server.app import serve
+
+    target: Nornir = ctx.obj["target"]
+    if not target.inventory.hosts:
+        typer.echo("No hosts in the inventory. Check your -c/-t and -i options.")
+        raise typer.Exit(1)
+    typer.echo(
+        f"fcli server on http://{listen}:{port} "
+        f"({len(target.inventory.hosts)} node(s))"
+    )
+    serve(
+        target,
+        host=listen,
+        port=port,
+        sample_interval=sample_interval,
+        resync_interval=resync,
+        refresh=refresh,
+        log_level=ctx.obj["log_level"],
+    )
 
 
 @app.command()
