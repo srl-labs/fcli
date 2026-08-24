@@ -444,6 +444,168 @@ a remote endpoint is reached over, and on which port.
 +-----------------------------------------------------------------------------------------+
 ```
 
+# Web server with live tables
+
+`fcli server` serves the same reports as a web UI, kept up to date by gNMI
+**subscriptions** instead of one-shot polls. Every node in the inventory gets a
+single `Subscribe` RPC carrying the paths the opened reports need, and the
+browser is pushed a new table over server-sent events whenever the data
+actually changes.
+
+The tables are the CLI reports, rendered by the same getters, so a column in the
+browser means what it means in `fcli`. The one CLI report that is not served is
+`routing-pol`, which is nested JSON rather than a table. `bgp-rib` is split into
+one report per route family (and per EVPN route type) so that no report needs
+arguments.
+
+```
+❯ fcli -t topo.clab.yml server
+fcli server on http://127.0.0.1:8080 (6 node(s))
+```
+
+The global options are the same as for the CLI reports, so the server can be
+pointed at a containerlab topology (`-t`), a Nornir config (`-c`) and be scoped
+to a subset of the fabric (`-i`):
+
+```
+❯ fcli -c nornir_config.yaml -i role=leaf server --listen 0.0.0.0 --port 8080
+```
+
+```
+❯ fcli -t topo.clab.yml server --help
+
+ Usage: fcli server [OPTIONS]
+
+ Serves live report tables over HTTP, fed by gNMI subscriptions
+
+╭─ Options ────────────────────────────────────────────────────────────────────╮
+│ --listen           -L      TEXT     Address to bind the web server to. Use   │
+│                                     0.0.0.0 to expose it on all interfaces   │
+│                                     [default: 127.0.0.1]                     │
+│ --port             -P      INTEGER  TCP port to listen on [default: 8080]    │
+│ --sample-interval  -S      INTEGER  Override the gNMI SAMPLE interval        │
+│                                     (seconds) of every subscription          │
+│                                     [default: None]                          │
+│ --refresh          -R      FLOAT    How often (seconds) a table is           │
+│                                     re-rendered and pushed to the browser    │
+│                                     [default: 2.0]                           │
+│ --resync                   INTEGER  Interval (seconds) for a full gNMI       │
+│                                     re-read per node; 0 disables it          │
+│                                     [default: 300]                           │
+│ --idle-timeout             INTEGER  Stop streaming paths no report has read  │
+│                                     for this long (seconds); 0 keeps every   │
+│                                     path subscribed for the lifetime of the  │
+│                                     server                                   │
+│                                     [default: 900]                           │
+│ --help                              Show this message and exit.              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+```
+
+
+> The server binds to localhost by default. It has no authentication of its
+> own, so put it behind a reverse proxy (or keep it on localhost) before
+> exposing it with `--listen 0.0.0.0`.
+
+## In the browser
+
+* **Reports** are listed in the sidebar, grouped by category, with a filter box
+  on top. The selected report is kept in the URL fragment
+  (`http://localhost:8080/#bgp_peers`), so a view can be bookmarked or shared.
+* **Sorting**: click a column header to sort, click again to reverse. Sorting is
+  natural, so `ethernet-1/10` comes after `ethernet-1/2`.
+* **Filtering**: each column has its own filter box, and the search box above
+  the table filters on all visible columns at once. Both accept a regular
+  expression and fall back to a substring match if the expression is not valid
+  (yet).
+* **Inventory filter**: the same `key=value` filter as the CLI's `-i`, applied
+  live — e.g. `role=leaf`.
+* **Live updates**: cells that changed since the previous update flash, and new
+  rows flash as a whole. **Pause** freezes the table without dropping the
+  subscriptions.
+* **Columns** hides columns you do not need, **CSV** downloads exactly what the
+  table currently shows (filters, column selection and all).
+
+## How the live data works
+
+1. When a report is opened for the first time, the server runs its getter once
+   against a recording proxy of the gNMI connection. That yields the exact set
+   of paths the report reads, so the subscription paths never have to be
+   maintained separately from the reports.
+2. Each path is bootstrapped with a regular gNMI `Get`, which seeds a per-node
+   state tree and pins down the response shape the report getter expects.
+3. A gNMI `Subscribe` (STREAM/SAMPLE) then keeps that tree current. Report
+   getters run against the tree instead of the device, so a rendered table costs
+   no device round-trip at all.
+   One tree per node holds every subscription, so reading it back is not simply a
+   matter of handing over the subtree: reports overlap (`/interface[name=lag*]`
+   and `/interface[name=*]/statistics` both live under `interface`), and SR Linux
+   streams whole subtrees for a subscription on one branch of them. What a report
+   sees is therefore narrowed back down to what its own path selects — matching
+   key predicates, the named branch, and nothing beside it — so a report reads
+   what its own `Get` would have returned rather than what its neighbours put
+   there.
+4. A path that cannot be subscribed to falls back to a short-TTL `Get`, and every
+   node is re-read every `--resync` seconds so a missed delete cannot leave a
+   stale row behind. Nodes are re-read round-robin rather than all at once, so a
+   sweep spreads its `Get`s over the interval.
+
+Step 2 needs data to work with: SR Linux answers a `Get` for a subtree that holds
+nothing with an empty response, which does not reveal the shape the report getter
+expects. Control-plane driven tables regularly start out that way — no MACs
+learned yet, no ES destinations, no IPv6 neighbours, or a spine that has no
+bridge table at all. Such a path is *pending* rather than broken: it is left out
+of the subscription and served by the short-TTL `Get` of step 4, so the report
+renders as empty instead of failing. The first of those `Get`s that comes back
+with an entry pins down the shape, and the path joins the subscription from then
+on — the table starts streaming by itself, within the `Get` TTL of the first
+entry appearing, with no extra round-trip spent on polling for it. `GET
+/api/status` marks these paths `pending`, and `streaming` once they are live.
+
+The per-report SAMPLE intervals are tuned per report (5s for interface counters,
+60s for system info); `--sample-interval` overrides them all at once.
+`GET /api/status` shows what each node is currently subscribed to.
+
+## gNMI sessions
+
+SR Linux accepts a limited number of concurrent gRPC sessions per gRPC server —
+`/system/grpc-server[name=mgmt]/session-limit`, 20 by default — and that budget
+is shared with every other gRPC client of the node. Every in-flight RPC counts,
+including a long-running `Subscribe`.
+
+The server is built to stay at **one session per node**: all opened reports share
+a single `Subscribe` RPC, and at most one `Get` is in flight per node at a time.
+Since gNMI cannot add paths to a running subscription, growing the path set means
+replacing the RPC; those restarts are batched, so opening a page full of reports
+costs one re-subscribe rather than one per report. Paths that no report has read
+for `--idle-timeout` are dropped again, which keeps the streaming load on the
+node proportional to what is actually being watched.
+
+`GET /api/status` reports `max_sessions_per_node`, and each node's own view is
+available on the device with:
+
+```
+❯ info from state /system grpc-server mgmt client *
+```
+
+## HTTP API
+
+The UI is a client of a small JSON API, which is just as usable from scripts:
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /api/reports` | The available reports and their metadata |
+| `GET /api/inventory` | Inventory nodes, labels and connection state |
+| `GET /api/status` | Per-node subscription state |
+| `GET /api/report/{name}` | One rendered table as JSON |
+| `GET /api/stream/{name}` | The same table, pushed as server-sent events |
+
+Both report endpoints accept `inv_filter=key=value,key=value`; the stream
+endpoint also accepts `refresh=<seconds>`.
+
+```
+❯ curl -s 'http://localhost:8080/api/report/bgp_peers?inv_filter=role%3Dleaf' | jq '.rows[0]'
+```
+
 # MCP Server for AI Agents
 
 `nornir-srl` includes a Model Context Protocol (MCP) server that exposes `fcli` reports as tools for AI agents (like Claude Desktop or Gemini CLI). This allows AI agents to directly query the operational state of your SR Linux fabric.
