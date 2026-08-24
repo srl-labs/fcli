@@ -17,3 +17,10 @@ def setup_logging(level: str, log_file: Optional[str] = None) -> None:
     )
     # ensure Nornir logs use the same level
     logging.getLogger("nornir").setLevel(numeric_level)
+    # pygnmi attaches an unformatted StreamHandler to its own logger when it is
+    # imported, and still propagates to the root one, so everything it logs
+    # arrives twice: once bare and once through the format above.
+    for name in ("pygnmi", "pygnmi.client"):
+        pygnmi_logger = logging.getLogger(name)
+        for handler in list(pygnmi_logger.handlers):
+            pygnmi_logger.removeHandler(handler)

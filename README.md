@@ -565,6 +565,32 @@ The per-report SAMPLE intervals are tuned per report (5s for interface counters,
 60s for system info); `--sample-interval` overrides them all at once.
 `GET /api/status` shows what each node is currently subscribed to.
 
+Opening a node's gNMI connection reaches it right away, to fetch its TLS
+certificate, so a node that is still booting when the server starts cannot be
+connected to yet. Those nodes are retried in the background — at most once every
+30 seconds, and only while a report covering them is being rendered — so a
+server started alongside the fabric picks each node up as it comes up instead of
+reporting it unreachable until restarted. `GET /api/status` lists the nodes that
+are still unreachable under `unreachable`.
+
+A node that goes away *after* it was connected — a reboot, or the whole lab being
+redeployed — is recovered the same way, at three levels. A `Get` that fails is not
+taken as proof that a path cannot be streamed, so the path stays a candidate and
+the next `--resync` sweep that gets an answer puts it back on the subscription;
+a report that could not be discovered is re-probed rather than written off for
+good. Until an answer comes back the table keeps its last known state rather than
+blanking, dated by the `generated` and `oldest_update` stamps the API returns, and
+the failing `Get` is remembered for the cache TTL so an unreachable node is not
+asked again by every report on every refresh.
+
+Underneath that, the gRPC channel is given a `max_reconnect_backoff_ms` of 10s,
+because the default caps the reconnect backoff at two minutes — long enough that a
+node which is briefly gone reads as permanently gone while every call on it fails
+fast. As a last resort, a node whose `Get`s have been failing, *or hanging*, for
+longer than 30 seconds has its connection replaced outright: a gNMI call carries
+no deadline of its own, and a channel belonging to a container that no longer
+exists cannot be waited back into life.
+
 ## gNMI sessions
 
 SR Linux accepts a limited number of concurrent gRPC sessions per gRPC server —

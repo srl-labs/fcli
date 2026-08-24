@@ -1,5 +1,6 @@
 """Tests for the per-host gNMI subscription session and the device facades."""
 
+import threading
 import time
 
 import pytest
@@ -66,7 +67,12 @@ def test_unsubscribed_path_is_not_snapshotted(lldp_stream):
     assert stream.snapshot("/system/features") is None
 
 
-def test_bootstrap_failure_marks_the_path_unstreamable():
+def test_a_failed_bootstrap_leaves_the_path_pending_with_its_error():
+    """A Get that fails must not be taken as proof the path cannot be streamed.
+
+    The path stays a candidate, so it is retried rather than written off; a node
+    that is merely unreachable would otherwise never come back.
+    """
     device = FakeDevice({})
     stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
     stream.ensure_paths([SubscriptionSpec("/does/not/exist")])
@@ -74,6 +80,7 @@ def test_bootstrap_failure_marks_the_path_unstreamable():
         assert stream.snapshot("/does/not/exist") is None
         status = stream.status()
         assert status["paths"][0]["streaming"] is False
+        assert status["paths"][0]["pending"] is True
         assert "unexpected path" in status["paths"][0]["error"]
     finally:
         stream.stop()
@@ -405,6 +412,111 @@ def test_fallback_gets_are_ttl_cached(lldp_stream):
     for _ in range(5):
         stream.direct_get("/system/features", "state")
     assert len(device.gets) == before + 1
+
+
+def test_a_failing_fallback_get_is_not_repeated_within_the_ttl(lldp_stream):
+    """A down node must not be asked again by every report on every render."""
+    stream, device = lldp_stream
+    device.down = True
+    before = len(device.gets)
+    for _ in range(5):
+        with pytest.raises(Exception):
+            stream.direct_get("/system/features", "state")
+    assert len(device.gets) == before + 1
+
+
+# --------------------------------------------------------------------------- #
+# surviving a node restart
+# --------------------------------------------------------------------------- #
+
+
+def test_a_path_recovers_after_the_node_goes_down_and_comes_back(lldp_stream):
+    """Restarting the lab must not cost the node its subscription for good.
+
+    A resync that runs while the node is down used to write the path off as
+    unstreamable, which dropped it from the subscription and excluded it from
+    every later sweep, so the node stayed dead until the server was restarted.
+    """
+    stream, device = lldp_stream
+    assert wait_for(lambda: stream.status()["paths"][0]["streaming"])
+
+    device.down = True
+    stream.resync()
+    path = stream.status()["paths"][0]
+    assert path["streaming"] or path["pending"], "the path was written off"
+
+    device.down = False
+    stream.resync()
+    assert wait_for(lambda: stream.status()["paths"][0]["streaming"])
+    assert stream.snapshot(LLDP_PATH) == LLDP_RESPONSE
+
+
+def test_a_resync_against_a_down_node_keeps_the_last_known_state(lldp_stream):
+    """Half of a failed re-read must not replace a good tree."""
+    stream, device = lldp_stream
+    before = stream.snapshot(LLDP_PATH)
+    assert before == LLDP_RESPONSE
+
+    device.down = True
+    stream.resync()
+    assert stream.snapshot(LLDP_PATH) == before
+
+
+def test_a_resync_subscribes_a_pending_path_that_gained_state():
+    """The sweep is also what picks up a table that was empty until now."""
+    device = FakeDevice({MAC_PATH: MAC_EMPTY})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    stream.ensure_paths([SubscriptionSpec(MAC_PATH)])
+    try:
+        assert stream.status()["paths"][0]["pending"] is True
+        device.responses[MAC_PATH] = MAC_RESPONSE
+        stream.resync()
+        assert wait_for(lambda: stream.status()["paths"][0]["streaming"])
+        assert stream.snapshot(MAC_PATH) == MAC_RESPONSE
+    finally:
+        stream.stop()
+
+
+def test_a_hanging_get_counts_as_the_node_not_answering():
+    """A Get that never returns leaves the node just as unusable as one that fails.
+
+    gNMI calls carry no deadline, so one issued against an address that stopped
+    being routed blocks until TCP gives up while holding the Get lock. Reporting
+    the node as fine throughout would hide it from the reconnect logic.
+    """
+    release = threading.Event()
+
+    class Hanging(FakeDevice):
+        def get(self, paths, datatype="config", strip_mod=True):
+            release.wait(timeout=10)
+            return super().get(paths, datatype, strip_mod)
+
+    device = Hanging({LLDP_PATH: LLDP_RESPONSE})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    worker = threading.Thread(
+        target=lambda: stream.direct_get(LLDP_PATH, "state"), daemon=True
+    )
+    try:
+        assert stream.failing_since is None
+        worker.start()
+        assert wait_for(lambda: stream.failing_since is not None)
+        release.set()
+        worker.join(timeout=10)
+        assert wait_for(lambda: stream.failing_since is None)
+    finally:
+        release.set()
+        stream.stop()
+
+
+def test_a_node_with_nothing_streamable_is_not_reported_as_connected():
+    device = FakeDevice({})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    stream.ensure_paths([SubscriptionSpec("/does/not/exist")])
+    try:
+        assert wait_for(lambda: stream.status()["connected"] is False)
+        assert stream.status()["sessions"] == 0
+    finally:
+        stream.stop()
 
 
 # --------------------------------------------------------------------------- #

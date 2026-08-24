@@ -9,4 +9,4 @@ docker:
 
 .PHONY: tests
 tests:
-	uv run pytest tests
+	uv run --extra dev pytest tests

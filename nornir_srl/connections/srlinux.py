@@ -88,8 +88,14 @@ class SrLinux(
         """
         target = (hostname, port)
         extras = dict(extras) if extras else {}
-        grpc_options = extras.pop("grpc_options", [])
+        grpc_options = list(extras.pop("grpc_options", []) or [])
         grpc_options.append(("grpc.max_receive_message_length", -1))
+        # When a node goes away - a reboot, or the whole lab being redeployed -
+        # the channel reconnects on an exponential backoff that gRPC caps at two
+        # minutes by default. Calls fail fast in the meantime, so the node reads
+        # as permanently gone for far longer than it is actually down.
+        if not any(name == "grpc.max_reconnect_backoff_ms" for name, _ in grpc_options):
+            grpc_options.append(("grpc.max_reconnect_backoff_ms", 10_000))
         _connection = gNMIclient(
             target=target,
             username=username,

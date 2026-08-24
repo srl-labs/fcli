@@ -49,6 +49,8 @@ class FakeDevice:
     ) -> None:
         self.responses = responses
         self.capabilities = capabilities if capabilities is not None else CAPABILITIES
+        #: Set to make every RPC fail, as a node that is rebooting does.
+        self.down = False
         self.updates: "queue.Queue[Dict[str, Any]]" = queue.Queue()
         self.gets: List[Tuple[str, Optional[str]]] = []
         self.subscribe_requests: List[Dict[str, Any]] = []
@@ -65,12 +67,16 @@ class FakeDevice:
         result: List[Dict[str, Any]] = []
         for path in paths:
             self.gets.append((path, datatype))
+            if self.down:
+                raise RuntimeError("GRPC ERROR: failed to connect to all addresses")
             if path not in self.responses:
                 raise ValueError(f"unexpected path {path}")
             result.extend(self.responses[path])
         return result
 
     def gnmi_subscribe(self, subscribe: Dict[str, Any]) -> FakeSubscriber:
+        if self.down:
+            raise RuntimeError("GRPC ERROR: failed to connect to all addresses")
         self.subscribe_requests.append(subscribe)
         subscriber = FakeSubscriber(self.updates)
         self.subscribers.append(subscriber)

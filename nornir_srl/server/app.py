@@ -107,6 +107,7 @@ def create_app(
     workers: int = 20,
     idle_timeout: float = 900.0,
     restart_debounce: float = 1.0,
+    connect_retry_interval: float = 30.0,
 ) -> Starlette:
     """Build the fcli server application around an initialized Nornir inventory."""
     store = FabricStore(
@@ -116,6 +117,7 @@ def create_app(
         workers=workers,
         idle_timeout=idle_timeout,
         restart_debounce=restart_debounce,
+        connect_retry_interval=connect_retry_interval,
     )
 
     @contextlib.asynccontextmanager

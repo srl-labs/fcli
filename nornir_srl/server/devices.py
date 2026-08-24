@@ -15,7 +15,7 @@ source simply by swapping the ``get`` implementation:
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..connections.ifstats import InterfaceStatsMixin
 from ..connections.interfaces import NetworkInstanceMixin
@@ -50,10 +50,21 @@ class MixinDevice(
 
 
 class RecordingDevice(MixinDevice):
-    """Real device proxy that records every path a report getter requests."""
+    """Real device proxy that records every path a report getter requests.
 
-    def __init__(self, device: Any) -> None:
+    *getter* redirects the Gets themselves, which is how the server runs
+    discovery through a :class:`~nornir_srl.server.stream.HostStream`: they then
+    share the one-Get-at-a-time lock and the failure accounting of every other
+    Get made against the node, instead of going straight to the connection.
+    """
+
+    def __init__(
+        self,
+        device: Any,
+        getter: Optional[Callable[[str, str], List[Dict[str, Any]]]] = None,
+    ) -> None:
         self._device = device
+        self._getter = getter
         self.capabilities = getattr(device, "capabilities", None)
         self.recorded: List[Tuple[str, str]] = []
 
@@ -67,7 +78,14 @@ class RecordingDevice(MixinDevice):
             entry = (path, datatype or "config")
             if entry not in self.recorded:
                 self.recorded.append(entry)
-        return self._device.get(paths=paths, datatype=datatype, strip_mod=strip_mod)
+        if self._getter is None:
+            return self._device.get(
+                paths=paths, datatype=datatype, strip_mod=strip_mod
+            )
+        result: List[Dict[str, Any]] = []
+        for path in paths:
+            result.extend(self._getter(path, datatype or "config"))
+        return result
 
 
 class CachedDevice(MixinDevice):

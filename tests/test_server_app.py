@@ -259,6 +259,197 @@ def test_rendering_a_report_keeps_its_paths_subscribed(store):
 
 
 # --------------------------------------------------------------------------- #
+# connecting
+# --------------------------------------------------------------------------- #
+
+
+def test_a_node_that_was_down_at_startup_is_picked_up_later(fabric, monkeypatch):
+    """A node still booting when the server starts must not stay unreachable.
+
+    Opening a gNMI connection reaches the node to fetch its certificate, so a
+    node that is not up yet fails at startup. Nothing else would retry it: the
+    resync sweep only walks nodes that already connected.
+    """
+    nornir, devices = fabric
+    down = {"leaf1"}
+
+    def get_connection(self, name, config):
+        if self.name in down:
+            raise RuntimeError("The SSL certificate cannot be retrieved")
+        return devices[self.name]
+
+    monkeypatch.setattr(
+        "nornir.core.inventory.Host.get_connection", get_connection, raising=True
+    )
+    fabric_store = FabricStore(
+        nornir,
+        resync_interval=0,
+        restart_debounce=0.02,
+        connect_retry_interval=0.0,
+    )
+    fabric_store.start()
+    try:
+        table = fabric_store.table(get_report("lldp"))
+        assert [e["node"] for e in table["errors"]] == ["leaf1"]
+        assert [n["node"] for n in fabric_store.status()["unreachable"]] == ["leaf1"]
+
+        down.clear()  # the node finishes booting
+        # The render that schedules the retry still reports the node as down,
+        # since reconnecting happens in the background.
+        fabric_store.table(get_report("lldp"))
+        assert wait_for(lambda: "leaf1" in fabric_store._streams, timeout=10)
+
+        table = fabric_store.table(get_report("lldp"))
+        assert table["errors"] == []
+        assert fabric_store.status()["unreachable"] == []
+        assert {row["Node"] for row in table["rows"]} == {"leaf1", "spine1"}
+    finally:
+        fabric_store.stop()
+
+
+def test_a_node_that_stopped_answering_is_not_counted_as_up(store):
+    """'connected' has to mean the node answers, not that a stream object exists.
+
+    The gRPC channel behind the stream outlives the node it was opened to, so
+    the node pane counted every node as up while the whole fabric was down.
+    """
+    fabric_store, devices = store
+    fabric_store.table(get_report("lldp"))
+    assert all(host["connected"] for host in fabric_store.inventory())
+
+    devices["leaf1"].down = True
+    fabric_store._streams["leaf1"].resync()
+
+    hosts = {host["name"]: host for host in fabric_store.inventory()}
+    assert hosts["leaf1"]["connected"] is False
+    assert "GRPC ERROR" in hosts["leaf1"]["error"]
+    assert hosts["spine1"]["connected"] is True
+    assert hosts["spine1"]["error"] is None
+
+
+def test_a_node_whose_subscription_dropped_is_not_counted_as_up(store):
+    """A dropped Subscribe RPC is the fastest evidence a node went away."""
+    fabric_store, devices = store
+    fabric_store.table(get_report("lldp"))
+    assert wait_for(lambda: all(h["streaming"] for h in fabric_store.inventory()))
+
+    stream = fabric_store._streams["leaf1"]
+    stream.connected = False
+    stream.error = "GRPC ERROR: Stream removed"
+
+    hosts = {host["name"]: host for host in fabric_store.inventory()}
+    assert hosts["leaf1"]["connected"] is False
+    assert hosts["spine1"]["connected"] is True
+
+
+def test_a_node_whose_channel_died_is_given_a_new_connection(fabric, monkeypatch):
+    """A redeployed node needs a new connection, not a longer wait.
+
+    Its gRPC channel belongs to the container that went away and keeps failing
+    every call from its own state, so the server has to replace it. Waiting was
+    what left the whole fabric dead in the UI after a lab restart.
+    """
+    nornir, devices = fabric
+    handed: dict = {}
+
+    def get_connection(self, name, config):
+        # The first connection each node gets is one whose calls all fail; any
+        # reconnection after that gets a working one.
+        if handed.setdefault(self.name, 0) == 0:
+            handed[self.name] += 1
+            broken = FakeDevice(_responses())
+            broken.down = True
+            return broken
+        return devices[self.name]
+
+    monkeypatch.setattr(
+        "nornir.core.inventory.Host.get_connection", get_connection, raising=True
+    )
+    fabric_store = FabricStore(
+        nornir,
+        resync_interval=0,
+        restart_debounce=0.02,
+        connect_retry_interval=0.0,
+    )
+    fabric_store.start()
+    try:
+        table = fabric_store.table(get_report("lldp"))
+        assert len(table["errors"]) == 2
+        assert table["rows"] == []
+
+        # The render that notices schedules the reconnect; a later one benefits.
+        assert wait_for(
+            lambda: fabric_store.table(get_report("lldp"))["errors"] == [], timeout=10
+        )
+        table = fabric_store.table(get_report("lldp"))
+        assert {row["Node"] for row in table["rows"]} == {"leaf1", "spine1"}
+    finally:
+        fabric_store.stop()
+
+
+def test_a_report_a_node_could_not_serve_is_probed_again(fabric, monkeypatch):
+    """Discovery failures must not be a permanent verdict either.
+
+    Discovery runs the report's getter against the device, so it fails while the
+    node is down - and the report has to recover once the node is back, without
+    the node itself having to be reconnected.
+    """
+    nornir, devices = fabric
+    monkeypatch.setattr(
+        "nornir.core.inventory.Host.get_connection",
+        lambda self, name, config: devices[self.name],
+        raising=True,
+    )
+    fabric_store = FabricStore(
+        nornir,
+        resync_interval=0,
+        restart_debounce=0.02,
+        connect_retry_interval=0.0,
+    )
+    fabric_store.start()
+    try:
+        for device in devices.values():
+            device.down = True
+        assert len(fabric_store.table(get_report("lldp"))["errors"]) == 2
+
+        for device in devices.values():
+            device.down = False
+        assert wait_for(
+            lambda: fabric_store.table(get_report("lldp"))["errors"] == [], timeout=10
+        )
+    finally:
+        fabric_store.stop()
+
+
+def test_an_unreachable_node_is_not_retried_on_every_render(fabric, monkeypatch):
+    """Retries are rate-limited, so a down node does not slow every render."""
+    nornir, _devices = fabric
+    attempts = []
+
+    def get_connection(self, name, config):
+        attempts.append(self.name)
+        raise RuntimeError("unreachable")
+
+    monkeypatch.setattr(
+        "nornir.core.inventory.Host.get_connection", get_connection, raising=True
+    )
+    fabric_store = FabricStore(
+        nornir,
+        resync_interval=0,
+        restart_debounce=0.02,
+        connect_retry_interval=300.0,
+    )
+    fabric_store.start()
+    try:
+        settled = len(attempts)
+        for _ in range(3):
+            fabric_store.table(get_report("lldp"))
+        assert len(attempts) == settled
+    finally:
+        fabric_store.stop()
+
+
+# --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
 

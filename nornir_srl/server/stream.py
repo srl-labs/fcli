@@ -149,6 +149,8 @@ class HostStream:
         self._direct_cache: Dict[
             Tuple[str, str], Tuple[float, List[Dict[str, Any]]]
         ] = {}
+        #: Failed Gets, kept for the same TTL as successful ones.
+        self._failed_gets: Dict[Tuple[str, str], Tuple[float, Exception]] = {}
         self.rates = RateTracker()
 
         self._thread: Optional[threading.Thread] = None
@@ -157,6 +159,14 @@ class HostStream:
         self._generation = 0
         self._subscription: Any = None
         self._gets = 0
+        #: When the running subscription was established, if there is one.
+        self._subscribed_at: Optional[float] = None
+        #: Start of the current run of consecutively failing Gets, if any.
+        self._failing_since: Optional[float] = None
+        #: When the Get currently in flight started, if there is one.
+        self._get_started: Optional[float] = None
+        #: Why the last Get failed, kept until one succeeds again.
+        self._get_error: Optional[str] = None
         self.last_update: Optional[float] = None
         self.connected = False
         self.error: Optional[str] = None
@@ -197,24 +207,34 @@ class HostStream:
             self._bootstrap(spec, self._tree)
         self._dirty.set()
 
-    def _bootstrap(self, spec: SubscriptionSpec, tree: Dict[str, Any]) -> None:
-        """Seed *tree* with a gNMI Get and learn the response envelope keys."""
+    def _bootstrap(self, spec: SubscriptionSpec, tree: Dict[str, Any]) -> bool:
+        """Seed *tree* with a gNMI Get and learn the response envelope keys.
+
+        Returns whether the ``Get`` itself succeeded, which is a different
+        question from whether the path came out bootstrapped: an empty response
+        is a perfectly good answer that simply leaves the path pending.
+        """
         state = self._paths.get(spec.path)
         if state is None:  # retired while we were getting to it
-            return
+            return False
         try:
             resp = self._raw_get(spec.path, spec.datatype)
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI
-            state.error = str(exc)
-            state.streamable = False
+            # A failed Get says nothing about whether the path can be streamed;
+            # the node is usually just unreachable, e.g. rebooting with the lab.
+            # Leaving the path's own flags alone keeps it retryable: whatever it
+            # was before, it goes back to being that once the node answers.
+            with self._lock:
+                state.error = str(exc)
             logger.warning(
                 "%s: bootstrap Get failed for %s: %s", self.name, spec.path, exc
             )
-            return
+            return False
         # Serve the first render from this response instead of repeating the Get
         # while the path is still pending.
         self._direct_cache[(spec.path, spec.datatype)] = (time.time(), resp)
         self._absorb(spec, resp, tree)
+        return True
 
     def _absorb(
         self, spec: SubscriptionSpec, resp: List[Dict[str, Any]], tree: Dict[str, Any]
@@ -260,6 +280,11 @@ class HostStream:
                 return False
             state.error = None
             if envelopes:
+                # A path that just gained state has to join the subscription,
+                # whether it is brand new, was empty until now, or is coming
+                # back after the node was unreachable.
+                if not state.bootstrapped:
+                    self._dirty.set()
                 state.envelopes = envelopes
                 state.bootstrapped = True
             return state.bootstrapped
@@ -270,18 +295,25 @@ class HostStream:
         SAMPLE subscriptions refresh values but rely on the target sending
         deletes for entries that disappear. A periodic full re-read keeps the
         view self-healing if one is ever missed.
+
+        Paths that are not streaming yet are re-read too, so this doubles as the
+        retry for a node that was unreachable: the first sweep whose Gets come
+        back puts its paths back on the subscription.
         """
         with self._lock:
             specs = [
-                state.spec
-                for state in self._paths.values()
-                if state.streamable and state.bootstrapped
+                state.spec for state in self._paths.values() if state.streamable
             ]
         if not specs:
             return
         fresh: Dict[str, Any] = {}
         for spec in specs:
-            self._bootstrap(spec, fresh)
+            if not self._bootstrap(spec, fresh):
+                # Swapping in a half-read tree would blank the reports of a node
+                # that is merely unreachable. Keeping the old one leaves them on
+                # their last known state, which ``last_update`` dates for the UI.
+                logger.debug("%s: resync aborted at %s", self.name, spec.path)
+                return
         with self._lock:
             self._tree = fresh
         self.last_update = time.time()
@@ -339,6 +371,10 @@ class HostStream:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
         if not specs or self._closed.is_set():
+            # Nothing left to stream, so there is no Subscribe RPC to be
+            # connected by; saying otherwise would leave a stale 'connected'
+            # behind for as long as the node has no streamable path.
+            self.connected = False
             return
         self._stop.clear()
         self._thread = threading.Thread(
@@ -370,6 +406,7 @@ class HostStream:
                 self._subscription = subscription
                 self.connected = True
                 self.error = None
+                self._subscribed_at = time.time()
                 logger.info("%s: subscribed to %d path(s)", self.name, len(specs))
                 while self._alive(generation):
                     try:
@@ -382,8 +419,11 @@ class HostStream:
                         self._apply(message)
             except Exception as exc:  # noqa: BLE001 - retried with backoff
                 self.connected = False
-                self.error = str(exc)
-                logger.warning("%s: subscription failed: %s", self.name, exc)
+                if self._alive(generation):
+                    self.error = str(exc)
+                    logger.warning("%s: subscription failed: %s", self.name, exc)
+                # Otherwise this is the RPC we cancelled ourselves to re-subscribe
+                # with a changed path set, which says nothing about the node.
             finally:
                 self._close_subscription()
             if not self._alive(generation):
@@ -479,13 +519,27 @@ class HostStream:
             return materialize(node) if isinstance(node, dict) else {}
 
     def direct_get(self, path: str, datatype: str) -> List[Dict[str, Any]]:
-        """gNMI Get with a short TTL cache, for paths that are not subscribed."""
+        """gNMI Get with a short TTL cache, for paths that are not subscribed.
+
+        Failures are cached alongside the successes: an unreachable node would
+        otherwise be asked again by every report on every render, which buries
+        the log in gRPC errors and spends the node's session budget on calls
+        that are already known to fail.
+        """
         cache_key = (path, datatype)
         now = time.time()
         cached = self._direct_cache.get(cache_key)
         if cached and now - cached[0] < self.get_ttl:
             return cached[1]
-        resp = self._raw_get(path, datatype)
+        failed = self._failed_gets.get(cache_key)
+        if failed and now - failed[0] < self.get_ttl:
+            raise failed[1]
+        try:
+            resp = self._raw_get(path, datatype)
+        except Exception as exc:  # noqa: BLE001 - re-raised to the caller
+            self._failed_gets[cache_key] = (now, exc)
+            raise
+        self._failed_gets.pop(cache_key, None)
         self._direct_cache[cache_key] = (now, resp)
         self._promote(path, datatype, resp)
         return resp
@@ -510,7 +564,6 @@ class HostStream:
             spec = state.spec
         if self._absorb(spec, resp, self._tree):
             logger.info("%s: %s now has state, subscribing to it", self.name, path)
-            self._dirty.set()
 
     def _raw_get(self, path: str, datatype: str) -> List[Dict[str, Any]]:
         # Serialized on purpose: an in-flight Get holds a gRPC session on the
@@ -518,8 +571,78 @@ class HostStream:
         # shared with every other gRPC client.
         with self._get_lock:
             self._gets += 1
-            resp = self.device.get(paths=[path], datatype=datatype)
+            self._get_started = time.time()
+            try:
+                resp = self.device.get(paths=[path], datatype=datatype)
+            except Exception as exc:
+                # How long the node has been failing decides whether waiting for
+                # it is still worthwhile or the connection itself has to go; see
+                # FabricStore._heal_connections.
+                if self._failing_since is None:
+                    self._failing_since = time.time()
+                self._get_error = str(exc)
+                raise
+            finally:
+                self._get_started = None
+            self._failing_since = None
+            self._get_error = None
         return [strip_modules(d) for d in resp] if resp else []
+
+    def discovery_get(self, path: str, datatype: str) -> List[Dict[str, Any]]:
+        """A Get made while discovering which paths a report needs.
+
+        Uncached on purpose - discovery is what decides the shape of everything
+        that follows - but otherwise accounted for like any other Get.
+        """
+        return self._raw_get(path, datatype)
+
+    @property
+    def failing_since(self) -> Optional[float]:
+        """When this node stopped answering, or ``None`` while it answers.
+
+        A Get that hangs counts as much as one that fails. A gRPC call carries
+        no deadline of its own, so one issued against an address that stopped
+        being routed - a container that was destroyed - blocks until TCP gives
+        up, holding the one-Get-at-a-time lock for as long as it does. The node
+        is equally unusable either way; only the elapsed time tells them apart.
+        """
+        stamps = [t for t in (self._failing_since, self._get_started) if t is not None]
+        return min(stamps) if stamps else None
+
+    @property
+    def stale_for(self) -> Optional[float]:
+        """Seconds by which this node's streamed updates are overdue, if they are.
+
+        A subscription can die without the transport ever reporting it. If the
+        route to the node goes away rather than the node refusing connections,
+        the TCP connection simply falls silent, and there is no keepalive on it
+        to find that out - so gRPC keeps considering the call healthy and the
+        updates just stop.
+
+        What gives it away is the cadence. Every path is subscribed in SAMPLE
+        mode, so the target reports on a known interval whether anything changed
+        or not, and the fastest of those intervals is the one that has to keep
+        being met.
+        """
+        with self._lock:
+            intervals = [
+                state.spec.sample_interval
+                for state in self._paths.values()
+                if state.streamable and state.bootstrapped
+                and state.spec.mode == "sample"
+            ]
+        if not intervals or not self.connected:
+            return None  # nothing is streaming, so nothing is due
+        reference = max(self.last_update or 0.0, self._subscribed_at or 0.0)
+        if reference == 0.0:
+            return None
+        overdue = time.time() - reference - (min(intervals) * 3 + 5)
+        return overdue if overdue > 0 else None
+
+    @property
+    def last_error(self) -> Optional[str]:
+        """The most recent reason this node did not answer, if any."""
+        return self._get_error or self.error
 
     # ------------------------------------------------------------------ #
     # introspection
@@ -550,6 +673,7 @@ class HostStream:
             "sessions": (1 if self.connected else 0)
             + (1 if self._get_lock.locked() else 0),
             "gets": self._gets,
+            "failing_since": self._failing_since,
             "paths": paths,
         }
 

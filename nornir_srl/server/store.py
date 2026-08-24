@@ -31,22 +31,27 @@ class FabricStore:
         workers: int = 20,
         restart_debounce: float = 1.0,
         idle_timeout: float = 900.0,
+        connect_retry_interval: float = 30.0,
     ) -> None:
         self.nornir = nornir
         self.sample_interval = sample_interval
         self.resync_interval = resync_interval
         self.restart_debounce = restart_debounce
         self.idle_timeout = idle_timeout
+        self.connect_retry_interval = connect_retry_interval
         self._pool = ThreadPoolExecutor(
             max_workers=max(workers, 1), thread_name_prefix="fcli-srv"
         )
         self._streams: Dict[str, HostStream] = {}
         self._connect_errors: Dict[str, str] = {}
+        #: When each unconnected node was last attempted, to rate-limit retries.
+        self._connect_attempts: Dict[str, float] = {}
         #: Discovered paths per (node, report). Discovery runs the report getter
         #: against the live device, so its result is cached; re-asserting the
         #: paths themselves is cheap and happens on every render.
         self._specs: Dict[Tuple[str, str], List[SubscriptionSpec]] = {}
-        self._activation_errors: Dict[Tuple[str, str], str] = {}
+        #: Why a node could not serve a report, and when that was decided.
+        self._activation_errors: Dict[Tuple[str, str], Tuple[float, str]] = {}
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._resync_thread: Optional[threading.Thread] = None
@@ -68,6 +73,12 @@ class FabricStore:
             self._resync_thread.start()
 
     def _connect(self, name: str, host: Any) -> None:
+        if self._stop.is_set():
+            # Opening one now would hold a session on the node with nothing left
+            # to close it: connects are queued, so they can outlive the store.
+            return
+        with self._lock:
+            self._connect_attempts[name] = time.time()
         try:
             device = host.get_connection(CONNECTION_NAME, self.nornir.config)
         except Exception as exc:  # noqa: BLE001 - reported per node in the UI
@@ -84,6 +95,64 @@ class FabricStore:
                 restart_debounce=self.restart_debounce,
                 idle_timeout=self.idle_timeout,
             )
+
+    def _heal_connections(self, names: List[str]) -> None:
+        """Reconnect the nodes among *names* whose gNMI connection does not work.
+
+        Two situations end up here. A node that was unreachable when the server
+        started has no connection at all, because opening one reaches the node
+        to fetch its TLS certificate. A node that went away afterwards - one
+        that rebooted, or a whole lab that was redeployed - does have one, but
+        its gRPC channel belongs to the instance that disappeared and keeps
+        answering every call from its own failed state, so it has to be replaced
+        rather than waited on.
+
+        Both are rate-limited to one attempt per ``connect_retry_interval`` and
+        run in the background: the render that schedules one still reports the
+        node as failing, and a later render picks it up. That keeps a node that
+        is slow to fail from holding up the render of every other node.
+        """
+        if self._stop.is_set():
+            return
+        now = time.time()
+        due: List[str] = []
+        with self._lock:
+            for name in names:
+                stream = self._streams.get(name)
+                if stream is not None:
+                    failing = stream.failing_since
+                    if failing is None or now - failing < self.connect_retry_interval:
+                        continue
+                last = self._connect_attempts.get(name)
+                if last is not None and now - last < self.connect_retry_interval:
+                    continue
+                # Stamped before submitting, so concurrent renders queue a node
+                # once rather than once each.
+                self._connect_attempts[name] = now
+                due.append(name)
+        for name in due:
+            host = self.nornir.inventory.hosts.get(name)
+            if host is not None:
+                self._pool.submit(self._reconnect, name, host)
+
+    def _reconnect(self, name: str, host: Any) -> None:
+        """Give *name* a fresh gNMI connection, discarding anything stale."""
+        with self._lock:
+            stream = self._streams.pop(name, None)
+            # Both were learned through the connection that stopped working, so
+            # they are re-discovered against the new one.
+            for key in [k for k in self._specs if k[0] == name]:
+                del self._specs[key]
+            for key in [k for k in self._activation_errors if k[0] == name]:
+                del self._activation_errors[key]
+        if stream is not None:
+            logger.info("%s: gNMI calls stopped working, reconnecting", name)
+            stream.stop()
+            try:
+                host.close_connection(CONNECTION_NAME)
+            except Exception as exc:  # noqa: BLE001 - best effort teardown
+                logger.debug("%s: closing the old connection failed: %s", name, exc)
+        self._connect(name, host)
 
     def _resync_loop(self) -> None:
         """Re-read one node per tick, spreading a sweep over ``resync_interval``.
@@ -129,13 +198,24 @@ class FabricStore:
                     "name": name,
                     "hostname": host.hostname or name,
                     "labels": {k: v for k, v in (host.data or {}).items()},
-                    # 'connected' is about the gNMI session; 'streaming' says
-                    # whether a Subscribe RPC is currently running on it, which
-                    # only happens once a report has been opened.
-                    "connected": stream is not None,
+                    # 'connected' says the node is answering: holding a stream
+                    # object proves nothing, since the gRPC channel behind it
+                    # outlives the node it was opened to. 'streaming' says a
+                    # Subscribe RPC is running on it, which only happens once a
+                    # report has been opened.
+                    # Three different ways of losing a node, because no single
+                    # one of them catches the others: the subscription reporting
+                    # an error, a Get failing or hanging, and updates that were
+                    # due never arriving on a connection nobody declared dead.
+                    "connected": bool(
+                        stream
+                        and stream.error is None
+                        and stream.failing_since is None
+                        and stream.stale_for is None
+                    ),
                     "streaming": bool(stream and stream.connected),
                     "error": self._connect_errors.get(name)
-                    or (stream.error if stream else None),
+                    or (stream.last_error if stream else None),
                     "last_update": stream.last_update if stream else None,
                 }
             )
@@ -168,9 +248,15 @@ class FabricStore:
             return
         key = (name, report.name)
         with self._lock:
-            if key in self._activation_errors:
-                # A node that cannot serve this report is not re-probed.
-                return
+            failed = self._activation_errors.get(key)
+            if failed is not None:
+                # Discovery runs the report's getter against the device, so a
+                # node that cannot serve it is not re-probed on every render.
+                # The reason is often temporary though - the node was rebooting
+                # - so the verdict expires instead of standing for good.
+                if time.time() - failed[0] < self.connect_retry_interval:
+                    return
+                del self._activation_errors[key]
             specs = self._specs.get(key)
         try:
             if specs is None:
@@ -183,7 +269,7 @@ class FabricStore:
                 "%s: activating report '%s' failed: %s", name, report.name, exc
             )
             with self._lock:
-                self._activation_errors[key] = str(exc)
+                self._activation_errors[key] = (time.time(), str(exc))
 
     def _discover(self, report: Report, stream: HostStream) -> List[SubscriptionSpec]:
         """Determine which gNMI paths a report needs on this node."""
@@ -197,7 +283,7 @@ class FabricStore:
                 )
                 for s in report.subscribe
             ]
-        recorder = RecordingDevice(stream.device)
+        recorder = RecordingDevice(stream.device, stream.discovery_get)
         report.getter(recorder)
         interval = self.sample_interval or report.sample_interval
         return [
@@ -217,6 +303,7 @@ class FabricStore:
         """Render *report* across the (filtered) inventory from streamed state."""
         started = time.time()
         names = self._targets(inv_filter)
+        self._heal_connections(names)
         self.activate(report, names)
 
         results = list(self._pool.map(lambda n: self._host_rows(report, n), names))
@@ -259,7 +346,7 @@ class FabricStore:
             return name, [], [], self._connect_errors.get(name, "not connected")
         activation_error = self._activation_errors.get((name, report.name))
         if activation_error:
-            return name, [], [], activation_error
+            return name, [], [], activation_error[1]
         host = self.nornir.inventory.hosts.get(name)
         node = (host.hostname if host and host.hostname else name) or name
         try:
