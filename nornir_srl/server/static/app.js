@@ -86,6 +86,8 @@
     identityColumn: null,
     firstPaint: true,
     viewMode: "tree",
+    collapsedCards: new Set(),
+    collapsedNodes: new Set(),
   };
 
   let overviewTimer = null;
@@ -633,6 +635,30 @@
     }
 
     if (targetEl) {
+      // Ensure parent card is expanded
+      const parentCard = targetEl.closest(".bd-card");
+      if (parentCard && parentCard.classList.contains("is-collapsed")) {
+        parentCard.classList.remove("is-collapsed");
+        const body = parentCard.querySelector(".bd-body");
+        if (body) body.hidden = false;
+        const header = parentCard.querySelector(".bd-header");
+        if (header) header.setAttribute("aria-expanded", "true");
+        const cardKey = parentCard.dataset.cardKey;
+        if (cardKey) state.collapsedCards.delete(cardKey);
+      }
+
+      // Ensure parent node is expanded
+      const parentNode = targetEl.closest(".bd-node");
+      if (parentNode && parentNode.classList.contains("is-collapsed")) {
+        parentNode.classList.remove("is-collapsed");
+        const content = parentNode.querySelector(".bd-node-content");
+        if (content) content.hidden = false;
+        const title = parentNode.querySelector(".bd-node-title");
+        if (title) title.setAttribute("aria-expanded", "true");
+        const nodeKey = parentNode.dataset.nodeKey;
+        if (nodeKey) state.collapsedNodes.delete(nodeKey);
+      }
+
       targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
       targetEl.classList.remove("highlight-pulse");
       void targetEl.offsetWidth; // trigger reflow
@@ -651,8 +677,14 @@
     }
 
     for (const [bdName, bdRows] of bdMap) {
+      const cardKey = `bd:${bdName}`;
+      const isCardCollapsed = state.collapsedCards.has(cardKey);
+
       const card = document.createElement("div");
       card.className = "bd-card";
+      card.dataset.cardKey = cardKey;
+      if (isCardCollapsed) card.classList.add("is-collapsed");
+
       const macVrfFirstName = bdRows.map((r) => r["MAC-VRF"]).find(Boolean) || "";
       if (macVrfFirstName) card.dataset.vrfName = macVrfFirstName;
 
@@ -673,9 +705,17 @@
 
       const header = document.createElement("div");
       header.className = "bd-header";
+      header.setAttribute("role", "button");
+      header.setAttribute("tabindex", "0");
+      header.setAttribute("aria-expanded", isCardCollapsed ? "false" : "true");
 
       const topRow = document.createElement("div");
       topRow.className = "bd-header-top";
+
+      const chevron = document.createElement("span");
+      chevron.className = "bd-chevron";
+      chevron.setAttribute("aria-hidden", "true");
+      chevron.textContent = "▼";
 
       const icon = document.createElement("span");
       icon.className = "bd-icon";
@@ -691,7 +731,7 @@
       badge.className = "bd-badge-count";
       badge.textContent = `${nodesCount} Node${nodesCount === 1 ? "" : "s"}`;
 
-      topRow.append(icon, title, badge);
+      topRow.append(chevron, icon, title, badge);
       header.append(topRow);
 
       const subRow = document.createElement("div");
@@ -714,6 +754,31 @@
 
       const body = document.createElement("div");
       body.className = "bd-body";
+      if (isCardCollapsed) body.hidden = true;
+
+      const toggleCard = () => {
+        const collapsed = card.classList.toggle("is-collapsed");
+        body.hidden = collapsed;
+        header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+        if (collapsed) {
+          state.collapsedCards.add(cardKey);
+        } else {
+          state.collapsedCards.delete(cardKey);
+        }
+      };
+
+      header.addEventListener("click", (e) => {
+        if (e.target.closest("a, button")) return;
+        toggleCard();
+      });
+
+      header.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          if (e.target.closest("a, button")) return;
+          e.preventDefault();
+          toggleCard();
+        }
+      });
 
       const nodeMap = new Map();
       for (const row of bdRows) {
@@ -723,14 +788,63 @@
       }
 
       for (const [nodeName, nodeRows] of nodeMap) {
+        const nodeKey = `${cardKey}:node:${nodeName}`;
+        const isNodeCollapsed = state.collapsedNodes.has(nodeKey);
+
         const nodeDiv = document.createElement("div");
         nodeDiv.className = "bd-node";
         nodeDiv.dataset.node = nodeName;
+        nodeDiv.dataset.nodeKey = nodeKey;
+        if (isNodeCollapsed) nodeDiv.classList.add("is-collapsed");
 
         const nodeTitle = document.createElement("div");
         nodeTitle.className = "bd-node-title";
-        nodeTitle.textContent = `🖥️ Node: ${nodeName}`;
+        nodeTitle.setAttribute("role", "button");
+        nodeTitle.setAttribute("tabindex", "0");
+        nodeTitle.setAttribute("aria-expanded", isNodeCollapsed ? "false" : "true");
+
+        const nodeChevron = document.createElement("span");
+        nodeChevron.className = "bd-node-chevron";
+        nodeChevron.setAttribute("aria-hidden", "true");
+        nodeChevron.textContent = "▼";
+
+        const nodeText = document.createElement("span");
+        nodeText.textContent = `🖥️ Node: ${nodeName}`;
+
+        const nodeBadge = document.createElement("span");
+        nodeBadge.className = "bd-node-count";
+        nodeBadge.textContent = `${nodeRows.length} item${nodeRows.length === 1 ? "" : "s"}`;
+
+        nodeTitle.append(nodeChevron, nodeText, nodeBadge);
         nodeDiv.append(nodeTitle);
+
+        const nodeContent = document.createElement("div");
+        nodeContent.className = "bd-node-content";
+        if (isNodeCollapsed) nodeContent.hidden = true;
+
+        const toggleNode = () => {
+          const collapsed = nodeDiv.classList.toggle("is-collapsed");
+          nodeContent.hidden = collapsed;
+          nodeTitle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+          if (collapsed) {
+            state.collapsedNodes.add(nodeKey);
+          } else {
+            state.collapsedNodes.delete(nodeKey);
+          }
+        };
+
+        nodeTitle.addEventListener("click", (e) => {
+          if (e.target.closest("a, button")) return;
+          toggleNode();
+        });
+
+        nodeTitle.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            if (e.target.closest("a, button")) return;
+            e.preventDefault();
+            toggleNode();
+          }
+        });
 
         for (const row of nodeRows) {
           const vrfDiv = document.createElement("div");
@@ -849,8 +963,9 @@
           }
 
           vrfDiv.append(details);
-          nodeDiv.append(vrfDiv);
+          nodeContent.append(vrfDiv);
         }
+        nodeDiv.append(nodeContent);
         body.append(nodeDiv);
       }
       card.append(body);
@@ -868,8 +983,14 @@
     }
 
     for (const [routerName, rRows] of routerMap) {
+      const cardKey = `router:${routerName}`;
+      const isCardCollapsed = state.collapsedCards.has(cardKey);
+
       const card = document.createElement("div");
       card.className = "bd-card";
+      card.dataset.cardKey = cardKey;
+      if (isCardCollapsed) card.classList.add("is-collapsed");
+
       const ipVrfFirstName = rRows.map((r) => r["IP-VRF"]).find(Boolean) || "";
       if (ipVrfFirstName) card.dataset.vrfName = ipVrfFirstName;
 
@@ -879,9 +1000,17 @@
 
       const header = document.createElement("div");
       header.className = "bd-header";
+      header.setAttribute("role", "button");
+      header.setAttribute("tabindex", "0");
+      header.setAttribute("aria-expanded", isCardCollapsed ? "false" : "true");
 
       const topRow = document.createElement("div");
       topRow.className = "bd-header-top";
+
+      const chevron = document.createElement("span");
+      chevron.className = "bd-chevron";
+      chevron.setAttribute("aria-hidden", "true");
+      chevron.textContent = "▼";
 
       const icon = document.createElement("span");
       icon.className = "bd-icon";
@@ -897,7 +1026,7 @@
       badge.className = "bd-badge-count";
       badge.textContent = `${nodesCount} Node${nodesCount === 1 ? "" : "s"}`;
 
-      topRow.append(icon, title, badge);
+      topRow.append(chevron, icon, title, badge);
       header.append(topRow);
 
       const subRow = document.createElement("div");
@@ -921,6 +1050,31 @@
 
       const body = document.createElement("div");
       body.className = "bd-body";
+      if (isCardCollapsed) body.hidden = true;
+
+      const toggleCard = () => {
+        const collapsed = card.classList.toggle("is-collapsed");
+        body.hidden = collapsed;
+        header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+        if (collapsed) {
+          state.collapsedCards.add(cardKey);
+        } else {
+          state.collapsedCards.delete(cardKey);
+        }
+      };
+
+      header.addEventListener("click", (e) => {
+        if (e.target.closest("a, button")) return;
+        toggleCard();
+      });
+
+      header.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          if (e.target.closest("a, button")) return;
+          e.preventDefault();
+          toggleCard();
+        }
+      });
 
       const nodeMap = new Map();
       for (const row of rRows) {
@@ -930,14 +1084,63 @@
       }
 
       for (const [nodeName, nodeRows] of nodeMap) {
+        const nodeKey = `${cardKey}:node:${nodeName}`;
+        const isNodeCollapsed = state.collapsedNodes.has(nodeKey);
+
         const nodeDiv = document.createElement("div");
         nodeDiv.className = "bd-node";
         nodeDiv.dataset.node = nodeName;
+        nodeDiv.dataset.nodeKey = nodeKey;
+        if (isNodeCollapsed) nodeDiv.classList.add("is-collapsed");
 
         const nodeTitle = document.createElement("div");
         nodeTitle.className = "bd-node-title";
-        nodeTitle.textContent = `🖥️ Node: ${nodeName}`;
+        nodeTitle.setAttribute("role", "button");
+        nodeTitle.setAttribute("tabindex", "0");
+        nodeTitle.setAttribute("aria-expanded", isNodeCollapsed ? "false" : "true");
+
+        const nodeChevron = document.createElement("span");
+        nodeChevron.className = "bd-node-chevron";
+        nodeChevron.setAttribute("aria-hidden", "true");
+        nodeChevron.textContent = "▼";
+
+        const nodeText = document.createElement("span");
+        nodeText.textContent = `🖥️ Node: ${nodeName}`;
+
+        const nodeBadge = document.createElement("span");
+        nodeBadge.className = "bd-node-count";
+        nodeBadge.textContent = `${nodeRows.length} item${nodeRows.length === 1 ? "" : "s"}`;
+
+        nodeTitle.append(nodeChevron, nodeText, nodeBadge);
         nodeDiv.append(nodeTitle);
+
+        const nodeContent = document.createElement("div");
+        nodeContent.className = "bd-node-content";
+        if (isNodeCollapsed) nodeContent.hidden = true;
+
+        const toggleNode = () => {
+          const collapsed = nodeDiv.classList.toggle("is-collapsed");
+          nodeContent.hidden = collapsed;
+          nodeTitle.setAttribute("aria-expanded", collapsed ? "false" : "true");
+          if (collapsed) {
+            state.collapsedNodes.add(nodeKey);
+          } else {
+            state.collapsedNodes.delete(nodeKey);
+          }
+        };
+
+        nodeTitle.addEventListener("click", (e) => {
+          if (e.target.closest("a, button")) return;
+          toggleNode();
+        });
+
+        nodeTitle.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            if (e.target.closest("a, button")) return;
+            e.preventDefault();
+            toggleNode();
+          }
+        });
 
         for (const row of nodeRows) {
           const vrfDiv = document.createElement("div");
@@ -1051,13 +1254,70 @@
           }
 
           vrfDiv.append(details);
-          nodeDiv.append(vrfDiv);
+          nodeContent.append(vrfDiv);
         }
+        nodeDiv.append(nodeContent);
         body.append(nodeDiv);
       }
       card.append(body);
       dom.servicesTreeView.append(card);
     }
+  }
+
+  function renderTreeControls() {
+    const controls = document.createElement("div");
+    controls.className = "tree-controls";
+
+    const expandBtn = document.createElement("button");
+    expandBtn.className = "btn btn-sm";
+    expandBtn.type = "button";
+    expandBtn.textContent = "📂 Expand All";
+    expandBtn.addEventListener("click", () => {
+      state.collapsedCards.clear();
+      state.collapsedNodes.clear();
+      dom.servicesTreeView.querySelectorAll(".bd-card.is-collapsed").forEach((card) => {
+        card.classList.remove("is-collapsed");
+        const body = card.querySelector(".bd-body");
+        if (body) body.hidden = false;
+        const header = card.querySelector(".bd-header");
+        if (header) header.setAttribute("aria-expanded", "true");
+      });
+      dom.servicesTreeView.querySelectorAll(".bd-node.is-collapsed").forEach((node) => {
+        node.classList.remove("is-collapsed");
+        const content = node.querySelector(".bd-node-content");
+        if (content) content.hidden = false;
+        const title = node.querySelector(".bd-node-title");
+        if (title) title.setAttribute("aria-expanded", "true");
+      });
+    });
+
+    const collapseBtn = document.createElement("button");
+    collapseBtn.className = "btn btn-sm";
+    collapseBtn.type = "button";
+    collapseBtn.textContent = "📁 Collapse All";
+    collapseBtn.addEventListener("click", () => {
+      dom.servicesTreeView.querySelectorAll(".bd-card").forEach((card) => {
+        const cardKey = card.dataset.cardKey;
+        if (cardKey) state.collapsedCards.add(cardKey);
+        card.classList.add("is-collapsed");
+        const body = card.querySelector(".bd-body");
+        if (body) body.hidden = true;
+        const header = card.querySelector(".bd-header");
+        if (header) header.setAttribute("aria-expanded", "false");
+      });
+      dom.servicesTreeView.querySelectorAll(".bd-node").forEach((node) => {
+        const nodeKey = node.dataset.nodeKey;
+        if (nodeKey) state.collapsedNodes.add(nodeKey);
+        node.classList.add("is-collapsed");
+        const content = node.querySelector(".bd-node-content");
+        if (content) content.hidden = true;
+        const title = node.querySelector(".bd-node-title");
+        if (title) title.setAttribute("aria-expanded", "false");
+      });
+    });
+
+    controls.append(expandBtn, collapseBtn);
+    return controls;
   }
 
   function renderBridgeDomainsTree(rows) {
@@ -1069,6 +1329,8 @@
       dom.servicesTreeView.append(p);
       return;
     }
+
+    dom.servicesTreeView.append(renderTreeControls());
 
     const bdRows = rows.filter((r) => r["Bridge Domain"] || r["MAC-VRF"] || r["Service Type"] === "Bridge Domain");
     const routerRows = rows.filter((r) => r["Router"] || r["IP-VRF"] || r["Service Type"] === "Router");
