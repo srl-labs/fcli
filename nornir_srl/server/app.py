@@ -143,6 +143,10 @@ def create_app(
     async def status(_request: Request) -> Response:
         return JSONResponse(await anyio.to_thread.run_sync(store.status))
 
+    async def overview(request: Request) -> Response:
+        inv_filter = parse_kv(request.query_params.get("inv_filter"))
+        return JSONResponse(await anyio.to_thread.run_sync(store.overview, inv_filter))
+
     async def report_once(request: Request) -> Response:
         try:
             report = get_report(request.path_params["name"])
@@ -174,6 +178,7 @@ def create_app(
         Route("/api/reports", reports),
         Route("/api/inventory", inventory),
         Route("/api/status", status),
+        Route("/api/overview", overview),
         Route("/api/report/{name}", report_once),
         Route("/api/stream/{name}", report_stream),
         Mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static"),

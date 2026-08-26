@@ -54,6 +54,19 @@ def _bgp_rib(
 
 REPORTS: List[Report] = [
     Report(
+        name="overview",
+        title="Overview",
+        description="Executive Fabric KPI dashboard and health metrics.",
+        resource="overview",
+        getter=lambda d: {},
+        category="Dashboard",
+        subscribe=[
+            SubscriptionSpec("/interface[name=*]/statistics", sample_interval=10),
+            SubscriptionSpec("/interface[name=*]/oper-state", sample_interval=10),
+            SubscriptionSpec("/network-instance[name=*]/protocols/bgp/neighbor", datatype="all", sample_interval=10),
+        ],
+    ),
+    Report(
         name="sys_info",
         title="System Info",
         description="Chassis type, serial, software version and last boot time.",
@@ -61,6 +74,10 @@ REPORTS: List[Report] = [
         getter=lambda d: d.get_info(),
         category="System",
         sample_interval=60,
+        subscribe=[
+            SubscriptionSpec("/platform/chassis", datatype="state"),
+            SubscriptionSpec("/platform/control[slot=A]", datatype="state"),
+        ],
     ),
     Report(
         name="ifstats",
@@ -84,6 +101,9 @@ REPORTS: List[Report] = [
         getter=lambda d: d.get_sum_subitf(),
         category="Interfaces",
         sample_interval=20,
+        subscribe=[
+            SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=20),
+        ],
     ),
     Report(
         name="lag",
@@ -93,6 +113,9 @@ REPORTS: List[Report] = [
         getter=lambda d: d.get_lag(),
         category="Interfaces",
         sample_interval=20,
+        subscribe=[
+            SubscriptionSpec("/interface[name=lag*]", datatype="all", sample_interval=20),
+        ],
     ),
     Report(
         name="ni",
@@ -102,6 +125,10 @@ REPORTS: List[Report] = [
         getter=lambda d: d.get_nwi_itf(),
         category="Interfaces",
         sample_interval=30,
+        subscribe=[
+            SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=30),
+            SubscriptionSpec("/network-instance[name=*]", datatype="all", sample_interval=30),
+        ],
     ),
     Report(
         name="bgp_peers",
@@ -111,6 +138,9 @@ REPORTS: List[Report] = [
         getter=lambda d: d.get_sum_bgp(),
         category="BGP",
         sample_interval=10,
+        subscribe=[
+            SubscriptionSpec("/network-instance[name=*]/protocols/bgp/neighbor", datatype="all", sample_interval=10),
+        ],
     ),
     Report(
         name="bgp_rib_evpn_1",
@@ -191,6 +221,11 @@ REPORTS: List[Report] = [
         resource="ip_rib",
         getter=lambda d: d.get_rib(afi="ipv4-unicast"),
         category="Routing",
+        subscribe=[
+            SubscriptionSpec("/network-instance[name=*]/route-table/ipv4-unicast", datatype="state"),
+            SubscriptionSpec("/network-instance[name=*]/route-table/next-hop-group[index=*]", datatype="state"),
+            SubscriptionSpec("/network-instance[name=*]/route-table/next-hop[index=*]", datatype="state"),
+        ],
     ),
     Report(
         name="ipv6_rib",
@@ -199,6 +234,11 @@ REPORTS: List[Report] = [
         resource="ip_rib",
         getter=lambda d: d.get_rib(afi="ipv6-unicast"),
         category="Routing",
+        subscribe=[
+            SubscriptionSpec("/network-instance[name=*]/route-table/ipv6-unicast", datatype="state"),
+            SubscriptionSpec("/network-instance[name=*]/route-table/next-hop-group[index=*]", datatype="state"),
+            SubscriptionSpec("/network-instance[name=*]/route-table/next-hop[index=*]", datatype="state"),
+        ],
     ),
     Report(
         name="static_routes",
@@ -208,6 +248,9 @@ REPORTS: List[Report] = [
         getter=lambda d: d.get_static_routes(),
         category="Routing",
         sample_interval=30,
+        subscribe=[
+            SubscriptionSpec("/network-instance[name=*]/static-routes", datatype="all", sample_interval=30),
+        ],
     ),
     Report(
         name="tunnel_table",
@@ -216,6 +259,45 @@ REPORTS: List[Report] = [
         resource="tunnel_table",
         getter=lambda d: d.get_tunnel_table(),
         category="Routing",
+    ),
+    Report(
+        name="services",
+        title="Services",
+        description="EVPN Bridge Domains (MAC-VRF) and Routers (IP-VRF) grouped by Route-Target.",
+        resource="services",
+        getter=lambda d: d.get_services(),
+        category="Services",
+        sample_interval=20,
+        subscribe=[
+            SubscriptionSpec("/network-instance[name=*]", datatype="all", sample_interval=20),
+            SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=20),
+        ],
+    ),
+    Report(
+        name="bridge_domains",
+        title="Bridge Domains",
+        description="EVPN Bridge Domains (MAC-VRF) grouped by Route-Target with bound access sub-interfaces and VXLAN overlays.",
+        resource="bridge_domains",
+        getter=lambda d: d.get_bridge_domains(),
+        category="Services",
+        sample_interval=20,
+        subscribe=[
+            SubscriptionSpec("/network-instance[name=*]", datatype="all", sample_interval=20),
+            SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=20),
+        ],
+    ),
+    Report(
+        name="routers",
+        title="Routers",
+        description="EVPN Routers (IP-VRF) grouped by Route-Target with bound MAC-VRFs, routed sub-interfaces and VXLAN overlays.",
+        resource="routers",
+        getter=lambda d: d.get_routers(),
+        category="Services",
+        sample_interval=20,
+        subscribe=[
+            SubscriptionSpec("/network-instance[name=*]", datatype="all", sample_interval=20),
+            SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=20),
+        ],
     ),
     Report(
         name="mac",
@@ -234,6 +316,10 @@ REPORTS: List[Report] = [
         getter=lambda d: d.get_irb(),
         category="EVPN / L2",
         sample_interval=30,
+        subscribe=[
+            SubscriptionSpec("/interface[name=irb*]/subinterface", datatype="all", sample_interval=30),
+            SubscriptionSpec("/network-instance[name=*]", datatype="config", sample_interval=30),
+        ],
     ),
     Report(
         name="es",
@@ -270,6 +356,9 @@ REPORTS: List[Report] = [
         getter=lambda d: d.get_lldp_sum(),
         category="Neighbors",
         sample_interval=20,
+        subscribe=[
+            SubscriptionSpec("/system/lldp/interface[name=*]/neighbor", datatype="state", sample_interval=20),
+        ],
     ),
     Report(
         name="arp",
@@ -278,6 +367,10 @@ REPORTS: List[Report] = [
         resource="arp",
         getter=lambda d: d.get_arp(),
         category="Neighbors",
+        subscribe=[
+            SubscriptionSpec("/interface[name=*]/subinterface[index=*]/ipv4/arp/neighbor", datatype="all"),
+            SubscriptionSpec("/network-instance[name=*]", datatype="config"),
+        ],
     ),
     Report(
         name="nd",
@@ -286,6 +379,9 @@ REPORTS: List[Report] = [
         resource="nd",
         getter=lambda d: d.get_nd(),
         category="Neighbors",
+        subscribe=[
+            SubscriptionSpec("/interface[name=*]/subinterface[index=*]/ipv6/neighbor-discovery/neighbor", datatype="all"),
+        ],
     ),
 ]
 

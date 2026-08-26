@@ -23,7 +23,7 @@ from ..connections.layer2 import Layer2Mixin
 from ..connections.neighbor_discovery import NeighborDiscoveryMixin
 from ..connections.routing import RoutingMixin
 from ..connections.system import SystemMixin
-from .stream import HostStream
+from .stream import HostStream, _suppress_pygnmi_client_logging
 
 logger = logging.getLogger(__name__)
 
@@ -79,9 +79,10 @@ class RecordingDevice(MixinDevice):
             if entry not in self.recorded:
                 self.recorded.append(entry)
         if self._getter is None:
-            return self._device.get(
-                paths=paths, datatype=datatype, strip_mod=strip_mod
-            )
+            with _suppress_pygnmi_client_logging():
+                return self._device.get(
+                    paths=paths, datatype=datatype, strip_mod=strip_mod
+                )
         result: List[Dict[str, Any]] = []
         for path in paths:
             result.extend(self._getter(path, datatype or "config"))

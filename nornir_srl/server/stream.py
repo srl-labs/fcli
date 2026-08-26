@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +32,44 @@ from .tree import (
 )
 
 logger = logging.getLogger(__name__)
+
+_pygnmi_suppress_lock = threading.Lock()
+_pygnmi_suppress_depth = 0
+_pygnmi_suppress_saved = None
+
+
+@contextmanager
+def _suppress_pygnmi_client_logging():
+    global _pygnmi_suppress_depth, _pygnmi_suppress_saved
+    log = logging.getLogger("pygnmi.client")
+    with _pygnmi_suppress_lock:
+        if _pygnmi_suppress_depth == 0:
+            _pygnmi_suppress_saved = (list(log.handlers), log.level, log.propagate)
+            log.handlers.clear()
+            log.setLevel(logging.CRITICAL + 1)
+            log.propagate = False
+        _pygnmi_suppress_depth += 1
+    try:
+        yield
+    finally:
+        with _pygnmi_suppress_lock:
+            _pygnmi_suppress_depth -= 1
+            if _pygnmi_suppress_depth == 0 and _pygnmi_suppress_saved is not None:
+                handlers, prev_level, prev_propagate = _pygnmi_suppress_saved
+                _pygnmi_suppress_saved = None
+                log.setLevel(prev_level)
+                log.propagate = prev_propagate
+                for h in handlers:
+                    log.addHandler(h)
+
+
+def _gnmi_path_missing(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    if "path not valid" in text and (
+        "unknown element" in text or "l3vpn" in text or "unknown path" in text
+    ):
+        return True
+    return False
 
 # Counters used to derive interface rates from consecutive streamed samples.
 IFSTATS_COUNTERS: Tuple[str, ...] = (
@@ -111,6 +150,27 @@ class RateTracker:
         return self._rates.get(itf, {})
 
 
+def _extract_item_path(item: Any) -> str:
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        if "path" in item and isinstance(item["path"], str):
+            return item["path"]
+        if "elem" in item and isinstance(item["elem"], list):
+            parts = []
+            for el in item["elem"]:
+                if isinstance(el, dict):
+                    name = el.get("name", "")
+                    keys = el.get("key", {})
+                    if keys:
+                        k_str = "".join(f"[{k}={v}]" for k, v in keys.items())
+                        parts.append(f"{name}{k_str}")
+                    else:
+                        parts.append(name)
+            return "/".join(parts)
+    return ""
+
+
 class HostStream:
     """Streaming state for a single SR Linux node.
 
@@ -133,6 +193,7 @@ class HostStream:
         reconnect_delay: float = 5.0,
         restart_debounce: float = 1.0,
         idle_timeout: float = 900.0,
+        on_update: Optional[Callable[[], None]] = None,
     ) -> None:
         self.name = name
         self.device = device
@@ -141,6 +202,7 @@ class HostStream:
         self.reconnect_delay = reconnect_delay
         self.restart_debounce = restart_debounce
         self.idle_timeout = idle_timeout
+        self.on_update = on_update
 
         self._lock = threading.RLock()
         self._get_lock = threading.Lock()
@@ -226,9 +288,10 @@ class HostStream:
             # was before, it goes back to being that once the node answers.
             with self._lock:
                 state.error = str(exc)
-            logger.warning(
-                "%s: bootstrap Get failed for %s: %s", self.name, spec.path, exc
-            )
+            if not _gnmi_path_missing(exc):
+                logger.warning(
+                    "%s: bootstrap Get failed for %s: %s", self.name, spec.path, exc
+                )
             return False
         # Serve the first render from this response instead of repeating the Get
         # while the path is still pending.
@@ -467,19 +530,30 @@ class HostStream:
         timestamp = update.get("timestamp") or 0
         touched_itfs = set()
         with self._lock:
+            self._direct_cache.clear()
+            self._failed_gets.clear()
             for item in update.get("update", []) or []:
-                path = join_path(prefix, item.get("path"))
-                insert(self._tree, path, item.get("val"))
+                item_path = _extract_item_path(item)
+                path = join_path(prefix, item_path)
+                val = item.get("val") if isinstance(item, dict) else None
+                insert(self._tree, path, val)
                 itf = _touched_interface(path)
                 if itf:
                     touched_itfs.add(itf)
             for item in update.get("delete", []) or []:
-                delete(self._tree, join_path(prefix, item.get("path")))
+                item_path = _extract_item_path(item)
+                path = join_path(prefix, item_path)
+                delete(self._tree, path)
             for itf in touched_itfs:
                 stats = get_node(self._tree, f"interface[name={itf}]/statistics")
                 if isinstance(stats, dict):
                     self.rates.observe(itf, materialize(stats), timestamp)
         self.last_update = time.time()
+        if self.on_update is not None:
+            try:
+                self.on_update()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ------------------------------------------------------------------ #
     # reads
@@ -573,7 +647,8 @@ class HostStream:
             self._gets += 1
             self._get_started = time.time()
             try:
-                resp = self.device.get(paths=[path], datatype=datatype)
+                with _suppress_pygnmi_client_logging():
+                    resp = self.device.get(paths=[path], datatype=datatype)
             except Exception as exc:
                 # How long the node has been failing decides whether waiting for
                 # it is still worthwhile or the connection itself has to go; see

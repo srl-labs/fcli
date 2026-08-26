@@ -243,6 +243,17 @@ def test_streamed_delete_removes_a_list_entry(lldp_stream):
     )
 
 
+def test_streamed_delete_handles_dict_elem_paths(lldp_stream):
+    stream, device = lldp_stream
+    # Directly queue a gNMI delete message containing dict items {"path": ...}
+    device.updates.put(
+        {"update": {"prefix": "system/lldp", "delete": [{"path": "interface[name=ethernet-1/2]"}]}}
+    )
+    assert wait_for(
+        lambda: len(stream.snapshot(LLDP_PATH)[0]["system/lldp"]["interface"]) == 1
+    )
+
+
 def test_streamed_update_reaches_the_report_getter(lldp_stream):
     stream, device = lldp_stream
     cached = CachedDevice(stream)

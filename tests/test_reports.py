@@ -478,3 +478,215 @@ def test_get_tunnel_table_resolves_egress_and_label():
     assert row["next-hop"] == ["10.255.0.1"]
     assert row["egress-itf"] == ["ethernet-1/5.0"]
     assert row["label"] == ["20000"]
+
+
+def test_get_bridge_domains():
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    data = [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "type": "default",
+                    "oper-state": "up",
+                },
+                {
+                    "name": "ip-vrf-1",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                    "interface": [{"name": "irb1.100"}],
+                    "protocols": {
+                        "bgp-vpn": {
+                            "bgp-instance": [
+                                {
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:65000:999"}],
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                },
+                {
+                    "name": "mac-vrf-100",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "protocols": {
+                        "bgp-vpn": {
+                            "bgp-instance": [
+                                {
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:65000:100"}],
+                                        "export-rt": [{"target": "target:65000:100"}],
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "interface": [
+                        {"name": "ethernet-1/1.100"},
+                        {"name": "ethernet-1/2.100"},
+                        {
+                            "name": "irb1.100",
+                            "ipv4": {
+                                "address": [
+                                    {"ip-prefix": "10.1.100.1/24", "anycast-gw": True}
+                                ]
+                            },
+                        },
+                    ],
+                    "vxlan-interface": [{"name": "vxlan1.100"}],
+                },
+            ]
+        }
+    ]
+
+    dev = _FakeLayer2({"network-instance": data})
+    out = dev.get_bridge_domains()
+    bds = out["bridge_domains"]
+    assert len(bds) == 1
+    bd = bds[0]
+    assert bd["Bridge Domain"] == "target:65000:100"
+    assert bd["MAC-VRF"] == "mac-vrf-100"
+    assert bd["Oper State"] == "up"
+    assert bd["Subnets"] == "10.1.100.0/24"
+    assert bd["IRB Interface"] == "irb1.100: 10.1.100.1/24 (anycast-gw: true) -> ip-vrf-1"
+    assert bd["Sub-Interfaces"] == "ethernet-1/1.100 (VLAN: 100), ethernet-1/2.100 (VLAN: 100)"
+    assert bd["VXLAN Interface"] == "vxlan1.100"
+
+
+def test_get_routers():
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    data = [
+        {
+            "network-instance": [
+                {
+                    "name": "ip-vrf-1",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                    "protocols": {
+                        "bgp-vpn": {
+                            "bgp-instance": [
+                                {
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:65000:999"}],
+                                        "export-rt": [{"target": "target:65000:999"}],
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                    "interface": [
+                        {
+                            "name": "irb1.100",
+                            "ipv4": {"address": [{"ip-prefix": "10.1.100.1/24"}]},
+                        },
+                        {
+                            "name": "ethernet-1/10.0",
+                            "ipv4": {"address": [{"ip-prefix": "192.168.1.1/30"}]},
+                        },
+                    ],
+                    "vxlan-interface": [{"name": "vxlan1.1"}],
+                },
+                {
+                    "name": "mac-vrf-100",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [{"name": "irb1.100"}],
+                },
+            ]
+        }
+    ]
+
+    dev = _FakeLayer2({"network-instance": data})
+    out = dev.get_routers()
+    routers = out["routers"]
+    assert len(routers) == 1
+    r = routers[0]
+    assert r["Router"] == "target:65000:999"
+    assert r["IP-VRF"] == "ip-vrf-1"
+    assert r["Oper State"] == "up"
+    assert r["Route Targets"] == "target:65000:999"
+    assert r["MAC-VRFs"] == "mac-vrf-100 (IRB-interface: 10.1.100.1/24)"
+    assert r["Routed Interfaces"] == "ethernet-1/10.0 (192.168.1.1/30)"
+    assert r["VXLAN Interface"] == "vxlan1.1"
+
+
+def test_get_services():
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    data = [
+        {
+            "network-instance": [
+                {
+                    "name": "mac-vrf-100",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                },
+                {
+                    "name": "ip-vrf-1",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                },
+            ]
+        }
+    ]
+
+    dev = _FakeLayer2({"network-instance": data})
+    out = dev.get_services()
+    services = out["services"]
+    assert len(services) == 2
+    types = [s["Service Type"] for s in services]
+    assert "Bridge Domain" in types
+    assert "Router" in types
+

@@ -15,6 +15,7 @@ from .devices import CachedDevice, RecordingDevice
 from .reports import Report
 from .rows import clean_columns, flatten
 from .stream import HostStream, SubscriptionSpec
+from .tree import materialize
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,13 @@ class FabricStore:
         self._specs: Dict[Tuple[str, str], List[SubscriptionSpec]] = {}
         #: Why a node could not serve a report, and when that was decided.
         self._activation_errors: Dict[Tuple[str, str], Tuple[float, str]] = {}
+        #: Centralized table cache per (report_name, inv_filter_tuple) -> (timestamp, table)
+        self._table_cache: Dict[
+            Tuple[str, Optional[Tuple[Tuple[str, str], ...]]],
+            Tuple[float, Dict[str, Any]],
+        ] = {}
+        #: Timestamp of the most recent fabric state update or topology change.
+        self._last_state_change: float = time.time()
         self._lock = threading.RLock()
         self._stop = threading.Event()
         self._resync_thread: Optional[threading.Thread] = None
@@ -59,6 +67,11 @@ class FabricStore:
     # ------------------------------------------------------------------ #
     # lifecycle
     # ------------------------------------------------------------------ #
+
+    def _on_host_update(self) -> None:
+        """Callback invoked when a HostStream receives a telemetry update."""
+        with self._lock:
+            self._last_state_change = time.time()
 
     def start(self) -> None:
         """Open a gNMI connection to every node in the inventory."""
@@ -85,6 +98,7 @@ class FabricStore:
             logger.warning("%s: connection failed: %s", name, exc)
             with self._lock:
                 self._connect_errors[name] = str(exc)
+                self._last_state_change = time.time()
             return
         with self._lock:
             self._connect_errors.pop(name, None)
@@ -94,7 +108,9 @@ class FabricStore:
                 default_sample_interval=self.sample_interval or 15,
                 restart_debounce=self.restart_debounce,
                 idle_timeout=self.idle_timeout,
+                on_update=self._on_host_update,
             )
+            self._last_state_change = time.time()
 
     def _heal_connections(self, names: List[str]) -> None:
         """Reconnect the nodes among *names* whose gNMI connection does not work.
@@ -130,10 +146,10 @@ class FabricStore:
                     bad_for = max(
                         now - failing if failing is not None else 0.0, stale or 0.0
                     )
-                    if bad_for < self.connect_retry_interval:
+                    if self.connect_retry_interval > 0 and bad_for < self.connect_retry_interval:
                         continue
                 last = self._connect_attempts.get(name)
-                if last is not None and now - last < self.connect_retry_interval:
+                if self.connect_retry_interval > 0 and last is not None and 0 <= (now - last) < self.connect_retry_interval:
                     continue
                 # Stamped before submitting, so concurrent renders queue a node
                 # once rather than once each.
@@ -154,6 +170,8 @@ class FabricStore:
                 del self._specs[key]
             for key in [k for k in self._activation_errors if k[0] == name]:
                 del self._activation_errors[key]
+            self._table_cache.clear()
+            self._last_state_change = time.time()
         if stream is not None:
             logger.info("%s: gNMI calls stopped working, reconnecting", name)
             stream.stop()
@@ -190,6 +208,8 @@ class FabricStore:
 
     def stop(self) -> None:
         self._stop.set()
+        with self._lock:
+            self._table_cache.clear()
         for stream in list(self._streams.values()):
             stream.stop()
         self._pool.shutdown(wait=False)
@@ -310,11 +330,21 @@ class FabricStore:
         inv_filter: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Render *report* across the (filtered) inventory from streamed state."""
-        started = time.time()
         names = self._targets(inv_filter)
         self._heal_connections(names)
         self.activate(report, names)
 
+        inv_key = tuple(sorted(inv_filter.items())) if inv_filter else None
+        cache_key = (report.name, inv_key)
+        now = time.time()
+        with self._lock:
+            cached = self._table_cache.get(cache_key)
+            if cached is not None:
+                cached_at, cached_table = cached
+                if (cached_at >= self._last_state_change or (now - cached_at < 0.5)) and not cached_table.get("errors"):
+                    return cached_table
+
+        started = time.time()
         results = list(self._pool.map(lambda n: self._host_rows(report, n), names))
 
         columns: List[str] = []
@@ -333,7 +363,7 @@ class FabricStore:
             {c: _cell(row.get(raw)) for c, raw in zip(all_columns, ["Node"] + columns)}
             for row in rows
         ]
-        return {
+        res_table = {
             "report": report.name,
             "title": report.title,
             "columns": all_columns,
@@ -346,6 +376,9 @@ class FabricStore:
                 [self._streams[n] for n in names if n in self._streams]
             ),
         }
+        with self._lock:
+            self._table_cache[cache_key] = (started, res_table)
+        return res_table
 
     def _host_rows(
         self, report: Report, name: str
@@ -384,6 +417,97 @@ class FabricStore:
             # this is the number to watch.
             "max_sessions_per_node": max((s["sessions"] for s in streams), default=0),
             "resync_interval": self.resync_interval,
+        }
+
+    def overview(self, inv_filter: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """Aggregate high-level health and topology metrics for executive dashboard."""
+        from .reports import get_report
+
+        names = self._targets(inv_filter)
+        self._heal_connections(names)
+        try:
+            ov_report = get_report("overview")
+            self.activate(ov_report, names)
+        except Exception:
+            pass
+
+        hosts = self.inventory()
+        total_nodes = len(hosts)
+        connected_nodes = sum(1 for h in hosts if h["connected"])
+        streaming_nodes = sum(1 for h in hosts if h["streaming"])
+        unreachable_nodes = len(self._connect_errors)
+
+        bgp_total = 0
+        bgp_established = 0
+        bgp_down = 0
+
+        itf_total = 0
+        itf_down = 0
+        itf_errors = 0
+
+        with self._lock:
+            for name in names:
+                stream = self._streams.get(name)
+                if stream is None:
+                    continue
+                itf_node = stream._tree.get("interface")
+                if itf_node is not None:
+                    itfs = materialize(itf_node)
+                    if isinstance(itfs, list):
+                        itf_total += len(itfs)
+                        for item in itfs:
+                            if isinstance(item, dict):
+                                if item.get("oper-state") == "down":
+                                    itf_down += 1
+                                stats = item.get("statistics", {})
+                                if isinstance(stats, dict):
+                                    err_cnt = (
+                                        int(stats.get("in-error-packets", 0) or 0)
+                                        + int(stats.get("out-error-packets", 0) or 0)
+                                        + int(stats.get("in-discarded-packets", 0) or 0)
+                                        + int(stats.get("out-discarded-packets", 0) or 0)
+                                    )
+                                    if err_cnt > 0:
+                                        itf_errors += 1
+
+                ni_node = stream._tree.get("network-instance")
+                if ni_node is not None:
+                    nis = materialize(ni_node)
+                    if isinstance(nis, list):
+                        for ni in nis:
+                            if isinstance(ni, dict):
+                                bgp = ni.get("protocols", {}).get("bgp", {})
+                                for nbr in bgp.get("neighbor", []):
+                                    if isinstance(nbr, dict):
+                                        bgp_total += 1
+                                        state = str(nbr.get("session-state", "")).lower()
+                                        if state == "established":
+                                            bgp_established += 1
+                                        else:
+                                            bgp_down += 1
+
+        return {
+            "nodes": {
+                "total": total_nodes,
+                "connected": connected_nodes,
+                "streaming": streaming_nodes,
+                "unreachable": unreachable_nodes,
+            },
+            "bgp": {
+                "total": bgp_total,
+                "established": bgp_established,
+                "down": bgp_down,
+            },
+            "interfaces": {
+                "total": itf_total,
+                "down": itf_down,
+                "errors": itf_errors,
+            },
+            "telemetry": {
+                "subscriptions": sum(len(s.status()["paths"]) for s in self._streams.values()),
+                "resync_interval": self.resync_interval,
+                "cached_tables": len(self._table_cache),
+            },
         }
 
 
