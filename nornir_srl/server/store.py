@@ -456,7 +456,18 @@ class FabricStore:
                     if isinstance(itfs, list):
                         for item in itfs:
                             if isinstance(item, dict):
-                                if item.get("admin-state") == "disable":
+                                admin = str(item.get("admin-state", "")).lower()
+                                if admin in ("disable", "disabled"):
+                                    continue
+                                subitfs = item.get("subinterface", [])
+                                name = str(item.get("name", ""))
+                                is_configured = (
+                                    len(subitfs) > 0
+                                    or item.get("oper-state") == "up"
+                                    or bool(item.get("description"))
+                                    or name.startswith(("mgmt", "system", "lo", "lag"))
+                                )
+                                if not is_configured:
                                     continue
                                 itf_total += 1
                                 if item.get("oper-state") == "down":

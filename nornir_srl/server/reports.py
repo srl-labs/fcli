@@ -62,6 +62,7 @@ REPORTS: List[Report] = [
         category="Dashboard",
         subscribe=[
             SubscriptionSpec("/interface[name=*]/statistics", sample_interval=10),
+            SubscriptionSpec("/interface[name=*]/admin-state", sample_interval=10),
             SubscriptionSpec("/interface[name=*]/oper-state", sample_interval=10),
             SubscriptionSpec("/network-instance[name=*]/protocols/bgp/neighbor", datatype="all", sample_interval=10),
         ],

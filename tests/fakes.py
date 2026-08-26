@@ -174,6 +174,11 @@ IFSTATE_RESPONSE: List[Dict[str, Any]] = [
     {"interface": [{"name": "ethernet-1/1", "oper-state": "up"}]}
 ]
 
+IFADMIN_PATH = "/interface[name=*]/admin-state"
+IFADMIN_RESPONSE: List[Dict[str, Any]] = [
+    {"interface": [{"name": "ethernet-1/1", "admin-state": "enable"}]}
+]
+
 #: The LAG report selects a family of interfaces by glob, so it shares the
 #: ``interface`` envelope with the wildcard interface subscriptions above.
 LAG_PATH = "/interface[name=lag*]"

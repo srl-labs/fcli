@@ -16,6 +16,8 @@ from nornir_srl.server.rows import flatten, get_fields, is_scalar
 from nornir_srl.server.store import FabricStore
 
 from .fakes import (
+    IFADMIN_PATH,
+    IFADMIN_RESPONSE,
     IFSTATE_PATH,
     IFSTATE_RESPONSE,
     IFSTATS_PATH,
@@ -44,6 +46,7 @@ def _responses():
         LLDP_PATH: LLDP_RESPONSE,
         IFSTATS_PATH: IFSTATS_RESPONSE,
         IFSTATE_PATH: IFSTATE_RESPONSE,
+        IFADMIN_PATH: IFADMIN_RESPONSE,
         "/network-instance[name=*]/protocols/bgp/neighbor": [
             {
                 "network-instance": [
@@ -718,14 +721,16 @@ def test_bridge_domains_report_endpoint(client):
 
 def test_overview_ignores_admin_disabled_interfaces(store):
     fabric_store, _devices = store
-    # Inject stream tree with admin-disabled interface and admin-enabled oper-down interface
+    # Inject stream tree with admin-disabled interface and admin-enabled oper-down configured interface
     stream = list(fabric_store._streams.values())[0]
     stream._tree["interface"] = [
         {"name": "ethernet-1/1", "admin-state": "enable", "oper-state": "up"},
         {"name": "ethernet-1/2", "admin-state": "disable", "oper-state": "down"},
-        {"name": "ethernet-1/3", "admin-state": "enable", "oper-state": "down"},
+        {"name": "ethernet-1/3", "admin-state": "enable", "oper-state": "down", "subinterface": [{"index": 0}]},
     ]
     data = fabric_store.overview()
-    # ethernet-1/2 is admin disabled, so it must be ignored from faults
-    assert data["interfaces"]["down"] >= 1
+    # ethernet-1/2 (admin disabled) and unconfigured ports are ignored from faults
+    # ethernet-1/3 (admin enable, configured, oper down) is counted as down
+    assert data["interfaces"]["down"] == 1
+    assert data["interfaces"]["total"] == 3
 
