@@ -628,7 +628,7 @@ class Layer2Mixin:
                 continue
             ni_name = ni.get("name", "")
             ni_type = ni.get("type", "")
-            if ni_type != "ip-vrf":
+            if ni_type != "ip-vrf" or ni_name.lower() == "mgmt":
                 continue
             oper_state = ni.get("oper-state", "unknown")
 
@@ -656,7 +656,7 @@ class Layer2Mixin:
                                 rts.add(target_str)
 
             rt_list = sorted(list(rts))
-            rt_display = ", ".join(rt_list) if rt_list else f"ip-vrf:{ni_name}"
+            rt_display = ", ".join(rt_list) if rt_list else "none (isolated)"
 
             mac_vrfs_items = []
             routed_itfs_items = []
@@ -685,7 +685,7 @@ class Layer2Mixin:
                 if isinstance(v, dict) and v.get("name")
             ]
 
-            primary_router = rt_list[0] if rt_list else f"ip-vrf:{ni_name}"
+            primary_router = rt_list[0] if rt_list else f"none (isolated) - {ni_name}"
             results.append(
                 {
                     "Router": primary_router,

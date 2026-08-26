@@ -645,6 +645,40 @@ def test_get_routers():
     assert r["Routed Interfaces"] == "ethernet-1/10.0 (192.168.1.1/30)"
     assert r["VXLAN Interface"] == "vxlan1.1"
 
+    # Test isolated ip-vrf without route targets
+    isolated_data = [
+        {
+            "network-instance": [
+                {
+                    "name": "isolated-vrf",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                }
+            ]
+        }
+    ]
+    dev2 = _FakeLayer2({"network-instance": isolated_data})
+    out2 = dev2.get_routers()
+    r2 = out2["routers"][0]
+    assert r2["Route Targets"] == "none (isolated)"
+    assert r2["Router"] == "none (isolated) - isolated-vrf"
+
+    # Test that mgmt ip-vrf is excluded
+    mgmt_data = [
+        {
+            "network-instance": [
+                {
+                    "name": "mgmt",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                }
+            ]
+        }
+    ]
+    dev3 = _FakeLayer2({"network-instance": mgmt_data})
+    out3 = dev3.get_routers()
+    assert len(out3["routers"]) == 0
+
 
 def test_get_services():
     from nornir_srl.connections.layer2 import Layer2Mixin

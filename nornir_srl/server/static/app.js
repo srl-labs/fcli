@@ -861,6 +861,7 @@
   function renderRoutersCards(rows) {
     const routerMap = new Map();
     for (const row of rows) {
+      if (row["IP-VRF"] === "mgmt") continue;
       const routerName = row["Router"] || row["Route Targets"] || "unassigned";
       if (!routerMap.has(routerName)) routerMap.set(routerName, []);
       routerMap.get(routerName).push(row);
@@ -904,7 +905,8 @@
 
       const rtLabel = document.createElement("span");
       rtLabel.className = "bd-rt-label";
-      rtLabel.textContent = `Route-target: ${routerName}`;
+      const isIsolated = !routerName || routerName === "none (isolated)" || routerName.startsWith("none (isolated)") || routerName.startsWith("ip-vrf:") || routerName === "unassigned";
+      rtLabel.textContent = isIsolated ? "Route-target: none (isolated)" : `Route-target: ${routerName}`;
       subRow.append(rtLabel);
 
       if (hasVrfMismatch) {
