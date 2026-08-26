@@ -9,7 +9,11 @@
     enable: "state-enable",
     disable: "state-disable",
     established: "state-established",
-    active: "state-up",
+    active: "state-down",
+    idle: "state-down",
+    connect: "state-down",
+    opensent: "state-down",
+    openconfirm: "state-down",
     inactive: "state-inactive",
   };
 
@@ -47,6 +51,9 @@
     updated: el("updated"),
     themeToggle: el("theme-toggle"),
     // KPI elements
+    kpiCardNodes: el("kpi-card-nodes"),
+    kpiCardBgp: el("kpi-card-bgp"),
+    kpiCardItf: el("kpi-card-itf"),
     kpiNodesTotal: el("kpi-nodes-total"),
     kpiNodesConnected: el("kpi-nodes-connected"),
     kpiNodesStreaming: el("kpi-nodes-streaming"),
@@ -259,6 +266,43 @@
       dom.kpiBgpTotal.textContent = `${data.bgp.total} total`;
       dom.kpiBgpDown.textContent = data.bgp.down > 0 ? ` · ${data.bgp.down} down` : "";
 
+      if (dom.kpiCardNodes) {
+        dom.kpiCardNodes.classList.remove("kpi-ok", "kpi-warn", "kpi-err");
+        if (data.nodes.total > 0) {
+          if (data.nodes.connected === data.nodes.total && data.nodes.unreachable === 0) {
+            dom.kpiCardNodes.classList.add("kpi-ok");
+          } else if (data.nodes.connected === 0) {
+            dom.kpiCardNodes.classList.add("kpi-err");
+          } else {
+            dom.kpiCardNodes.classList.add("kpi-warn");
+          }
+        }
+      }
+
+      if (dom.kpiCardBgp) {
+        dom.kpiCardBgp.classList.remove("kpi-ok", "kpi-warn", "kpi-err");
+        if (data.bgp.total > 0) {
+          if (data.bgp.established === data.bgp.total && data.bgp.down === 0) {
+            dom.kpiCardBgp.classList.add("kpi-ok");
+          } else if (data.bgp.established === 0) {
+            dom.kpiCardBgp.classList.add("kpi-err");
+          } else {
+            dom.kpiCardBgp.classList.add("kpi-warn");
+          }
+        }
+      }
+
+      if (dom.kpiCardItf) {
+        dom.kpiCardItf.classList.remove("kpi-ok", "kpi-warn", "kpi-err");
+        if (data.interfaces.total > 0) {
+          if (data.interfaces.down === 0 && data.interfaces.errors === 0) {
+            dom.kpiCardItf.classList.add("kpi-ok");
+          } else {
+            dom.kpiCardItf.classList.add("kpi-warn");
+          }
+        }
+      }
+
       dom.kpiItfTotal.textContent = data.interfaces.total;
       dom.kpiItfDown.textContent = `${data.interfaces.down} oper down`;
       dom.kpiItfErrors.textContent = `${data.interfaces.errors} errors/discards`;
@@ -408,6 +452,11 @@
   }
 
   function renderHead() {
+    const activeEl = document.activeElement;
+    const activeColumn = activeEl && activeEl.dataset ? activeEl.dataset.column : null;
+    const selStart = activeEl && typeof activeEl.selectionStart === "number" ? activeEl.selectionStart : null;
+    const selEnd = activeEl && typeof activeEl.selectionEnd === "number" ? activeEl.selectionEnd : null;
+
     dom.headRow.replaceChildren();
     dom.filterRow.replaceChildren();
     for (const column of visibleColumns()) {
@@ -438,6 +487,7 @@
       const input = document.createElement("input");
       input.type = "search";
       input.placeholder = "filter";
+      input.dataset.column = column;
       input.value = state.colFilters.get(column) || "";
       input.addEventListener(
         "input",
@@ -448,12 +498,24 @@
           state.windowSize = WINDOW_STEP;
           saveReportPreferences();
           updateFilterUI();
-          renderHead();
+          th.classList.toggle("filtered", Boolean(value));
           renderBody();
         }, 150)
       );
       filterCell.append(input);
       dom.filterRow.append(filterCell);
+    }
+
+    if (activeColumn) {
+      const newInput = dom.filterRow.querySelector(`input[data-column="${CSS.escape(activeColumn)}"]`);
+      if (newInput) {
+        newInput.focus();
+        if (selStart !== null && selEnd !== null) {
+          try {
+            newInput.setSelectionRange(selStart, selEnd);
+          } catch (_err) {}
+        }
+      }
     }
   }
 
@@ -1068,7 +1130,14 @@
         const value = row[column] ?? "";
         const td = document.createElement("td");
         td.textContent = value;
-        const stateClass = STATE_CLASSES[String(value).toLowerCase()];
+        let stateClass = STATE_CLASSES[String(value).toLowerCase()];
+        if (state.report && state.report.name === "bgp_peers" && column.toLowerCase().includes("state")) {
+          if (String(value).toLowerCase() === "established") {
+            stateClass = "state-established";
+          } else {
+            stateClass = "state-down";
+          }
+        }
         if (stateClass) td.classList.add(stateClass);
         else if (isNumeric(value) && value !== "") td.classList.add("num");
         if (

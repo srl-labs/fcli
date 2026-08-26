@@ -454,9 +454,11 @@ class FabricStore:
                 if itf_node is not None:
                     itfs = materialize(itf_node)
                     if isinstance(itfs, list):
-                        itf_total += len(itfs)
                         for item in itfs:
                             if isinstance(item, dict):
+                                if item.get("admin-state") == "disable":
+                                    continue
+                                itf_total += 1
                                 if item.get("oper-state") == "down":
                                     itf_down += 1
                                 stats = item.get("statistics", {})

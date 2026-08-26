@@ -714,3 +714,18 @@ def test_bridge_domains_report_endpoint(client):
     table = resp.json()
     assert table["report"] == "bridge_domains"
     assert "columns" in table
+
+
+def test_overview_ignores_admin_disabled_interfaces(store):
+    fabric_store, _devices = store
+    # Inject stream tree with admin-disabled interface and admin-enabled oper-down interface
+    stream = list(fabric_store._streams.values())[0]
+    stream._tree["interface"] = [
+        {"name": "ethernet-1/1", "admin-state": "enable", "oper-state": "up"},
+        {"name": "ethernet-1/2", "admin-state": "disable", "oper-state": "down"},
+        {"name": "ethernet-1/3", "admin-state": "enable", "oper-state": "down"},
+    ]
+    data = fabric_store.overview()
+    # ethernet-1/2 is admin disabled, so it must be ignored from faults
+    assert data["interfaces"]["down"] >= 1
+
