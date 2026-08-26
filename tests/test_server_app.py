@@ -16,6 +16,10 @@ from nornir_srl.server.rows import flatten, get_fields, is_scalar
 from nornir_srl.server.store import FabricStore
 
 from .fakes import (
+    IFSTATE_PATH,
+    IFSTATE_RESPONSE,
+    IFSTATS_PATH,
+    IFSTATS_RESPONSE,
     LLDP_PATH,
     LLDP_RESPONSE,
     SYS_INFO_RESPONSES,
@@ -36,7 +40,31 @@ HOSTS = {
 
 
 def _responses():
-    return {LLDP_PATH: LLDP_RESPONSE, **SYS_INFO_RESPONSES}
+    return {
+        LLDP_PATH: LLDP_RESPONSE,
+        IFSTATS_PATH: IFSTATS_RESPONSE,
+        IFSTATE_PATH: IFSTATE_RESPONSE,
+        "/network-instance[name=*]/protocols/bgp/neighbor": [
+            {
+                "network-instance": [
+                    {
+                        "name": "default",
+                        "protocols": {
+                            "bgp": {
+                                "neighbor": [
+                                    {
+                                        "peer-address": "192.168.1.1",
+                                        "session-state": "established",
+                                    }
+                                ]
+                            }
+                        },
+                    }
+                ]
+            }
+        ],
+        **SYS_INFO_RESPONSES,
+    }
 
 
 @pytest.fixture
@@ -228,6 +256,34 @@ def test_repeated_renders_do_not_hit_the_node_again(store):
     for _ in range(3):
         fabric_store.table(get_report("lldp"))
     assert len(devices["leaf1"].gets) == settled
+
+
+def test_table_caching_and_invalidation(store):
+    """Consecutive calls to table() return cached dict unless state updates."""
+    fabric_store, devices = store
+    t1 = fabric_store.table(get_report("lldp"))
+    t2 = fabric_store.table(get_report("lldp"))
+    assert t1 is t2  # Cache hit returns exact same dict object
+
+    # Simulating a state update invalidates the cache
+    devices["leaf1"].push(
+        "system/lldp/interface[name=ethernet-1/1]",
+        [("neighbor[id=1]/system-name", "spine99")],
+    )
+    assert wait_for(
+        lambda: any(
+            row["Nbr-System"] == "spine99"
+            for row in fabric_store.table(get_report("lldp"))["rows"]
+        )
+    )
+    t3 = fabric_store.table(get_report("lldp"))
+    assert t3 is not t1
+
+
+def test_all_static_reports_have_predeclared_subscriptions():
+    """Verify that core static reports have explicit subscribe specs defined."""
+    reports_with_subscribe = [r for r in REPORTS if r.subscribe]
+    assert len(reports_with_subscribe) >= 10
 
 
 def test_opening_every_report_costs_one_session_per_node(store):
@@ -563,6 +619,28 @@ def test_status_endpoint(client):
     assert len(status["nodes"]) == 2
 
 
+def test_overview_endpoint(client):
+    test_client, _devices = client
+    resp = test_client.get("/api/overview")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["nodes"]["total"] == 2
+    assert "connected" in data["nodes"]
+    assert "established" in data["bgp"]
+    assert "total" in data["interfaces"]
+    assert "subscriptions" in data["telemetry"]
+
+
+def test_store_overview_method(store):
+    fabric_store, _devices = store
+    data = fabric_store.overview()
+    assert data["nodes"]["total"] == 2
+    assert data["nodes"]["connected"] == 2
+    assert isinstance(data["bgp"]["established"], int)
+    assert isinstance(data["interfaces"]["total"], int)
+    assert isinstance(data["telemetry"]["subscriptions"], int)
+
+
 @pytest.mark.anyio
 async def test_stream_pushes_a_table_event(store):
     fabric_store, _devices = store
@@ -627,3 +705,12 @@ async def _collect(fabric_store, report, stop_after):
         data = text.split("data: ", 1)[1].strip()
         events.append((kind, json.loads(data)))
     return events
+
+
+def test_bridge_domains_report_endpoint(client):
+    test_client, _devices = client
+    resp = test_client.get("/api/report/bridge_domains")
+    assert resp.status_code == 200
+    table = resp.json()
+    assert table["report"] == "bridge_domains"
+    assert "columns" in table

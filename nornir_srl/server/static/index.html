@@ -73,6 +73,10 @@
             autocomplete="off"
             title="Nornir inventory filter: key=value pairs, comma separated"
           />
+          <button id="clear-filters-btn" class="btn" type="button" hidden>
+            ✕ Clear Filters <span id="filter-badge" class="badge"></span>
+          </button>
+          <button id="view-mode-btn" class="btn" type="button" hidden>🌲 Services View</button>
           <label class="field">
             <span class="muted">refresh</span>
             <select id="refresh" class="input">
@@ -91,6 +95,59 @@
         </section>
 
         <section id="errors" class="errors" hidden></section>
+
+        <div id="overview-dashboard" class="dashboard-wrap" hidden>
+          <div class="kpi-grid">
+            <div class="kpi-card">
+              <div class="kpi-header">
+                <span class="kpi-title">Fabric Nodes</span>
+                <span class="kpi-icon">🖥️</span>
+              </div>
+              <div class="kpi-value" id="kpi-nodes-total">0</div>
+              <div class="kpi-sub">
+                <span class="state-up" id="kpi-nodes-connected">0 connected</span> ·
+                <span class="state-enable" id="kpi-nodes-streaming">0 streaming</span> ·
+                <span class="state-down" id="kpi-nodes-unreachable">0 unreachable</span>
+              </div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-header">
+                <span class="kpi-title">BGP Sessions</span>
+                <span class="kpi-icon">🌐</span>
+              </div>
+              <div class="kpi-value" id="kpi-bgp-established">0</div>
+              <div class="kpi-sub">
+                <span class="state-established" id="kpi-bgp-sub">0 established</span> / 
+                <span id="kpi-bgp-total" class="muted">0 total</span>
+                <span class="state-down" id="kpi-bgp-down"></span>
+              </div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-header">
+                <span class="kpi-title">Interface Health</span>
+                <span class="kpi-icon">🔌</span>
+              </div>
+              <div class="kpi-value" id="kpi-itf-total">0</div>
+              <div class="kpi-sub">
+                <span class="state-down" id="kpi-itf-down">0 oper down</span> ·
+                <span class="state-down" id="kpi-itf-errors">0 errors/discards</span>
+              </div>
+            </div>
+            <div class="kpi-card">
+              <div class="kpi-header">
+                <span class="kpi-title">Telemetry Engine</span>
+                <span class="kpi-icon">⚡</span>
+              </div>
+              <div class="kpi-value" id="kpi-sub-count">0</div>
+              <div class="kpi-sub">
+                <span id="kpi-cache-count" class="muted">0 cached tables</span> ·
+                <span id="kpi-resync-int" class="muted">300s resync</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="services-tree-view" class="services-tree-wrap" hidden></div>
 
         <div class="table-wrap" id="table-wrap">
           <table class="grid" id="grid">
