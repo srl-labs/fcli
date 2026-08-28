@@ -559,6 +559,7 @@ def main(
     ctx.obj["box_type"] = box_type.upper() if box_type else None
     ctx.obj["output"] = output
     ctx.obj["log_level"] = log_level.value
+    ctx.obj["topo_name"] = lab_name if topo_file else None
 
 
 # ------------------------- command helpers -------------------------
@@ -645,6 +646,7 @@ def server(
         refresh=refresh,
         idle_timeout=idle_timeout,
         log_level=ctx.obj["log_level"],
+        topo_name=ctx.obj.get("topo_name"),
     )
 
 

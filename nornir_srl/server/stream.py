@@ -510,13 +510,14 @@ class HostStream:
     def stop(self) -> None:
         self._closed.set()
         self._stop.set()
+        self._dirty.set()
         with self._lock:
             self._generation += 1
         self._close_subscription()
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3)
+            self._thread.join(timeout=0.2)
         if self._reconciler.is_alive():
-            self._reconciler.join(timeout=3)
+            self._reconciler.join(timeout=0.2)
 
     # ------------------------------------------------------------------ #
     # update handling

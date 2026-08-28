@@ -23,6 +23,7 @@
     reportList: el("report-list"),
     nodeList: el("node-list"),
     nodeSummary: el("node-summary"),
+    topoBadge: el("topo-badge"),
     version: el("version"),
     title: el("report-title"),
     desc: el("report-desc"),
@@ -65,6 +66,18 @@
     kpiItfTotal: el("kpi-itf-total"),
     kpiItfDown: el("kpi-itf-down"),
     kpiItfErrors: el("kpi-itf-errors"),
+    kpiCardBd: el("kpi-card-bd"),
+    kpiBdTotal: el("kpi-bd-total"),
+    kpiBdUp: el("kpi-bd-up"),
+    kpiBdDegraded: el("kpi-bd-degraded"),
+    kpiBdDown: el("kpi-bd-down"),
+    kpiBdInstances: el("kpi-bd-instances"),
+    kpiCardRouters: el("kpi-card-routers"),
+    kpiRoutersTotal: el("kpi-routers-total"),
+    kpiRoutersUp: el("kpi-routers-up"),
+    kpiRoutersDegraded: el("kpi-routers-degraded"),
+    kpiRoutersDown: el("kpi-routers-down"),
+    kpiRoutersInstances: el("kpi-routers-instances"),
     kpiSubCount: el("kpi-sub-count"),
     kpiCacheCount: el("kpi-cache-count"),
     kpiResyncInt: el("kpi-resync-int"),
@@ -201,6 +214,15 @@
     const data = await res.json();
     state.reports = data.reports;
     dom.version.textContent = "v" + data.version;
+    if (data.topo_name) {
+      if (dom.topoBadge) {
+        dom.topoBadge.textContent = "clab: " + data.topo_name;
+        dom.topoBadge.title = "Containerlab topology: " + data.topo_name;
+        dom.topoBadge.hidden = false;
+      }
+    } else if (dom.topoBadge) {
+      dom.topoBadge.hidden = true;
+    }
     renderReportList();
 
     try {
@@ -308,6 +330,48 @@
       dom.kpiItfTotal.textContent = data.interfaces.total;
       dom.kpiItfDown.textContent = `${data.interfaces.down} oper down`;
       dom.kpiItfErrors.textContent = `${data.interfaces.errors} errors/discards`;
+
+      if (data.bridge_domains) {
+        dom.kpiBdTotal.textContent = data.bridge_domains.total;
+        dom.kpiBdUp.textContent = `${data.bridge_domains.up} up`;
+        dom.kpiBdDegraded.textContent = data.bridge_domains.degraded > 0 ? ` · ${data.bridge_domains.degraded} degraded` : "";
+        dom.kpiBdDown.textContent = data.bridge_domains.down > 0 ? ` · ${data.bridge_domains.down} down` : "";
+        dom.kpiBdInstances.textContent = ` (${data.bridge_domains.instances} inst)`;
+
+        if (dom.kpiCardBd) {
+          dom.kpiCardBd.classList.remove("kpi-ok", "kpi-warn", "kpi-err");
+          if (data.bridge_domains.total > 0) {
+            if (data.bridge_domains.down > 0) {
+              dom.kpiCardBd.classList.add("kpi-err");
+            } else if (data.bridge_domains.degraded > 0) {
+              dom.kpiCardBd.classList.add("kpi-warn");
+            } else {
+              dom.kpiCardBd.classList.add("kpi-ok");
+            }
+          }
+        }
+      }
+
+      if (data.routers) {
+        dom.kpiRoutersTotal.textContent = data.routers.total;
+        dom.kpiRoutersUp.textContent = `${data.routers.up} up`;
+        dom.kpiRoutersDegraded.textContent = data.routers.degraded > 0 ? ` · ${data.routers.degraded} degraded` : "";
+        dom.kpiRoutersDown.textContent = data.routers.down > 0 ? ` · ${data.routers.down} down` : "";
+        dom.kpiRoutersInstances.textContent = ` (${data.routers.instances} inst)`;
+
+        if (dom.kpiCardRouters) {
+          dom.kpiCardRouters.classList.remove("kpi-ok", "kpi-warn", "kpi-err");
+          if (data.routers.total > 0) {
+            if (data.routers.down > 0) {
+              dom.kpiCardRouters.classList.add("kpi-err");
+            } else if (data.routers.degraded > 0) {
+              dom.kpiCardRouters.classList.add("kpi-warn");
+            } else {
+              dom.kpiCardRouters.classList.add("kpi-ok");
+            }
+          }
+        }
+      }
 
       dom.kpiSubCount.textContent = data.telemetry.subscriptions;
       dom.kpiCacheCount.textContent = `${data.telemetry.cached_tables} cached tables`;
@@ -668,6 +732,31 @@
     }
   }
 
+  function aggregateServiceState(rows) {
+    if (!rows || !rows.length) {
+      return { status: "unknown", className: "state-badge-down", badgeText: "UNKNOWN" };
+    }
+    let upCount = 0;
+    let downCount = 0;
+
+    for (const row of rows) {
+      const st = String(row["Oper State"] || "").toLowerCase().trim();
+      if (st === "up" || st === "enable" || st === "enabled" || st === "active" || st === "established") {
+        upCount++;
+      } else {
+        downCount++;
+      }
+    }
+
+    if (upCount === rows.length) {
+      return { status: "up", className: "state-badge-up", badgeText: "UP" };
+    }
+    if (downCount === rows.length) {
+      return { status: "down", className: "state-badge-down", badgeText: "DOWN" };
+    }
+    return { status: "degraded", className: "state-badge-warn", badgeText: "DEGRADED" };
+  }
+
   function renderBridgeDomainsCards(rows) {
     const bdMap = new Map();
     for (const row of rows) {
@@ -679,9 +768,10 @@
     for (const [bdName, bdRows] of bdMap) {
       const cardKey = `bd:${bdName}`;
       const isCardCollapsed = state.collapsedCards.has(cardKey);
+      const cardAgg = aggregateServiceState(bdRows);
 
       const card = document.createElement("div");
-      card.className = "bd-card";
+      card.className = `bd-card bd-state-${cardAgg.status}`;
       card.dataset.cardKey = cardKey;
       if (isCardCollapsed) card.classList.add("is-collapsed");
 
@@ -726,12 +816,16 @@
       const vrfTitleStr = vrfNames.join(", ") + (hasVrfMismatch ? " (!)" : "");
       title.textContent = `Bridge-domain: ${vrfTitleStr}${subnetsStr}`;
 
+      const stateBadge = document.createElement("span");
+      stateBadge.className = `bd-state-badge ${cardAgg.className}`;
+      stateBadge.textContent = cardAgg.badgeText;
+
       const nodesCount = new Set(bdRows.map((r) => r.Node)).size;
       const badge = document.createElement("span");
       badge.className = "bd-badge-count";
       badge.textContent = `${nodesCount} Node${nodesCount === 1 ? "" : "s"}`;
 
-      topRow.append(chevron, icon, title, badge);
+      topRow.append(chevron, icon, title, stateBadge, badge);
       header.append(topRow);
 
       const subRow = document.createElement("div");
@@ -811,11 +905,17 @@
         const nodeText = document.createElement("span");
         nodeText.textContent = `🖥️ Node: ${nodeName}`;
 
+        const nodeAgg = aggregateServiceState(nodeRows);
+
+        const nodeStateBadge = document.createElement("span");
+        nodeStateBadge.className = `bd-node-state ${nodeAgg.className}`;
+        nodeStateBadge.textContent = nodeAgg.badgeText;
+
         const nodeBadge = document.createElement("span");
         nodeBadge.className = "bd-node-count";
         nodeBadge.textContent = `${nodeRows.length} item${nodeRows.length === 1 ? "" : "s"}`;
 
-        nodeTitle.append(nodeChevron, nodeText, nodeBadge);
+        nodeTitle.append(nodeChevron, nodeText, nodeStateBadge, nodeBadge);
         nodeDiv.append(nodeTitle);
 
         const nodeContent = document.createElement("div");
@@ -859,9 +959,9 @@
           vrfName.textContent = `📦 MAC-VRF: ${row["MAC-VRF"] || "-"}${subnetsStr}`;
 
           const stateSpan = document.createElement("span");
-          const stateVal = (row["Oper State"] || "unknown").toLowerCase();
-          stateSpan.className = stateVal === "up" ? "state-badge-up" : "state-badge-down";
-          stateSpan.textContent = row["Oper State"] || "unknown";
+          const instanceAgg = aggregateServiceState([row]);
+          stateSpan.className = instanceAgg.className;
+          stateSpan.textContent = row["Oper State"] || instanceAgg.badgeText;
 
           vrfHeader.append(vrfName, stateSpan);
           vrfDiv.append(vrfHeader);
@@ -985,9 +1085,10 @@
     for (const [routerName, rRows] of routerMap) {
       const cardKey = `router:${routerName}`;
       const isCardCollapsed = state.collapsedCards.has(cardKey);
+      const cardAgg = aggregateServiceState(rRows);
 
       const card = document.createElement("div");
-      card.className = "bd-card";
+      card.className = `bd-card bd-state-${cardAgg.status}`;
       card.dataset.cardKey = cardKey;
       if (isCardCollapsed) card.classList.add("is-collapsed");
 
@@ -1021,12 +1122,16 @@
       const vrfTitleStr = vrfNames.join(", ") + (hasVrfMismatch ? " (!)" : "");
       title.textContent = `Router: ${vrfTitleStr}`;
 
+      const stateBadge = document.createElement("span");
+      stateBadge.className = `bd-state-badge ${cardAgg.className}`;
+      stateBadge.textContent = cardAgg.badgeText;
+
       const nodesCount = new Set(rRows.map((r) => r.Node)).size;
       const badge = document.createElement("span");
       badge.className = "bd-badge-count";
       badge.textContent = `${nodesCount} Node${nodesCount === 1 ? "" : "s"}`;
 
-      topRow.append(chevron, icon, title, badge);
+      topRow.append(chevron, icon, title, stateBadge, badge);
       header.append(topRow);
 
       const subRow = document.createElement("div");
@@ -1107,11 +1212,17 @@
         const nodeText = document.createElement("span");
         nodeText.textContent = `🖥️ Node: ${nodeName}`;
 
+        const nodeAgg = aggregateServiceState(nodeRows);
+
+        const nodeStateBadge = document.createElement("span");
+        nodeStateBadge.className = `bd-node-state ${nodeAgg.className}`;
+        nodeStateBadge.textContent = nodeAgg.badgeText;
+
         const nodeBadge = document.createElement("span");
         nodeBadge.className = "bd-node-count";
         nodeBadge.textContent = `${nodeRows.length} item${nodeRows.length === 1 ? "" : "s"}`;
 
-        nodeTitle.append(nodeChevron, nodeText, nodeBadge);
+        nodeTitle.append(nodeChevron, nodeText, nodeStateBadge, nodeBadge);
         nodeDiv.append(nodeTitle);
 
         const nodeContent = document.createElement("div");
@@ -1154,9 +1265,9 @@
           vrfName.textContent = `📦 IP-VRF: ${row["IP-VRF"] || "-"}`;
 
           const stateSpan = document.createElement("span");
-          const stateVal = (row["Oper State"] || "unknown").toLowerCase();
-          stateSpan.className = stateVal === "up" ? "state-badge-up" : "state-badge-down";
-          stateSpan.textContent = row["Oper State"] || "unknown";
+          const instanceAgg = aggregateServiceState([row]);
+          stateSpan.className = instanceAgg.className;
+          stateSpan.textContent = row["Oper State"] || instanceAgg.badgeText;
 
           vrfHeader.append(vrfName, stateSpan);
           vrfDiv.append(vrfHeader);
@@ -1511,6 +1622,20 @@
   );
 
   dom.clearFiltersBtn.addEventListener("click", clearAllFilters);
+
+  if (dom.kpiCardBd) {
+    dom.kpiCardBd.addEventListener("click", () => {
+      const report = state.reports.find((r) => r.name === "bridge_domains");
+      if (report) selectReport(report);
+    });
+  }
+
+  if (dom.kpiCardRouters) {
+    dom.kpiCardRouters.addEventListener("click", () => {
+      const report = state.reports.find((r) => r.name === "routers");
+      if (report) selectReport(report);
+    });
+  }
 
   dom.viewModeBtn.addEventListener("click", () => {
     state.viewMode = state.viewMode === "tree" ? "table" : "tree";

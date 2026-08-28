@@ -91,7 +91,7 @@ class GnmiSubscription:
             self._call.cancel()
         except Exception as exc:  # noqa: BLE001 - best effort teardown
             logger.debug("cancelling subscription failed: %s", exc)
-        self._reader.join(timeout=2)
+        self._reader.join(timeout=0.2)
 
 
 def _rpc_handles(client: Any) -> Any:

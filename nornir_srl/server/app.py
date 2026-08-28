@@ -76,26 +76,47 @@ async def table_events(
     loop = asyncio.get_running_loop()
     last_digest = ""
     last_sent = 0.0
-    while not await is_disconnected():
+    try:
+        while not await is_disconnected():
+            try:
+                table = await anyio.to_thread.run_sync(store.table, report, inv_filter)
+            except (asyncio.CancelledError, GeneratorExit):
+                break
+            except Exception as exc:  # noqa: BLE001 - surfaced in the browser
+                logger.exception("rendering report '%s' failed", report.name)
+                payload = json.dumps({"error": str(exc)})
+                yield f"event: error\ndata: {payload}\n\n".encode()
+                await asyncio.sleep(interval)
+                continue
+            digest = table_digest(table)
+            now = loop.time()
+            if digest != last_digest:
+                last_digest = digest
+                last_sent = now
+                body = json.dumps(table, default=str)
+                yield f"event: table\ndata: {body}\n\n".encode()
+            elif now - last_sent > SSE_HEARTBEAT:
+                last_sent = now
+                yield b": keep-alive\n\n"
+            try:
+                await asyncio.sleep(interval)
+            except (asyncio.CancelledError, GeneratorExit):
+                break
+    except (asyncio.CancelledError, GeneratorExit):
+        return
+
+
+class SuppressCancelledErrorMiddleware:
+    """Catch asyncio.CancelledError during uvicorn shutdown to prevent traceback noise."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         try:
-            table = await anyio.to_thread.run_sync(store.table, report, inv_filter)
-        except Exception as exc:  # noqa: BLE001 - surfaced in the browser
-            logger.exception("rendering report '%s' failed", report.name)
-            payload = json.dumps({"error": str(exc)})
-            yield f"event: error\ndata: {payload}\n\n".encode()
-            await asyncio.sleep(interval)
-            continue
-        digest = table_digest(table)
-        now = loop.time()
-        if digest != last_digest:
-            last_digest = digest
-            last_sent = now
-            body = json.dumps(table, default=str)
-            yield f"event: table\ndata: {body}\n\n".encode()
-        elif now - last_sent > SSE_HEARTBEAT:
-            last_sent = now
-            yield b": keep-alive\n\n"
-        await asyncio.sleep(interval)
+            await self.app(scope, receive, send)
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
 
 
 def create_app(
@@ -108,6 +129,7 @@ def create_app(
     idle_timeout: float = 900.0,
     restart_debounce: float = 1.0,
     connect_retry_interval: float = 30.0,
+    topo_name: Optional[str] = None,
 ) -> Starlette:
     """Build the fcli server application around an initialized Nornir inventory."""
     store = FabricStore(
@@ -118,6 +140,7 @@ def create_app(
         idle_timeout=idle_timeout,
         restart_debounce=restart_debounce,
         connect_retry_interval=connect_retry_interval,
+        topo_name=topo_name,
     )
 
     @contextlib.asynccontextmanager
@@ -133,7 +156,11 @@ def create_app(
 
     async def reports(_request: Request) -> Response:
         return JSONResponse(
-            {"version": __version__, "reports": [r.as_dict() for r in REPORTS]}
+            {
+                "version": __version__,
+                "topo_name": store.topo_name,
+                "reports": [r.as_dict() for r in REPORTS],
+            }
         )
 
     async def inventory(_request: Request) -> Response:
@@ -186,7 +213,7 @@ def create_app(
 
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.store = store
-    return app
+    return SuppressCancelledErrorMiddleware(app)
 
 
 def serve(
@@ -200,6 +227,7 @@ def serve(
     workers: int = 20,
     idle_timeout: float = 900.0,
     log_level: str = "info",
+    topo_name: Optional[str] = None,
 ) -> None:
     """Run the fcli server with uvicorn (blocking)."""
     import uvicorn
@@ -211,7 +239,18 @@ def serve(
         refresh=refresh,
         workers=workers,
         idle_timeout=idle_timeout,
+        topo_name=topo_name,
     )
-    uvicorn.run(
-        app, host=host, port=port, log_level=log_level.lower(), access_log=False
+    config = uvicorn.Config(
+        app,
+        host=host,
+        port=port,
+        log_level=log_level.lower(),
+        access_log=False,
+        timeout_graceful_shutdown=5.0,
     )
+    server = uvicorn.Server(config)
+    try:
+        server.run()
+    except (KeyboardInterrupt, SystemExit):
+        pass

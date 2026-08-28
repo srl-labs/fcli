@@ -33,8 +33,10 @@ class FabricStore:
         restart_debounce: float = 1.0,
         idle_timeout: float = 900.0,
         connect_retry_interval: float = 30.0,
+        topo_name: Optional[str] = None,
     ) -> None:
         self.nornir = nornir
+        self.topo_name = topo_name
         self.sample_interval = sample_interval
         self.resync_interval = resync_interval
         self.restart_debounce = restart_debounce
@@ -76,7 +78,16 @@ class FabricStore:
     def start(self) -> None:
         """Open a gNMI connection to every node in the inventory."""
         hosts = list(self.nornir.inventory.hosts.items())
-        list(self._pool.map(lambda item: self._connect(*item), hosts))
+        futures = [self._pool.submit(self._connect, name, host) for name, host in hosts]
+        for fut in futures:
+            while not self._stop.is_set():
+                try:
+                    fut.result(timeout=0.1)
+                    break
+                except TimeoutError:
+                    continue
+                except Exception:
+                    break
         connected = len(self._streams)
         logger.info("connected to %d/%d node(s)", connected, len(hosts))
         if self.resync_interval > 0:
@@ -210,9 +221,26 @@ class FabricStore:
         self._stop.set()
         with self._lock:
             self._table_cache.clear()
-        for stream in list(self._streams.values()):
-            stream.stop()
-        self._pool.shutdown(wait=False)
+
+        hosts = list(self.nornir.inventory.hosts.items())
+        streams = list(self._streams.values())
+
+        def _close_host(item: Tuple[str, Any]) -> None:
+            name, host = item
+            try:
+                host.close_connections()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("%s: error closing connection: %s", name, exc)
+
+        def _stop_stream(stream: Any) -> None:
+            try:
+                stream.stop()
+            except Exception:  # noqa: BLE001
+                pass
+
+        list(self._pool.map(_close_host, hosts))
+        list(self._pool.map(_stop_stream, streams))
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------ #
     # inventory
@@ -445,32 +473,53 @@ class FabricStore:
         itf_down = 0
         itf_errors = 0
 
+        bd_instances_list: List[Dict[str, Any]] = []
+        router_instances_list: List[Dict[str, Any]] = []
+
+        def _clean_val(v: Any) -> str:
+            if not v:
+                return ""
+            s = str(v).lower()
+            return s.split(":")[-1]
+
         with self._lock:
             for name in names:
                 stream = self._streams.get(name)
                 if stream is None:
                     continue
-                itf_node = stream._tree.get("interface")
-                if itf_node is not None:
-                    itfs = materialize(itf_node)
+                with stream._lock:
+                    itf_node = stream._tree.get("interface")
+                    itfs = materialize(itf_node) if itf_node is not None else None
+                    ni_node = stream._tree.get("network-instance")
+                    nis = materialize(ni_node) if ni_node is not None else None
+
+                if itfs is not None:
                     if isinstance(itfs, list):
                         for item in itfs:
                             if isinstance(item, dict):
-                                admin = str(item.get("admin-state", "")).lower()
+                                admin = _clean_val(item.get("admin-state"))
                                 if admin in ("disable", "disabled"):
                                     continue
                                 subitfs = item.get("subinterface", [])
-                                name = str(item.get("name", ""))
+                                has_subitfs = len(subitfs) > 0 if isinstance(subitfs, list) else bool(subitfs)
+                                has_desc = bool(item.get("description"))
+                                eth_cfg = item.get("ethernet", {})
+                                has_lag = bool(eth_cfg.get("aggregate-id")) if isinstance(eth_cfg, dict) else False
+                                itf_name = str(item.get("name", ""))
+                                is_sys = itf_name.startswith(("mgmt", "system", "lo", "lag"))
+                                oper_st = _clean_val(item.get("oper-state"))
+
                                 is_configured = (
-                                    len(subitfs) > 0
-                                    or item.get("oper-state") == "up"
-                                    or bool(item.get("description"))
-                                    or name.startswith(("mgmt", "system", "lo", "lag"))
+                                    oper_st == "up"
+                                    or is_sys
+                                    or has_subitfs
+                                    or has_desc
+                                    or has_lag
                                 )
                                 if not is_configured:
                                     continue
                                 itf_total += 1
-                                if item.get("oper-state") == "down":
+                                if oper_st == "down":
                                     itf_down += 1
                                 stats = item.get("statistics", {})
                                 if isinstance(stats, dict):
@@ -483,21 +532,93 @@ class FabricStore:
                                     if err_cnt > 0:
                                         itf_errors += 1
 
-                ni_node = stream._tree.get("network-instance")
-                if ni_node is not None:
-                    nis = materialize(ni_node)
+                if nis is not None:
                     if isinstance(nis, list):
                         for ni in nis:
-                            if isinstance(ni, dict):
-                                bgp = ni.get("protocols", {}).get("bgp", {})
-                                for nbr in bgp.get("neighbor", []):
-                                    if isinstance(nbr, dict):
-                                        bgp_total += 1
-                                        state = str(nbr.get("session-state", "")).lower()
-                                        if state == "established":
-                                            bgp_established += 1
-                                        else:
-                                            bgp_down += 1
+                            if not isinstance(ni, dict):
+                                continue
+                            ni_name = str(ni.get("name", ""))
+                            ni_type = _clean_val(ni.get("type"))
+                            oper_state = _clean_val(ni.get("oper-state")) or "unknown"
+
+                            bgp = ni.get("protocols", {}).get("bgp", {})
+                            for nbr in bgp.get("neighbor", []):
+                                if isinstance(nbr, dict):
+                                    bgp_total += 1
+                                    state = _clean_val(nbr.get("session-state"))
+                                    if state == "established":
+                                        bgp_established += 1
+                                    else:
+                                        bgp_down += 1
+
+                            bgp_vpn = ni.get("protocols", {}).get("bgp-vpn", {})
+                            bgp_instances = bgp_vpn.get("bgp-instance", [])
+                            if isinstance(bgp_instances, dict):
+                                bgp_instances = [bgp_instances]
+                            rts = set()
+                            for inst in bgp_instances:
+                                if isinstance(inst, dict):
+                                    rt_cfg = inst.get("route-target", {})
+                                    if isinstance(rt_cfg, dict):
+                                        for key in ("import-rt", "export-rt"):
+                                            rts_raw = rt_cfg.get(key, [])
+                                            if isinstance(rts_raw, (str, dict)):
+                                                rts_raw = [rts_raw]
+                                            for item in rts_raw:
+                                                target = item.get("target") if isinstance(item, dict) else item
+                                                if target:
+                                                    t_str = str(target)
+                                                    if not t_str.startswith("target:"):
+                                                        t_str = f"target:{t_str}"
+                                                    rts.add(t_str)
+                            rt_list = sorted(list(rts))
+
+                            if ni_type == "mac-vrf":
+                                primary_bd = rt_list[0] if rt_list else f"mac-vrf:{ni_name}"
+                                bd_instances_list.append({
+                                    "name": primary_bd,
+                                    "oper_state": oper_state,
+                                })
+                            elif ni_type in ("ip-vrf", "vrf") and ni_name != "mgmt":
+                                primary_router = rt_list[0] if rt_list else f"ip-vrf:{ni_name}"
+                                router_instances_list.append({
+                                    "name": primary_router,
+                                    "oper_state": oper_state,
+                                })
+
+        # Aggregate Bridge Domains
+        bd_map: Dict[str, List[str]] = {}
+        for item in bd_instances_list:
+            bd_map.setdefault(item["name"], []).append(item["oper_state"])
+
+        bd_up = 0
+        bd_degraded = 0
+        bd_down = 0
+        for _bd_name, st_list in bd_map.items():
+            up_cnt = sum(1 for s in st_list if s in ("up", "enable", "enabled", "active", "established"))
+            if up_cnt == len(st_list):
+                bd_up += 1
+            elif up_cnt == 0:
+                bd_down += 1
+            else:
+                bd_degraded += 1
+
+        # Aggregate Routers
+        router_map: Dict[str, List[str]] = {}
+        for item in router_instances_list:
+            router_map.setdefault(item["name"], []).append(item["oper_state"])
+
+        r_up = 0
+        r_degraded = 0
+        r_down = 0
+        for _r_name, st_list in router_map.items():
+            up_cnt = sum(1 for s in st_list if s in ("up", "enable", "enabled", "active", "established"))
+            if up_cnt == len(st_list):
+                r_up += 1
+            elif up_cnt == 0:
+                r_down += 1
+            else:
+                r_degraded += 1
 
         return {
             "nodes": {
@@ -515,6 +636,20 @@ class FabricStore:
                 "total": itf_total,
                 "down": itf_down,
                 "errors": itf_errors,
+            },
+            "bridge_domains": {
+                "total": len(bd_map),
+                "up": bd_up,
+                "degraded": bd_degraded,
+                "down": bd_down,
+                "instances": len(bd_instances_list),
+            },
+            "routers": {
+                "total": len(router_map),
+                "up": r_up,
+                "degraded": r_degraded,
+                "down": r_down,
+                "instances": len(router_instances_list),
             },
             "telemetry": {
                 "subscriptions": sum(len(s.status()["paths"]) for s in self._streams.values()),

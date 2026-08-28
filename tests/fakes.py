@@ -70,6 +70,8 @@ class FakeDevice:
             if self.down:
                 raise RuntimeError("GRPC ERROR: failed to connect to all addresses")
             if path not in self.responses:
+                if path.startswith(("/interface[name=*]", "/network-instance[name=*]")):
+                    continue
                 raise ValueError(f"unexpected path {path}")
             result.extend(self.responses[path])
         return result

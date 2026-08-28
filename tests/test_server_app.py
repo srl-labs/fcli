@@ -165,6 +165,14 @@ def test_store_connects_to_every_node(store):
     assert {h["name"] for h in inventory} == set(HOSTS)
 
 
+def test_store_stop_closes_host_connections(fabric):
+    nornir, devices = fabric
+    fabric_store = FabricStore(nornir, resync_interval=0, restart_debounce=0.02)
+    fabric_store.start()
+    fabric_store.stop()
+    assert fabric_store._stop.is_set()
+
+
 def test_table_renders_rows_for_all_nodes(store):
     fabric_store, _devices = store
     table = fabric_store.table(get_report("lldp"))
@@ -577,6 +585,14 @@ def test_reports_endpoint_lists_every_report(client):
     assert all(r["title"] and r["description"] for r in payload["reports"])
 
 
+def test_reports_endpoint_returns_topo_name(fabric):
+    nornir, _devices = fabric
+    app = create_app(nornir, resync_interval=0, topo_name="dc1")
+    with TestClient(app) as test_client:
+        payload = test_client.get("/api/reports").json()
+        assert payload["topo_name"] == "dc1"
+
+
 def test_inventory_endpoint(client):
     test_client, _devices = client
     hosts = test_client.get("/api/inventory").json()["hosts"]
@@ -632,6 +648,10 @@ def test_overview_endpoint(client):
     assert "established" in data["bgp"]
     assert "total" in data["interfaces"]
     assert "subscriptions" in data["telemetry"]
+    assert "bridge_domains" in data
+    assert "routers" in data
+    assert "total" in data["bridge_domains"]
+    assert "total" in data["routers"]
 
 
 def test_store_overview_method(store):
@@ -642,6 +662,8 @@ def test_store_overview_method(store):
     assert isinstance(data["bgp"]["established"], int)
     assert isinstance(data["interfaces"]["total"], int)
     assert isinstance(data["telemetry"]["subscriptions"], int)
+    assert isinstance(data["bridge_domains"]["total"], int)
+    assert isinstance(data["routers"]["total"], int)
 
 
 @pytest.mark.anyio

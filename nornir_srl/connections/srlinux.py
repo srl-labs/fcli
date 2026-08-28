@@ -130,7 +130,12 @@ class SrLinux(
         )
 
     def close(self) -> None:
-        self._connection.close()
+        if getattr(self, "_connection", None) is not None:
+            try:
+                self._connection.close()
+            except Exception:
+                pass
+            self._connection = None
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__} on {self.hostname}"

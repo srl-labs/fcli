@@ -351,9 +351,11 @@ def get_node(root: Dict[str, Any], path: str) -> Optional[Any]:
 def materialize(node: Any) -> Any:
     """Render a tree node back into plain JSON, as a gNMI ``Get`` would."""
     if isinstance(node, ListNode):
-        return [{**keys, **materialize(child)} for keys, child in node.entries.values()]
+        entries = list(node.entries.values())
+        return [{**keys, **materialize(child)} for keys, child in entries]
     if isinstance(node, dict):
-        return {k: materialize(v) for k, v in node.items()}
+        items = list(node.items())
+        return {k: materialize(v) for k, v in items}
     if isinstance(node, list):
         return copy.deepcopy(node)
     return node

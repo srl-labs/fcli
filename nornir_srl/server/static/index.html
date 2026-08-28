@@ -16,6 +16,7 @@
         <header class="brand">
           <span class="brand-mark">fcli</span>
           <span class="brand-sub">SR Linux fabric</span>
+          <span id="topo-badge" class="topo-badge" hidden></span>
         </header>
 
         <div class="side-block">
@@ -131,6 +132,32 @@
               <div class="kpi-sub">
                 <span class="state-down" id="kpi-itf-down">0 oper down</span> ·
                 <span class="state-down" id="kpi-itf-errors">0 errors/discards</span>
+              </div>
+            </div>
+            <div class="kpi-card" id="kpi-card-bd" style="cursor: pointer;" title="Click to view Bridge Domains report">
+              <div class="kpi-header">
+                <span class="kpi-title">Bridge Domains</span>
+                <span class="kpi-icon">🌉</span>
+              </div>
+              <div class="kpi-value" id="kpi-bd-total">0</div>
+              <div class="kpi-sub">
+                <span class="state-up" id="kpi-bd-up">0 up</span>
+                <span class="state-warn" id="kpi-bd-degraded"></span>
+                <span class="state-down" id="kpi-bd-down"></span>
+                <span class="muted" id="kpi-bd-instances"></span>
+              </div>
+            </div>
+            <div class="kpi-card" id="kpi-card-routers" style="cursor: pointer;" title="Click to view Routers report">
+              <div class="kpi-header">
+                <span class="kpi-title">Routers</span>
+                <span class="kpi-icon">🔀</span>
+              </div>
+              <div class="kpi-value" id="kpi-routers-total">0</div>
+              <div class="kpi-sub">
+                <span class="state-up" id="kpi-routers-up">0 up</span>
+                <span class="state-warn" id="kpi-routers-degraded"></span>
+                <span class="state-down" id="kpi-routers-down"></span>
+                <span class="muted" id="kpi-routers-instances"></span>
               </div>
             </div>
             <div class="kpi-card">

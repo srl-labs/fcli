@@ -64,7 +64,13 @@ REPORTS: List[Report] = [
             SubscriptionSpec("/interface[name=*]/statistics", sample_interval=10),
             SubscriptionSpec("/interface[name=*]/admin-state", sample_interval=10),
             SubscriptionSpec("/interface[name=*]/oper-state", sample_interval=10),
+            SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=10),
+            SubscriptionSpec("/interface[name=*]/description", sample_interval=10),
+            SubscriptionSpec("/interface[name=*]/ethernet", datatype="all", sample_interval=10),
+            SubscriptionSpec("/network-instance[name=*]/type", sample_interval=10),
+            SubscriptionSpec("/network-instance[name=*]/oper-state", sample_interval=10),
             SubscriptionSpec("/network-instance[name=*]/protocols/bgp/neighbor", datatype="all", sample_interval=10),
+            SubscriptionSpec("/network-instance[name=*]/protocols/bgp-vpn", datatype="all", sample_interval=10),
         ],
     ),
     Report(

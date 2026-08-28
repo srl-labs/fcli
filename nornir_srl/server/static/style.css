@@ -71,8 +71,9 @@ body {
   padding: 14px 16px;
   border-bottom: 1px solid var(--border);
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .brand-mark {
@@ -85,6 +86,21 @@ body {
 .brand-sub {
   font-size: 12px;
   color: var(--muted);
+}
+
+.topo-badge {
+  font-size: 11px;
+  font-family: var(--mono);
+  background: var(--accent-soft);
+  color: var(--accent);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+  margin-left: auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 120px;
 }
 
 .side-block {
@@ -927,12 +943,36 @@ th.filtered::after {
   font-size: 11px;
 }
 
+.state-badge-warn {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.15);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+}
+
 .state-badge-down {
   color: #f87171;
   background: rgba(248, 113, 113, 0.15);
   padding: 1px 6px;
   border-radius: 4px;
   font-size: 11px;
+}
+
+.bd-state-badge {
+  font-size: 11px;
+  font-weight: 700;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.bd-node-state {
+  font-size: 10px;
+  font-weight: 700;
+  font-family: var(--mono);
+  text-transform: uppercase;
+  margin-left: 4px;
 }
 
 .vrf-link {
