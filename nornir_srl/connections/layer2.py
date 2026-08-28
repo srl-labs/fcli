@@ -429,8 +429,25 @@ class Layer2Mixin:
                 return parts[-1]
             return "untagged"
 
-        def _format_irb_item_and_subnets(itf_name: str, itf_dict: Dict[str, Any], assoc_vrfs: List[str]) -> Tuple[str, List[str]]:
+        def _clean_st(val: Any) -> str:
+            if not val:
+                return ""
+            s = str(val).lower()
+            return s.split(":")[-1]
+
+        def _get_subitf_state(itf_name: str, itf_dict: Dict[str, Any]) -> str:
             si = subitf_details.get(itf_name, {})
+            st = _clean_st(si.get("oper-state")) or _clean_st(itf_dict.get("oper-state"))
+            if st:
+                return st
+            admin = _clean_st(si.get("admin-state")) or _clean_st(itf_dict.get("admin-state"))
+            if admin in ("disable", "disabled"):
+                return "down"
+            return "up"
+
+        def _format_irb_item_and_subnets(itf_name: str, itf_dict: Dict[str, Any], assoc_vrfs: List[str]) -> Tuple[str, List[str], str]:
+            si = subitf_details.get(itf_name, {})
+            st = _get_subitf_state(itf_name, itf_dict)
             ips: List[str] = []
             is_anycast = False
 
@@ -467,7 +484,7 @@ class Layer2Mixin:
             gw_part = f" (anycast-gw: {'true' if is_anycast else 'false'})"
             vrf_part = f" -> {', '.join(assoc_vrfs)}" if assoc_vrfs else ""
 
-            return f"{itf_name}{ip_part}{gw_part}{vrf_part}", subnets
+            return f"{itf_name} [{st}]{ip_part}{gw_part}{vrf_part}", subnets, st
 
         for ni in ni_list:
             if not isinstance(ni, dict):
@@ -507,17 +524,20 @@ class Layer2Mixin:
             irb_subitfs = []
             bridge_subitfs = []
             all_subnets = []
+            subitf_states = []
             for i in ni.get("interface", []):
                 if isinstance(i, dict) and i.get("name"):
                     name = i["name"]
+                    st = _get_subitf_state(name, i)
+                    subitf_states.append(st)
                     if name.startswith("irb"):
                         assoc_vrfs = irb_to_ip_vrf.get(name, [])
-                        irb_item_str, subnets = _format_irb_item_and_subnets(name, i, assoc_vrfs)
+                        irb_item_str, subnets, _st = _format_irb_item_and_subnets(name, i, assoc_vrfs)
                         irb_subitfs.append(irb_item_str)
                         all_subnets.extend(subnets)
                     else:
                         vlan_info = _extract_vlan_encap(name, i)
-                        bridge_subitfs.append(f"{name} (VLAN: {vlan_info})")
+                        bridge_subitfs.append(f"{name} [{st}] (VLAN: {vlan_info})")
 
             vxlan_itfs = [
                 v.get("name", "")
@@ -525,12 +545,27 @@ class Layer2Mixin:
                 if isinstance(v, dict) and v.get("name")
             ]
 
+            ni_oper = _clean_st(oper_state)
+            if ni_oper == "down":
+                effective_oper = "down"
+            elif subitf_states:
+                up_cnt = sum(1 for s in subitf_states if s in ("up", "enable", "enabled", "active"))
+                down_cnt = sum(1 for s in subitf_states if s in ("down", "disable", "disabled"))
+                if up_cnt == len(subitf_states):
+                    effective_oper = "up"
+                elif down_cnt == len(subitf_states):
+                    effective_oper = "down"
+                else:
+                    effective_oper = "degraded"
+            else:
+                effective_oper = ni_oper if ni_oper else "up"
+
             primary_bd = rt_list[0] if rt_list else f"mac-vrf:{ni_name}"
             results.append(
                 {
                     "Bridge Domain": primary_bd,
                     "MAC-VRF": ni_name,
-                    "Oper State": oper_state,
+                    "Oper State": effective_oper,
                     "Route Targets": rt_display,
                     "Subnets": ", ".join(all_subnets) if all_subnets else "",
                     "IRB Interface": ", ".join(irb_subitfs) if irb_subitfs else "-",
@@ -588,6 +623,22 @@ class Layer2Mixin:
             except BaseException as e:
                 if not _gnmi_path_missing(e):
                     pass
+
+        def _clean_st(val: Any) -> str:
+            if not val:
+                return ""
+            s = str(val).lower()
+            return s.split(":")[-1]
+
+        def _get_subitf_state(itf_name: str, itf_dict: Dict[str, Any]) -> str:
+            si = subitf_details.get(itf_name, {})
+            st = _clean_st(si.get("oper-state")) or _clean_st(itf_dict.get("oper-state"))
+            if st:
+                return st
+            admin = _clean_st(si.get("admin-state")) or _clean_st(itf_dict.get("admin-state"))
+            if admin in ("disable", "disabled"):
+                return "down"
+            return "up"
 
         # Build mapping of irb_subinterface -> mac-vrf network instance name
         irb_to_mac_vrf: Dict[str, str] = {}
@@ -660,24 +711,27 @@ class Layer2Mixin:
 
             mac_vrfs_items = []
             routed_itfs_items = []
+            subitf_states = []
 
             for i in ni.get("interface", []):
                 if isinstance(i, dict) and i.get("name"):
                     name = i["name"]
+                    st = _get_subitf_state(name, i)
+                    subitf_states.append(st)
                     ips = _get_ip_addresses(name, i)
                     ip_str = ", ".join(ips) if ips else ""
 
                     if name.startswith("irb"):
                         mac_name = irb_to_mac_vrf.get(name, "unknown")
                         if ip_str:
-                            mac_vrfs_items.append(f"{mac_name} (IRB-interface: {ip_str})")
+                            mac_vrfs_items.append(f"{mac_name} ({name} [{st}]: {ip_str})")
                         else:
-                            mac_vrfs_items.append(f"{mac_name} ( )")
+                            mac_vrfs_items.append(f"{mac_name} ({name} [{st}])")
                     else:
                         if ip_str:
-                            routed_itfs_items.append(f"{name} ({ip_str})")
+                            routed_itfs_items.append(f"{name} [{st}] ({ip_str})")
                         else:
-                            routed_itfs_items.append(f"{name} ()")
+                            routed_itfs_items.append(f"{name} [{st}]")
 
             vxlan_itfs = [
                 v.get("name", "")
@@ -685,12 +739,27 @@ class Layer2Mixin:
                 if isinstance(v, dict) and v.get("name")
             ]
 
+            ni_oper = _clean_st(oper_state)
+            if ni_oper == "down":
+                effective_oper = "down"
+            elif subitf_states:
+                up_cnt = sum(1 for s in subitf_states if s in ("up", "enable", "enabled", "active"))
+                down_cnt = sum(1 for s in subitf_states if s in ("down", "disable", "disabled"))
+                if up_cnt == len(subitf_states):
+                    effective_oper = "up"
+                elif down_cnt == len(subitf_states):
+                    effective_oper = "down"
+                else:
+                    effective_oper = "degraded"
+            else:
+                effective_oper = ni_oper if ni_oper else "up"
+
             primary_router = rt_list[0] if rt_list else f"none (isolated) - {ni_name}"
             results.append(
                 {
                     "Router": primary_router,
                     "IP-VRF": ni_name,
-                    "Oper State": oper_state,
+                    "Oper State": effective_oper,
                     "Route Targets": rt_display,
                     "MAC-VRFs": ", ".join(mac_vrfs_items) if mac_vrfs_items else "-",
                     "Routed Interfaces": ", ".join(routed_itfs_items) if routed_itfs_items else "-",

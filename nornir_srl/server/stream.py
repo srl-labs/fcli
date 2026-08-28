@@ -565,6 +565,14 @@ class HostStream:
         with self._lock:
             state = self._paths.get(path)
             if state is None or not state.bootstrapped or not state.streamable:
+                if "interface" in path:
+                    node = self._tree.get("interface")
+                    if node is not None:
+                        return [{"interface": materialize(node)}]
+                elif "network-instance" in path:
+                    node = self._tree.get("network-instance")
+                    if node is not None:
+                        return [{"network-instance": materialize(node)}]
                 return None
             state.last_read = time.time()
             result: List[Dict[str, Any]] = []

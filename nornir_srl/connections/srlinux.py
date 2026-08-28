@@ -147,9 +147,10 @@ class SrLinux(
         strip_mod: Optional[bool] = True,
     ) -> List[Dict[str, Any]]:
         if self._connection:
+            clean_paths = [p.replace("[name=*]", "") if "[name=*]" in p else p for p in paths]
             resp = normalize_gnmi_resp(
                 self._connection.get(
-                    path=paths, datatype=datatype, encoding="json_ietf"  # type: ignore
+                    path=clean_paths, datatype=datatype, encoding="json_ietf"  # type: ignore
                 )
             )
         else:

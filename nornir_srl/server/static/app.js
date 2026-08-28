@@ -985,6 +985,7 @@
             irbStr.split(",").forEach((s) => {
               const p = document.createElement("span");
               p.className = "pill pill-irb";
+              if (s.toLowerCase().includes("[down]")) p.classList.add("pill-down");
 
               if (s.includes("->")) {
                 const parts = s.split("->");
@@ -1032,6 +1033,7 @@
             subitfStr.split(",").forEach((s) => {
               const p = document.createElement("span");
               p.className = "pill";
+              if (s.toLowerCase().includes("[down]")) p.classList.add("pill-down");
               p.textContent = s.trim();
               pillGroup.append(p);
             });
@@ -1292,6 +1294,7 @@
             items.forEach((itemStr) => {
               const p = document.createElement("span");
               p.className = "pill pill-macvrf";
+              if (itemStr.toLowerCase().includes("[down]")) p.classList.add("pill-down");
 
               const match = itemStr.trim().match(/^([^\s(]+)(.*)$/);
               if (match) {
@@ -1334,6 +1337,7 @@
             routedStr.split(",").forEach((s) => {
               const p = document.createElement("span");
               p.className = "pill";
+              if (s.toLowerCase().includes("[down]")) p.classList.add("pill-down");
               p.textContent = s.trim();
               pillGroup.append(p);
             });

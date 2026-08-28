@@ -573,17 +573,43 @@ class FabricStore:
                                                     rts.add(t_str)
                             rt_list = sorted(list(rts))
 
+                            # Determine effective_ni_state incorporating sub-interfaces
+                            sub_states = []
+                            for i in ni.get("interface", []):
+                                if isinstance(i, dict) and i.get("name"):
+                                    i_name = str(i["name"])
+                                    if itfs and isinstance(itfs, list):
+                                        for itf_item in itfs:
+                                            if isinstance(itf_item, dict) and itf_item.get("name") == i_name:
+                                                op = _clean_val(itf_item.get("oper-state"))
+                                                if op:
+                                                    sub_states.append(op)
+
+                            if oper_state == "down":
+                                effective_ni_state = "down"
+                            elif sub_states:
+                                up_cnt = sum(1 for s in sub_states if s in ("up", "enable", "enabled", "active"))
+                                down_cnt = sum(1 for s in sub_states if s in ("down", "disable", "disabled"))
+                                if up_cnt == len(sub_states):
+                                    effective_ni_state = "up"
+                                elif down_cnt == len(sub_states):
+                                    effective_ni_state = "down"
+                                else:
+                                    effective_ni_state = "degraded"
+                            else:
+                                effective_ni_state = oper_state
+
                             if ni_type == "mac-vrf":
                                 primary_bd = rt_list[0] if rt_list else f"mac-vrf:{ni_name}"
                                 bd_instances_list.append({
                                     "name": primary_bd,
-                                    "oper_state": oper_state,
+                                    "oper_state": effective_ni_state,
                                 })
                             elif ni_type in ("ip-vrf", "vrf") and ni_name != "mgmt":
                                 primary_router = rt_list[0] if rt_list else f"ip-vrf:{ni_name}"
                                 router_instances_list.append({
                                     "name": primary_router,
-                                    "oper_state": oper_state,
+                                    "oper_state": effective_ni_state,
                                 })
 
         # Aggregate Bridge Domains

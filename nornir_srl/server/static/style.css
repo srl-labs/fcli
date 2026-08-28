@@ -923,6 +923,12 @@ th.filtered::after {
   border: 1px solid rgba(236, 72, 153, 0.3);
 }
 
+.pill-down {
+  background: rgba(248, 113, 113, 0.15) !important;
+  color: #f87171 !important;
+  border: 1px solid rgba(248, 113, 113, 0.4) !important;
+}
+
 .services-section-header {
   font-size: 15px;
   font-weight: 700;

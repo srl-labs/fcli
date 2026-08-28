@@ -567,8 +567,8 @@ def test_get_bridge_domains():
     assert bd["MAC-VRF"] == "mac-vrf-100"
     assert bd["Oper State"] == "up"
     assert bd["Subnets"] == "10.1.100.0/24"
-    assert bd["IRB Interface"] == "irb1.100: 10.1.100.1/24 (anycast-gw: true) -> ip-vrf-1"
-    assert bd["Sub-Interfaces"] == "ethernet-1/1.100 (VLAN: 100), ethernet-1/2.100 (VLAN: 100)"
+    assert bd["IRB Interface"] == "irb1.100 [up]: 10.1.100.1/24 (anycast-gw: true) -> ip-vrf-1"
+    assert bd["Sub-Interfaces"] == "ethernet-1/1.100 [up] (VLAN: 100), ethernet-1/2.100 [up] (VLAN: 100)"
     assert bd["VXLAN Interface"] == "vxlan1.100"
 
 
@@ -641,8 +641,8 @@ def test_get_routers():
     assert r["IP-VRF"] == "ip-vrf-1"
     assert r["Oper State"] == "up"
     assert r["Route Targets"] == "target:65000:999"
-    assert r["MAC-VRFs"] == "mac-vrf-100 (IRB-interface: 10.1.100.1/24)"
-    assert r["Routed Interfaces"] == "ethernet-1/10.0 (192.168.1.1/30)"
+    assert r["MAC-VRFs"] == "mac-vrf-100 (irb1.100 [up]: 10.1.100.1/24)"
+    assert r["Routed Interfaces"] == "ethernet-1/10.0 [up] (192.168.1.1/30)"
     assert r["VXLAN Interface"] == "vxlan1.1"
 
     # Test isolated ip-vrf without route targets
