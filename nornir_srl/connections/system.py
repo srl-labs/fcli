@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from .helpers import first_payload
+
 
 class SystemMixin:
     """Mixin providing system related getters."""
@@ -40,10 +42,11 @@ class SystemMixin:
         result: Dict[str, Any] = {}
         for spec in path_specs:
             resp = self.get(paths=[spec.get("path", "")], datatype=spec["datatype"])
-            for path in resp[0]:
-                result.update(
-                    {k: v for k, v in resp[0][path].items() if k in spec["fields"]}
-                )
+            for value in first_payload(resp).values():
+                if isinstance(value, dict):
+                    result.update(
+                        {k: v for k, v in value.items() if k in spec["fields"]}
+                    )
         if result.get("software-version"):
             result["software-version"] = (
                 result["software-version"].split("-")[0].lstrip("v")

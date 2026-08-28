@@ -6,7 +6,8 @@ import time
 import pytest
 
 from nornir_srl.server.devices import CachedDevice, RecordingDevice
-from nornir_srl.server.stream import HostStream, RateTracker, SubscriptionSpec
+from nornir_srl.reports import SubscriptionSpec
+from nornir_srl.server.stream import HostStream, RateTracker
 
 from .fakes import (
     IFSTATE_PATH,

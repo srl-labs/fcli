@@ -170,6 +170,9 @@
       const hiddenData = localStorage.getItem(`fcli-hidden-${state.report.name}`);
       if (hiddenData) {
         JSON.parse(hiddenData).forEach((col) => state.hidden.add(col));
+      } else if (["bridge_domains", "services", "routers"].includes(state.report.name)) {
+        // Node identifiers shown next to the name in the tree, not as table columns.
+        ["System IPv4", "System IPv6"].forEach((c) => state.hidden.add(c));
       }
       const filtersData = localStorage.getItem(`fcli-filters-${state.report.name}`);
       if (filtersData) {
@@ -732,29 +735,89 @@
     }
   }
 
+  const UP_STATES = ["up", "enable", "enabled", "active", "established"];
+  const DOWN_STATES = ["down", "disable", "disabled"];
+
+  // Anything that is neither plainly up nor plainly down counts as degraded -
+  // notably the "degraded" a service gets when only some of its interfaces are
+  // up, which red would put on a par with a service that is entirely gone.
+  function stateKind(state) {
+    const st = String(state || "").toLowerCase().trim();
+    if (!st) return "";
+    if (UP_STATES.includes(st)) return "up";
+    if (DOWN_STATES.includes(st)) return "down";
+    return "degraded";
+  }
+
+  // The reports label an interface with its state, and a down one carries the
+  // reason with it: "irb0.0 [down: net-inst-down]: 172.16.20.254/24".
+  function labelledState(text) {
+    const match = /\[([^\]]+)\]/.exec(text || "");
+    return match ? stateKind(match[1].split(":")[0]) : "";
+  }
+
+  // *markUp* is off for pills that already carry a colour of their own to say
+  // what kind of object they are; those only change colour when something is
+  // wrong with them.
+  function applyPillState(pill, text, { markUp = true } = {}) {
+    const kind = labelledState(text);
+    if (!kind || (kind === "up" && !markUp)) return;
+    pill.classList.add(`pill-${kind}`);
+  }
+
   function aggregateServiceState(rows) {
     if (!rows || !rows.length) {
       return { status: "unknown", className: "state-badge-down", badgeText: "UNKNOWN" };
     }
-    let upCount = 0;
-    let downCount = 0;
-
+    const counts = { up: 0, down: 0, degraded: 0 };
     for (const row of rows) {
-      const st = String(row["Oper State"] || "").toLowerCase().trim();
-      if (st === "up" || st === "enable" || st === "enabled" || st === "active" || st === "established") {
-        upCount++;
-      } else {
-        downCount++;
-      }
+      counts[stateKind(row["Oper State"]) || "degraded"] += 1;
     }
 
-    if (upCount === rows.length) {
+    if (counts.up === rows.length) {
       return { status: "up", className: "state-badge-up", badgeText: "UP" };
     }
-    if (downCount === rows.length) {
+    if (counts.down === rows.length) {
       return { status: "down", className: "state-badge-down", badgeText: "DOWN" };
     }
     return { status: "degraded", className: "state-badge-warn", badgeText: "DEGRADED" };
+  }
+
+  function nodeNameWithIps(nodeName, nodeRows) {
+    const wrap = document.createElement("span");
+    wrap.className = "bd-node-name";
+
+    const name = document.createElement("span");
+    name.textContent = `🖥️ Node: ${nodeName}`;
+    wrap.append(name);
+
+    const row = (nodeRows && nodeRows[0]) || {};
+    const ips = [row["System IPv4"], row["System IPv6"]]
+      .map((v) => (typeof v === "string" ? v.trim() : ""))
+      .filter(Boolean);
+    if (ips.length) {
+      const ipSpan = document.createElement("span");
+      ipSpan.className = "bd-node-ips";
+      ipSpan.textContent = ips.join("  ·  ");
+      wrap.append(ipSpan);
+    }
+    return wrap;
+  }
+
+  // A network-instance covered by another report, as a button that jumps to it -
+  // the association is worth a control of its own rather than a link buried in
+  // the text of a pill.
+  function makeJumpButton(report, target, node, title) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "pill pill-jump";
+    button.textContent = target;
+    button.title = title;
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      jumpToVrf(report, target, node);
+    });
+    return button;
   }
 
   function renderBridgeDomainsCards(rows) {
@@ -902,8 +965,7 @@
         nodeChevron.setAttribute("aria-hidden", "true");
         nodeChevron.textContent = "▼";
 
-        const nodeText = document.createElement("span");
-        nodeText.textContent = `🖥️ Node: ${nodeName}`;
+        const nodeText = nodeNameWithIps(nodeName, nodeRows);
 
         const nodeAgg = aggregateServiceState(nodeRows);
 
@@ -969,7 +1031,7 @@
           const details = document.createElement("div");
           details.className = "bd-details";
 
-          // 1. IRB interface (max 1, includes associated ip-vrf name if present)
+          // 1. IRB interface (max 1; its ip-vrf, if any, gets its own button)
           const irbStr = row["IRB Interface"] || "-";
           if (irbStr !== "-") {
             const irbRowDiv = document.createElement("div");
@@ -982,36 +1044,31 @@
 
             const pillGroup = document.createElement("div");
             pillGroup.className = "pill-group";
-            irbStr.split(",").forEach((s) => {
+            // Split only where a new IRB starts, so the commas inside an address
+            // list or a list of VRFs stay where they belong.
+            irbStr.split(/,\s*(?=irb)/i).forEach((entry) => {
+              const [itfText, ...vrfText] = entry.split("->");
+
               const p = document.createElement("span");
-              p.className = "pill pill-irb";
-              if (s.toLowerCase().includes("[down]")) p.classList.add("pill-down");
-
-              if (s.includes("->")) {
-                const parts = s.split("->");
-                const preText = parts[0] + "-> ";
-                const vrfsText = parts.slice(1).join("->").trim();
-
-                p.append(document.createTextNode(preText));
-
-                const vrfs = vrfsText.split(",").map((v) => v.trim()).filter(Boolean);
-                vrfs.forEach((vrf, idx) => {
-                  if (idx > 0) p.append(document.createTextNode(", "));
-                  const link = document.createElement("a");
-                  link.className = "vrf-link";
-                  link.textContent = vrf;
-                  link.href = "#";
-                  link.title = `Jump to Router ${vrf}`;
-                  link.addEventListener("click", (e) => {
-                    e.preventDefault();
-                    jumpToVrf("routers", vrf, nodeName);
-                  });
-                  p.append(link);
-                });
-              } else {
-                p.textContent = s.trim();
-              }
+              p.className = "pill";
+              applyPillState(p, itfText);
+              p.textContent = itfText.trim();
               pillGroup.append(p);
+
+              const vrfs = vrfText
+                .join("->")
+                .split(",")
+                .map((v) => v.trim())
+                .filter(Boolean);
+              vrfs.forEach((vrf) => {
+                const arrow = document.createElement("span");
+                arrow.className = "pill-arrow";
+                arrow.textContent = "→";
+                pillGroup.append(
+                  arrow,
+                  makeJumpButton("routers", vrf, nodeName, `Jump to Router ${vrf}`),
+                );
+              });
             });
             irbRowDiv.append(pillGroup);
             details.append(irbRowDiv);
@@ -1033,7 +1090,7 @@
             subitfStr.split(",").forEach((s) => {
               const p = document.createElement("span");
               p.className = "pill";
-              if (s.toLowerCase().includes("[down]")) p.classList.add("pill-down");
+              applyPillState(p, s);
               p.textContent = s.trim();
               pillGroup.append(p);
             });
@@ -1211,8 +1268,7 @@
         nodeChevron.setAttribute("aria-hidden", "true");
         nodeChevron.textContent = "▼";
 
-        const nodeText = document.createElement("span");
-        nodeText.textContent = `🖥️ Node: ${nodeName}`;
+        const nodeText = nodeNameWithIps(nodeName, nodeRows);
 
         const nodeAgg = aggregateServiceState(nodeRows);
 
@@ -1294,7 +1350,9 @@
             items.forEach((itemStr) => {
               const p = document.createElement("span");
               p.className = "pill pill-macvrf";
-              if (itemStr.toLowerCase().includes("[down]")) p.classList.add("pill-down");
+              // Keeps its own colour while healthy - it says "mac-vrf", and the
+              // name in it is the link across to the Bridge Domains view.
+              applyPillState(p, itemStr, { markUp: false });
 
               const match = itemStr.trim().match(/^([^\s(]+)(.*)$/);
               if (match) {
@@ -1337,7 +1395,7 @@
             routedStr.split(",").forEach((s) => {
               const p = document.createElement("span");
               p.className = "pill";
-              if (s.toLowerCase().includes("[down]")) p.classList.add("pill-down");
+              applyPillState(p, s);
               p.textContent = s.trim();
               pillGroup.append(p);
             });

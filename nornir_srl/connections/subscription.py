@@ -27,6 +27,13 @@ from pygnmi.spec.v080.gnmi_pb2_grpc import gNMIStub
 
 logger = logging.getLogger(__name__)
 
+#: Queued by :meth:`GnmiSubscription.close` to wake a blocked reader at once.
+_CLOSED = object()
+
+
+class SubscriptionClosed(Exception):
+    """Raised by :meth:`GnmiSubscription.get_update` after a local close."""
+
 
 class GnmiSubscription:
     """One ``Subscribe`` RPC, drained by a background thread.
@@ -77,11 +84,17 @@ class GnmiSubscription:
             self.error = ConnectionError("subscription closed by target")
 
     def get_update(self, timeout: Optional[float] = None) -> Dict[str, Any]:
-        """Return the next parsed notification, or raise :class:`TimeoutError`."""
+        """Return the next parsed notification.
+
+        Raises :class:`TimeoutError` if none arrives within *timeout*, or
+        :class:`SubscriptionClosed` if the subscription is closed while waiting.
+        """
         try:
             message = self._updates.get(block=True, timeout=timeout)
         except queue.Empty:
             raise TimeoutError(f"no update from target after {timeout}s") from None
+        if message is _CLOSED:
+            raise SubscriptionClosed("subscription was closed")
         return telemetryParser(message)
 
     def close(self) -> None:
@@ -91,6 +104,10 @@ class GnmiSubscription:
             self._call.cancel()
         except Exception as exc:  # noqa: BLE001 - best effort teardown
             logger.debug("cancelling subscription failed: %s", exc)
+        # Cancelling ends the drain thread but says nothing to a consumer already
+        # blocked on the queue, which would otherwise sit out its full timeout
+        # before noticing - once per node, on every re-subscribe and shutdown.
+        self._updates.put(_CLOSED)
         self._reader.join(timeout=0.2)
 
 

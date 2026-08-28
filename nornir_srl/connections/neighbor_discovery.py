@@ -4,6 +4,25 @@ from typing import Any, Dict, List, Optional
 import datetime
 import jmespath
 
+from .helpers import as_list, first_payload
+
+
+def _relative_expiry(timestamp: Any) -> str:
+    """Render a device timestamp as the time left until it, e.g. ``0:03:41s``.
+
+    SR Linux reports these in UTC (the trailing ``Z``), so they have to be
+    compared against UTC rather than the local clock - otherwise every entry is
+    off by the timezone offset of whoever is running fcli.
+    """
+    try:
+        expires_at = datetime.datetime.strptime(
+            timestamp, "%Y-%m-%dT%H:%M:%S.%fZ"
+        ).replace(tzinfo=datetime.timezone.utc)
+    except (TypeError, ValueError):
+        return "-"
+    remaining = expires_at - datetime.datetime.now(datetime.timezone.utc)
+    return str(remaining).split(".")[0] + "s"
+
 
 class NeighborDiscoveryMixin:
     """Mixin providing ARP and ND getters."""
@@ -25,7 +44,7 @@ class NeighborDiscoveryMixin:
         }
         ni_itfs = self.get(paths=["/network-instance[name=*]"], datatype="config")
         ni_itf_map: Dict[str, List[str]] = {}
-        for ni in ni_itfs[0].get("network-instance", []):
+        for ni in as_list(first_payload(ni_itfs).get("network-instance")):
             for ni_itf in ni.get("interface", []):
                 if ni_itf["name"] not in ni_itf_map:
                     ni_itf_map[ni_itf["name"]] = []
@@ -33,23 +52,17 @@ class NeighborDiscoveryMixin:
         resp = self.get(
             paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
         )
-        for itf in resp[0].get("interface", []):
+        for itf in as_list(first_payload(resp).get("interface")):
             for subitf in itf.get("subinterface", []):
                 subitf["_subitf"] = f"{itf['name']}.{subitf['index']}"
                 subitf["_ni"] = ni_itf_map.get(subitf["_subitf"], [])
                 for arp_entry in (
                     subitf.get("ipv4", {}).get("arp", {}).get("neighbor", [])
                 ):
-                    try:
-                        ts = datetime.datetime.strptime(
-                            arp_entry["expiration-time"], "%Y-%m-%dT%H:%M:%S.%fZ"
-                        )
-                        arp_entry["_rel_expiry"] = (
-                            str(ts - datetime.datetime.now()).split(".")[0] + "s"
-                        )
-                    except Exception:
-                        arp_entry["_rel_expiry"] = "-"
-        res = jmespath.search(path_spec["jmespath"], resp[0])
+                    arp_entry["_rel_expiry"] = _relative_expiry(
+                        arp_entry.get("expiration-time")
+                    )
+        res = jmespath.search(path_spec["jmespath"], first_payload(resp))
         return {"arp": res}
 
     def get_nd(self) -> Dict[str, Any]:
@@ -61,7 +74,7 @@ class NeighborDiscoveryMixin:
         resp = self.get(
             paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
         )
-        for itf in resp[0].get("interface", []):
+        for itf in as_list(first_payload(resp).get("interface")):
             for subitf in itf.get("subinterface", []):
                 subitf["_subitf"] = f"{itf['name']}.{subitf['index']}"
                 for nd_entry in (
@@ -69,14 +82,8 @@ class NeighborDiscoveryMixin:
                     .get("neighbor-discovery", {})
                     .get("neighbor", [])
                 ):
-                    try:
-                        ts = datetime.datetime.strptime(
-                            nd_entry["next-state-time"], "%Y-%m-%dT%H:%M:%S.%fZ"
-                        )
-                        nd_entry["_rel_expiry"] = (
-                            str(ts - datetime.datetime.now()).split(".")[0] + "s"
-                        )
-                    except Exception:
-                        nd_entry["_rel_expiry"] = "-"
-        res = jmespath.search(path_spec["jmespath"], resp[0])
+                    nd_entry["_rel_expiry"] = _relative_expiry(
+                        nd_entry.get("next-state-time")
+                    )
+        res = jmespath.search(path_spec["jmespath"], first_payload(resp))
         return {"nd": res}

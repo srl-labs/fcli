@@ -7,6 +7,7 @@ without a live device.
 from typing import Any, Dict, List, Optional
 
 from nornir_srl.connections.helpers import clean_structured_key
+from nornir_srl.connections.interfaces import NetworkInstanceMixin
 from nornir_srl.connections.routing import RoutingMixin
 
 # --------------------------------------------------------------------------- #
@@ -50,6 +51,25 @@ class _FakeRouting(RoutingMixin):
         self.capabilities = {
             "supported_models": [{"name": "bgp-rib", "version": "2024-10-31"}]
         }
+
+    def get(
+        self,
+        paths: List[str],
+        datatype: Optional[str] = "config",
+        strip_mod: Optional[bool] = True,
+    ) -> List[Dict[str, Any]]:
+        path = paths[0]
+        for key, resp in self._responses.items():
+            if key in path:
+                return resp
+        raise KeyError(f"no scripted response for path {path}")
+
+
+class _FakeInterfaces(NetworkInstanceMixin):
+    """NetworkInstanceMixin with a scripted ``get`` keyed on path substrings."""
+
+    def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+        self._responses = responses
 
     def get(
         self,
@@ -558,7 +578,7 @@ def test_get_bridge_domains():
         }
     ]
 
-    dev = _FakeLayer2({"network-instance": data})
+    dev = _FakeLayer2({"network-instance": data, "subinterface": [{}]})
     out = dev.get_bridge_domains()
     bds = out["bridge_domains"]
     assert len(bds) == 1
@@ -570,6 +590,186 @@ def test_get_bridge_domains():
     assert bd["IRB Interface"] == "irb1.100 [up]: 10.1.100.1/24 (anycast-gw: true) -> ip-vrf-1"
     assert bd["Sub-Interfaces"] == "ethernet-1/1.100 [up] (VLAN: 100), ethernet-1/2.100 [up] (VLAN: 100)"
     assert bd["VXLAN Interface"] == "vxlan1.100"
+    assert bd["System IPv4"] == ""
+    assert bd["System IPv6"] == ""
+
+
+def test_system0_addresses_skips_link_local_and_reads_system0():
+    from nornir_srl.connections.layer2 import _system0_addresses
+
+    assert _system0_addresses({}) == ("", "")
+    ipv4, ipv6 = _system0_addresses(
+        {
+            "system0.0": {
+                "ipv4": {"address": [{"ip-prefix": "192.0.2.11/32"}]},
+                "ipv6": {
+                    "address": [
+                        {"ip-prefix": "fe80::1/64"},
+                        {"ip-prefix": "2001:db8::11/128"},
+                    ]
+                },
+            }
+        }
+    )
+    assert ipv4 == "192.0.2.11"
+    assert ipv6 == "2001:db8::11"
+
+
+def test_get_bridge_domains_includes_system0_addresses():
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    network_instances = [
+        {
+            "network-instance": [
+                {
+                    "name": "mac-vrf-100",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [{"name": "ethernet-1/1.100"}],
+                }
+            ]
+        }
+    ]
+    subinterfaces = [
+        {
+            "interface": [
+                {
+                    "name": "system0",
+                    "subinterface": [
+                        {
+                            "index": 0,
+                            "ipv4": {"address": [{"ip-prefix": "10.0.0.1/32"}]},
+                            "ipv6": {"address": [{"ip-prefix": "2001:db8::1/128"}]},
+                        }
+                    ],
+                },
+                {
+                    "name": "ethernet-1/1",
+                    "subinterface": [{"index": 100, "oper-state": "up"}],
+                },
+            ]
+        }
+    ]
+    dev = _FakeLayer2(
+        {"network-instance": network_instances, "subinterface": subinterfaces}
+    )
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+    assert bd["System IPv4"] == "10.0.0.1"
+    assert bd["System IPv6"] == "2001:db8::1"
+
+
+def test_get_bridge_domains_reports_a_disabled_mac_vrf_from_its_own_view():
+    """An IRB held down by its mac-vrf must not read as up.
+
+    SR Linux answers the same question two ways: the subinterface is up under
+    ``/interface`` - nothing is wrong with it - while the disabled mac-vrf holding
+    it reports it down with ``net-inst-down``. The service listing has to show the
+    mac-vrf's view, or the row contradicts itself by pairing a down bridge domain
+    with an up IRB.
+    """
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    network_instances = [
+        {
+            "network-instance": [
+                {
+                    "name": "macvrf-v20",
+                    "type": "mac-vrf",
+                    "admin-state": "disable",
+                    "oper-state": "down",
+                    "oper-down-reason": "admin-down",
+                    "protocols": {
+                        "bgp-vpn": {
+                            "bgp-instance": [
+                                {"route-target": {"import-rt": [{"target": "target:1:20"}]}}
+                            ]
+                        }
+                    },
+                    "interface": [
+                        {
+                            "name": "irb0.0",
+                            "oper-state": "down",
+                            "oper-down-reason": "net-inst-down",
+                        },
+                        {
+                            "name": "ethernet-1/3.20",
+                            "oper-state": "down",
+                            "oper-down-reason": "net-inst-down",
+                        },
+                    ],
+                }
+            ]
+        }
+    ]
+    # The /interface view of the very same subinterfaces, which is up.
+    subinterfaces = [
+        {
+            "interface": [
+                {
+                    "name": "irb0",
+                    "subinterface": [
+                        {
+                            "index": 0,
+                            "oper-state": "up",
+                            "ipv4": {
+                                "address": [
+                                    {"ip-prefix": "172.16.20.254/24", "anycast-gw": True}
+                                ]
+                            },
+                        }
+                    ],
+                },
+                {
+                    "name": "ethernet-1/3",
+                    "subinterface": [{"index": 20, "oper-state": "up"}],
+                },
+            ]
+        }
+    ]
+
+    dev = _FakeLayer2(
+        {"network-instance": network_instances, "subinterface": subinterfaces}
+    )
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+
+    assert bd["Oper State"] == "down"
+    assert (
+        bd["IRB Interface"]
+        == "irb0.0 [down: net-inst-down]: 172.16.20.254/24 (anycast-gw: true)"
+    )
+    assert bd["Sub-Interfaces"] == "ethernet-1/3.20 [down: net-inst-down] (VLAN: 20)"
 
 
 def test_get_routers():
@@ -632,7 +832,7 @@ def test_get_routers():
         }
     ]
 
-    dev = _FakeLayer2({"network-instance": data})
+    dev = _FakeLayer2({"network-instance": data, "subinterface": [{}]})
     out = dev.get_routers()
     routers = out["routers"]
     assert len(routers) == 1
@@ -657,7 +857,7 @@ def test_get_routers():
             ]
         }
     ]
-    dev2 = _FakeLayer2({"network-instance": isolated_data})
+    dev2 = _FakeLayer2({"network-instance": isolated_data, "subinterface": [{}]})
     out2 = dev2.get_routers()
     r2 = out2["routers"][0]
     assert r2["Route Targets"] == "none (isolated)"
@@ -675,7 +875,7 @@ def test_get_routers():
             ]
         }
     ]
-    dev3 = _FakeLayer2({"network-instance": mgmt_data})
+    dev3 = _FakeLayer2({"network-instance": mgmt_data, "subinterface": [{}]})
     out3 = dev3.get_routers()
     assert len(out3["routers"]) == 0
 
@@ -716,7 +916,7 @@ def test_get_services():
         }
     ]
 
-    dev = _FakeLayer2({"network-instance": data})
+    dev = _FakeLayer2({"network-instance": data, "subinterface": [{}]})
     out = dev.get_services()
     services = out["services"]
     assert len(services) == 2
@@ -724,3 +924,215 @@ def test_get_services():
     assert "Bridge Domain" in types
     assert "Router" in types
 
+# --------------------------------------------------------------------------- #
+# Network-instance and interface getters
+# --------------------------------------------------------------------------- #
+
+
+_SUBITF_RESPONSE = [
+    {
+        "interface": [
+            {
+                "name": "ethernet-1/10",
+                "subinterface": [
+                    {
+                        "index": 0,
+                        "oper-state": "up",
+                        "ip-mtu": 1500,
+                        "ipv4": {"address": [{"ip-prefix": "192.168.1.1/30"}]},
+                    }
+                ],
+            },
+            {
+                "name": "irb1",
+                "subinterface": [
+                    {
+                        "index": 100,
+                        "oper-state": "up",
+                        "l2-mtu": 9000,
+                        "ipv4": {"address": [{"ip-prefix": "10.1.100.1/24"}]},
+                    }
+                ],
+            },
+        ]
+    }
+]
+
+
+def test_get_nwi_itf_joins_subinterface_details_onto_network_instances():
+    ni_response = [
+        {
+            "network-instance": [
+                {
+                    "name": "ip-vrf-1",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                    "interface": [{"name": "ethernet-1/10.0"}, {"name": "irb1.100"}],
+                    "protocols": {
+                        "bgp-vpn": {
+                            "bgp-instance": [
+                                {
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:65000:1"}],
+                                        "export-rt": [{"target": "target:65000:1"}],
+                                    }
+                                }
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+    ]
+    device = _FakeInterfaces(
+        {"subinterface": _SUBITF_RESPONSE, "network-instance": ni_response}
+    )
+
+    rows = device.get_nwi_itf()["nwi_itfs"]
+
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["NI"] == "ip-vrf-1"
+    assert row["oper"] == "up"
+    assert row["In-RT"] == "65000:1"
+    assert row["Out-RT"] == "65000:1"
+    by_name = {i["Subitf"]: i for i in row["itfs"]}
+    assert by_name["ethernet-1/10.0"]["ip-prefix"] == ["192.168.1.1/30"]
+    assert by_name["ethernet-1/10.0"]["mtu"] == 1500
+    # An IRB carries an l2-mtu rather than an ip-mtu.
+    assert by_name["irb1.100"]["mtu"] == 9000
+    assert by_name["irb1.100"]["if-oper"] == "up"
+
+
+def test_get_nwi_itf_records_the_other_network_instance_an_irb_is_in():
+    """An IRB sits in a mac-vrf and an ip-vrf; each row names the other one."""
+    ni_response = [
+        {
+            "network-instance": [
+                {
+                    "name": "ip-vrf-1",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                    "interface": [{"name": "irb1.100"}],
+                },
+                {
+                    "name": "mac-vrf-100",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [{"name": "irb1.100"}],
+                },
+            ]
+        }
+    ]
+    device = _FakeInterfaces(
+        {"subinterface": _SUBITF_RESPONSE, "network-instance": ni_response}
+    )
+
+    rows = {r["NI"]: r for r in device.get_nwi_itf()["nwi_itfs"]}
+
+    assert rows["ip-vrf-1"]["itfs"][0]["assoc-ni"] == "mac-vrf-100"
+    assert rows["mac-vrf-100"]["itfs"][0]["assoc-ni"] == "ip-vrf-1"
+
+
+def test_get_nwi_itf_accepts_a_single_network_instance_as_a_bare_dict():
+    """gNMI returns a one-entry YANG list unwrapped, which must not crash."""
+    ni_response = [
+        {"network-instance": {"name": "default", "type": "default", "oper-state": "up"}}
+    ]
+    device = _FakeInterfaces(
+        {"subinterface": _SUBITF_RESPONSE, "network-instance": ni_response}
+    )
+
+    assert device.get_nwi_itf()["nwi_itfs"] is not None
+
+
+def test_get_nwi_itf_survives_an_empty_response():
+    device = _FakeInterfaces({"subinterface": [], "network-instance": []})
+    assert device.get_nwi_itf() == {"nwi_itfs": []}
+
+
+def test_get_nwi_itf_reads_route_targets_from_import_and_export_policies():
+    ni_response = [
+        {
+            "network-instance": [
+                {
+                    "name": "ip-vrf-1",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                    "protocols": {
+                        "bgp-vpn": {
+                            "bgp-instance": {
+                                "import-policy": "import-all",
+                                "export-policy": ["export-a", "export-b"],
+                            }
+                        }
+                    },
+                }
+            ]
+        }
+    ]
+    device = _FakeInterfaces(
+        {"subinterface": _SUBITF_RESPONSE, "network-instance": ni_response}
+    )
+
+    row = device.get_nwi_itf()["nwi_itfs"][0]
+
+    assert row["In-RT"] == "import-all"
+    assert row["Out-RT"] == "export-a, export-b"
+
+
+def test_get_lag_shortens_member_interface_names():
+    lag_response = [
+        {
+            "interface": [
+                {
+                    "name": "lag1",
+                    "oper-state": "up",
+                    "mtu": 9000,
+                    "lag": {
+                        "lag-type": "lacp",
+                        "min-links": 1,
+                        "member": [
+                            {
+                                "name": "ethernet-1/1",
+                                "oper-state": "up",
+                                "lacp": {"activity": "ACTIVE"},
+                            }
+                        ],
+                        "lacp": {"lacp-mode": "ACTIVE", "interval": "SLOW"},
+                    },
+                }
+            ]
+        }
+    ]
+    device = _FakeInterfaces({"interface": lag_response})
+
+    rows = device.get_lag()["lag"]
+
+    assert len(rows) == 1
+    assert rows[0]["lag"] == "lag1"
+    assert rows[0]["oper"] == "up"
+    # Members are abbreviated so the column stays narrow enough to read.
+    assert rows[0]["members"][0]["member-itf"] == "et-1/1"
+
+
+def test_get_lag_survives_an_empty_response():
+    device = _FakeInterfaces({"interface": []})
+    assert device.get_lag() == {"lag": []}
+
+
+def test_get_sum_subitf_names_subinterfaces_and_lists_addresses():
+    device = _FakeInterfaces({"subinterface": _SUBITF_RESPONSE})
+
+    rows = {r["Itf"]: r for r in device.get_sum_subitf()["subinterface"]}
+
+    assert set(rows) == {"ethernet-1/10", "irb1"}
+    subitf = rows["ethernet-1/10"]["subitfs"][0]
+    assert subitf["Subitf"] == "ethernet-1/10.0"
+    assert subitf["oper"] == "up"
+    assert subitf["ipv4"] == ["192.168.1.1/30"]
+
+
+def test_get_sum_subitf_survives_an_empty_response():
+    device = _FakeInterfaces({"subinterface": []})
+    assert device.get_sum_subitf() == {"subinterface": []}

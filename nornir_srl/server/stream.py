@@ -18,9 +18,10 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..connections.helpers import strip_modules
+from ..reports import SubscriptionSpec
 from .tree import (
     delete,
     get_node,
@@ -85,21 +86,9 @@ IFSTATS_COUNTERS: Tuple[str, ...] = (
 
 _MIN_RATE_INTERVAL = 0.5  # seconds; below this the rate is too noisy to report
 
-
-@dataclass(frozen=True)
-class SubscriptionSpec:
-    """One gNMI subscription entry."""
-
-    path: str
-    datatype: str = "state"
-    mode: str = "sample"  # sample | on_change | target_defined
-    sample_interval: int = 10  # seconds
-
-    def as_gnmi(self) -> Dict[str, Any]:
-        entry: Dict[str, Any] = {"path": self.path, "mode": self.mode}
-        if self.mode == "sample":
-            entry["sample_interval"] = int(self.sample_interval * 1_000_000_000)
-        return entry
+#: Tree roots that reports overlap on heavily enough to be worth reading from a
+#: neighbouring subscription rather than spending a Get of their own on.
+_SHARED_ROOTS: Tuple[str, ...] = ("interface", "network-instance")
 
 
 @dataclass
@@ -147,7 +136,13 @@ class RateTracker:
         self._last[itf] = (now, current)
 
     def rates(self, itf: str) -> Dict[str, float]:
-        return self._rates.get(itf, {})
+        # Copied: read by report renders while the subscription thread observes.
+        return dict(self._rates.get(itf, {}))
+
+    def forget(self, itf: str) -> None:
+        """Drop the counters of an interface that no longer exists."""
+        self._last.pop(itf, None)
+        self._rates.pop(itf, None)
 
 
 def _extract_item_path(item: Any) -> str:
@@ -276,9 +271,12 @@ class HostStream:
         question from whether the path came out bootstrapped: an empty response
         is a perfectly good answer that simply leaves the path pending.
         """
-        state = self._paths.get(spec.path)
+        with self._lock:
+            state = self._paths.get(spec.path)
         if state is None:  # retired while we were getting to it
             return False
+        # Deliberately outside the lock: this is a network round-trip, and every
+        # render of every report on this node would queue up behind it.
         try:
             resp = self._raw_get(spec.path, spec.datatype)
         except Exception as exc:  # noqa: BLE001 - surfaced to the UI
@@ -295,7 +293,8 @@ class HostStream:
             return False
         # Serve the first render from this response instead of repeating the Get
         # while the path is still pending.
-        self._direct_cache[(spec.path, spec.datatype)] = (time.time(), resp)
+        with self._lock:
+            self._direct_cache[(spec.path, spec.datatype)] = (time.time(), resp)
         self._absorb(spec, resp, tree)
         return True
 
@@ -313,29 +312,31 @@ class HostStream:
         first entry appears. Control-plane driven tables (MAC, ES destinations)
         routinely start out that way.
         """
-        state = self._paths.get(spec.path)
-        if state is None:
-            return False
-        envelopes: List[str] = []
-        streamable = True
         hints = _key_hints(spec.path)
-        for item in resp:
-            if not isinstance(item, dict):
-                streamable = False
-                break
-            if not item:  # empty subtree: nothing to learn from yet
-                continue
-            if len(item) != 1:
-                # Keyless yang-list responses cannot be placed in the tree;
-                # such a path is served by a TTL-cached Get instead.
-                streamable = False
-                break
-            env_key = next(iter(item))
-            env_path = "" if env_key in ("/", "") else env_key
-            insert(tree, env_path, item[env_key], key_hints=hints)
-            if env_path not in envelopes:
-                envelopes.append(env_path)
+        # The tree is shared with the subscription thread, so seeding it and
+        # recording what was learned from the response is one atomic step.
         with self._lock:
+            state = self._paths.get(spec.path)
+            if state is None:
+                return False
+            envelopes: List[str] = []
+            streamable = True
+            for item in resp:
+                if not isinstance(item, dict):
+                    streamable = False
+                    break
+                if not item:  # empty subtree: nothing to learn from yet
+                    continue
+                if len(item) != 1:
+                    # Keyless yang-list responses cannot be placed in the tree;
+                    # such a path is served by a TTL-cached Get instead.
+                    streamable = False
+                    break
+                env_key = next(iter(item))
+                env_path = "" if env_key in ("/", "") else env_key
+                insert(tree, env_path, item[env_key], key_hints=hints)
+                if env_path not in envelopes:
+                    envelopes.append(env_path)
             state.streamable = streamable
             if not streamable:
                 state.envelopes = []
@@ -507,17 +508,28 @@ class HostStream:
             and generation == self._generation
         )
 
-    def stop(self) -> None:
+    def stop(self, timeout: float = 5.0) -> None:
+        """Tear the subscription down and wait for its threads to notice.
+
+        Both threads block on waits of their own - up to a second on the next
+        update, up to ``restart_debounce`` plus a thread join on a pending
+        restart - so returning before they have run out would leave the node's
+        ``Subscribe`` RPC open past the shutdown that was supposed to close it.
+        """
         self._closed.set()
         self._stop.set()
         self._dirty.set()
         with self._lock:
             self._generation += 1
         self._close_subscription()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=0.2)
-        if self._reconciler.is_alive():
-            self._reconciler.join(timeout=0.2)
+        for thread in (self._thread, self._reconciler):
+            if thread is None or not thread.is_alive():
+                continue
+            thread.join(timeout=timeout)
+            if thread.is_alive():
+                logger.warning(
+                    "%s: %s did not stop within %.1fs", self.name, thread.name, timeout
+                )
 
     # ------------------------------------------------------------------ #
     # update handling
@@ -545,6 +557,9 @@ class HostStream:
                 item_path = _extract_item_path(item)
                 path = join_path(prefix, item_path)
                 delete(self._tree, path)
+                gone = _deleted_interface(path)
+                if gone:
+                    self.rates.forget(gone)
             for itf in touched_itfs:
                 stats = get_node(self._tree, f"interface[name={itf}]/statistics")
                 if isinstance(stats, dict):
@@ -565,15 +580,7 @@ class HostStream:
         with self._lock:
             state = self._paths.get(path)
             if state is None or not state.bootstrapped or not state.streamable:
-                if "interface" in path:
-                    node = self._tree.get("interface")
-                    if node is not None:
-                        return [{"interface": materialize(node)}]
-                elif "network-instance" in path:
-                    node = self._tree.get("network-instance")
-                    if node is not None:
-                        return [{"network-instance": materialize(node)}]
-                return None
+                return self._borrowed_snapshot(path)
             state.last_read = time.time()
             result: List[Dict[str, Any]] = []
             for env in state.envelopes:
@@ -586,6 +593,50 @@ class HostStream:
                 # envelope can hold entries this path never asked for.
                 result.append({key: select_path(materialize(node), path, env)})
             return result
+
+    def _borrowed_snapshot(self, path: str) -> Optional[List[Dict[str, Any]]]:
+        """Serve *path* from state a neighbouring subscription already streams.
+
+        Reports overlap so much on ``/interface`` and ``/network-instance`` that a
+        path without a subscription of its own is often covered anyway. Borrowing
+        that state still has to go through :func:`select_path`, exactly like a
+        registered path does, or the caller would be handed every entry the other
+        subscriptions put under the root rather than the ones it asked for.
+
+        Returns ``None`` when nothing survives the narrowing, so the caller falls
+        back to a ``Get`` instead of rendering an empty table forever. Must be
+        called with ``_lock`` held.
+        """
+        elems = parse_path(path)
+        if not elems:
+            return None
+        root = elems[0][0]
+        if root not in _SHARED_ROOTS:
+            return None
+        node = self._tree.get(root)
+        if node is None:
+            return None
+        selected = select_path(materialize(node), path, root)
+        if not selected:
+            return None
+        return [{root: selected}]
+
+    def snapshot_roots(self, roots: Tuple[str, ...]) -> Dict[str, Any]:
+        """Materialize whole tree roots, for summaries that span reports.
+
+        Unlike :meth:`snapshot` this returns everything below each root instead
+        of what one path selects, because the caller is summarizing the node
+        rather than standing in for a ``Get``. Roots the node has no state for
+        are left out.
+        """
+        with self._lock:
+            # Materializing walks the live tree, so it cannot be moved out of
+            # the lock - the subscription thread would be mutating it midway.
+            return {
+                root: materialize(node)
+                for root, node in ((r, self._tree.get(r)) for r in roots)
+                if node is not None
+            }
 
     def interfaces(self) -> List[str]:
         """Names of the interfaces currently present in the streamed state."""
@@ -611,19 +662,22 @@ class HostStream:
         """
         cache_key = (path, datatype)
         now = time.time()
-        cached = self._direct_cache.get(cache_key)
-        if cached and now - cached[0] < self.get_ttl:
-            return cached[1]
-        failed = self._failed_gets.get(cache_key)
-        if failed and now - failed[0] < self.get_ttl:
-            raise failed[1]
+        with self._lock:
+            cached = self._direct_cache.get(cache_key)
+            if cached and now - cached[0] < self.get_ttl:
+                return cached[1]
+            failed = self._failed_gets.get(cache_key)
+            if failed and now - failed[0] < self.get_ttl:
+                raise failed[1]
         try:
             resp = self._raw_get(path, datatype)
         except Exception as exc:  # noqa: BLE001 - re-raised to the caller
-            self._failed_gets[cache_key] = (now, exc)
+            with self._lock:
+                self._failed_gets[cache_key] = (now, exc)
             raise
-        self._failed_gets.pop(cache_key, None)
-        self._direct_cache[cache_key] = (now, resp)
+        with self._lock:
+            self._failed_gets.pop(cache_key, None)
+            self._direct_cache[cache_key] = (now, resp)
         self._promote(path, datatype, resp)
         return resp
 
@@ -775,6 +829,14 @@ def _key_hints(path: str) -> Dict[str, List[str]]:
         if keys:
             hints[name] = list(keys)
     return hints
+
+
+def _deleted_interface(path: str) -> Optional[str]:
+    """Return the interface name when *path* removes a whole interface entry."""
+    elems = parse_path(path)
+    if len(elems) != 1 or elems[0][0] != "interface":
+        return None
+    return elems[0][1].get("name") or None
 
 
 def _touched_interface(path: str) -> Optional[str]:

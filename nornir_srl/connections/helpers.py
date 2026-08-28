@@ -1,8 +1,75 @@
-from typing import Any, Dict, List, Tuple, Optional, Union
+from typing import Any, Dict, List, Tuple, Optional
 import json
 import difflib
 import re
 import ipaddress
+
+
+def first_payload(resp: Optional[List[Any]]) -> Dict[str, Any]:
+    """The payload of a single-path gNMI Get response, or ``{}`` if there is none.
+
+    SR Linux answers a Get for a subtree that holds nothing with an empty
+    response, so indexing ``resp[0]`` is only safe once the device is known to
+    have answered with data. Reports read paths that are legitimately empty all
+    the time: a spine with no bridge table, a leaf that has not learned a MAC.
+    """
+    if not resp:
+        return {}
+    payload = resp[0]
+    return payload if isinstance(payload, dict) else {}
+
+
+def as_list(value: Any) -> List[Any]:
+    """Normalize a YANG list that may arrive absent, as a single dict, or a list."""
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def model_version(
+    capabilities: Optional[Dict[str, Any]],
+    *names: str,
+    exact: bool = False,
+) -> str:
+    """The version of the first supported YANG model matching one of *names*.
+
+    The gNMI paths a report needs differ between SR Linux releases, and this
+    version is what picks between them. A device that does not advertise the
+    model cannot serve the report at all, so name the model that is missing
+    instead of failing on an empty list.
+    """
+    if capabilities is None:
+        raise ValueError("no gNMI capabilities available for this device")
+    for model in capabilities.get("supported_models") or []:
+        if not isinstance(model, dict):
+            continue
+        model_name = model.get("name") or ""
+        matched = any(
+            name == model_name if exact else name in model_name for name in names
+        )
+        if matched and model.get("version"):
+            return str(model["version"])
+    raise ValueError(
+        f"device advertises no version for the YANG model(s) {', '.join(names)}; "
+        "it is probably running an unsupported release"
+    )
+
+
+def version_bucket(version_map: Dict[int, Any], version: str) -> int:
+    """The lowest key of *version_map* whose version prefixes match *version*.
+
+    Each key stands for one shape of the gNMI paths a report uses; the values are
+    the model-version prefixes that shape applies to.
+    """
+    for bucket in sorted(version_map):
+        prefixes = version_map[bucket]
+        if isinstance(prefixes, str):
+            prefixes = (prefixes,)
+        if any(version.startswith(prefix) for prefix in prefixes):
+            return bucket
+    raise ValueError(f"unsupported YANG model version {version!r}")
 
 
 def normalize_gnmi_resp(resp: Dict) -> List[Dict[str, Any]]:

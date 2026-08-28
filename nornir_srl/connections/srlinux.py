@@ -1,6 +1,7 @@
-from typing import Any, List, Dict, Optional, Union
+from typing import Any, List, Dict, Optional
 import difflib
 import json
+import logging
 import re
 
 
@@ -17,6 +18,8 @@ from .neighbor_discovery import NeighborDiscoveryMixin
 from .subscription import GnmiSubscription
 from .system import SystemMixin
 from .ifstats import InterfaceStatsMixin
+
+logger = logging.getLogger(__name__)
 
 CONNECTION_NAME = "srlinux"
 
@@ -133,8 +136,8 @@ class SrLinux(
         if getattr(self, "_connection", None) is not None:
             try:
                 self._connection.close()
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001 - best effort teardown
+                logger.debug("%s: closing the connection failed: %s", self.hostname, exc)
             self._connection = None
 
     def __repr__(self) -> str:
@@ -154,7 +157,7 @@ class SrLinux(
                 )
             )
         else:
-            raise Exception("no active connection")
+            raise ConnectionException("no active connection")
         if strip_mod:
             return [strip_modules(d) for d in resp]
         else:

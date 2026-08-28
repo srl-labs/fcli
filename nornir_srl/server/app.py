@@ -19,7 +19,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from .. import __version__
-from .reports import REPORTS, Report, get_report
+from ..reports import SERVER, ReportSpec, get_report, reports_for
 from .store import FabricStore
 
 logger = logging.getLogger(__name__)
@@ -63,7 +63,7 @@ def table_digest(table: Dict[str, Any]) -> str:
 
 async def table_events(
     store: FabricStore,
-    report: Report,
+    report: ReportSpec,
     inv_filter: Optional[Dict[str, str]],
     interval: float,
     is_disconnected: Callable[[], Awaitable[bool]],
@@ -159,7 +159,7 @@ def create_app(
             {
                 "version": __version__,
                 "topo_name": store.topo_name,
-                "reports": [r.as_dict() for r in REPORTS],
+                "reports": [r.as_dict() for r in reports_for(SERVER)],
             }
         )
 
@@ -174,9 +174,16 @@ def create_app(
         inv_filter = parse_kv(request.query_params.get("inv_filter"))
         return JSONResponse(await anyio.to_thread.run_sync(store.overview, inv_filter))
 
+    def streamable_report(name: str) -> ReportSpec:
+        """The named report, provided the server is able to stream it."""
+        report = get_report(name)
+        if not report.on(SERVER):
+            raise KeyError(f"report '{name}' cannot be streamed")
+        return report
+
     async def report_once(request: Request) -> Response:
         try:
-            report = get_report(request.path_params["name"])
+            report = streamable_report(request.path_params["name"])
         except KeyError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         inv_filter = parse_kv(request.query_params.get("inv_filter"))
@@ -185,7 +192,7 @@ def create_app(
 
     async def report_stream(request: Request) -> Response:
         try:
-            report = get_report(request.path_params["name"])
+            report = streamable_report(request.path_params["name"])
         except KeyError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         inv_filter = parse_kv(request.query_params.get("inv_filter"))

@@ -37,6 +37,8 @@ from nornir.core.task import Result, Task
 
 from .connections.srlinux import CONNECTION_NAME
 from .connections.helpers import clean_structured_key
+from .reports import ReportSpec, get_report
+from .rows import extract
 
 logger = logging.getLogger(__name__)
 
@@ -186,93 +188,7 @@ def get_nornir() -> Nornir:
     return _nornir_instance
 
 
-# ---- Data extraction (reused from cli.py logic) ----
-
-
-def _extract_report_data(
-    resource: str,
-    results: Any,
-    field_filter: Optional[Dict[str, str]] = None,
-) -> List[Dict[str, Any]]:
-    """Extract structured data from AggregatedResult, returning list of row dicts."""
-    import re
-
-    rows: List[Dict[str, Any]] = []
-
-    def _pass_filter(row: dict, filt: Optional[dict]) -> bool:
-        if not filt:
-            return True
-        filt_lower = {str(k).lower(): v for k, v in filt.items()}
-        matched = sum(
-            1
-            for k, v in row.items()
-            if filt_lower.get(str(k).lower())
-            and re.search(str(filt_lower[str(k).lower()]), str(v), re.IGNORECASE)
-        )
-        return matched >= len(filt_lower)
-
-    for host, host_result in results.items():
-        r = host_result[0]
-        node = r.host
-        if r.failed:
-            rows.append(
-                {
-                    "Node": node.hostname if node and node.hostname else host,
-                    "_error": str(r.exception),
-                }
-            )
-            continue
-        if r.result and r.result.get(resource) is not None:
-            for item in r.result.get(resource):
-                common = {
-                    k: v
-                    for k, v in item.items()
-                    if isinstance(v, (str, int, float))
-                    or (
-                        isinstance(v, list)
-                        and len(v) > 0
-                        and not isinstance(v[0], dict)
-                    )
-                }
-                node_name = node.hostname if node and node.hostname else host
-                nested_lists = [
-                    (k, v)
-                    for k, v in item.items()
-                    if isinstance(v, list) and v and isinstance(v[0], dict)
-                ]
-                if not nested_lists:
-                    if _pass_filter(common, field_filter):
-                        rows.append({"Node": node_name, **common})
-                else:
-                    for key, lst in nested_lists:
-                        for sub_item in lst:
-                            sub_row = {
-                                k: v
-                                for k, v in sub_item.items()
-                                if isinstance(v, (str, int, float))
-                                or (
-                                    isinstance(v, list)
-                                    and len(v) > 0
-                                    and not isinstance(v[0], dict)
-                                )
-                            }
-                            merged = {**common, **sub_row}
-                            if _pass_filter(merged, field_filter):
-                                rows.append({"Node": node_name, **merged})
-    return [{clean_structured_key(k): v for k, v in row.items()} for row in rows]
-
-
-def _run_report(
-    resource: str,
-    task_func: Any,
-    inv_filter: Optional[Dict[str, str]] = None,
-    field_filter: Optional[Dict[str, str]] = None,
-) -> List[Dict[str, Any]]:
-    """Run a nornir task and return structured data."""
-    nornir = get_nornir()
-    target = nornir.filter(**inv_filter) if inv_filter else nornir
-    result = target.run(task=task_func, name=resource, raise_on_error=False)
-    return _extract_report_data(resource, result, field_filter)
+# ---- Report plumbing ----
 
 
 def _parse_filters(
@@ -280,25 +196,59 @@ def _parse_filters(
     field_filter: Optional[str] = None,
 ) -> tuple:
     """Parse comma-separated key=value filter strings into dicts."""
-    i_filter = None
-    if inv_filter:
-        i_filter = {}
-        for part in inv_filter.split(","):
+
+    def parse(spec: Optional[str]) -> Optional[Dict[str, str]]:
+        if not spec:
+            return None
+        parsed: Dict[str, str] = {}
+        for part in spec.split(","):
             part = part.strip()
             if "=" in part:
-                k, v = part.split("=", 1)
-                i_filter[k.strip()] = v.strip()
+                key, value = part.split("=", 1)
+                parsed[key.strip()] = value.strip()
+        return parsed
 
-    f_filter = None
-    if field_filter:
-        f_filter = {}
-        for part in field_filter.split(","):
-            part = part.strip()
-            if "=" in part:
-                k, v = part.split("=", 1)
-                f_filter[k.strip()] = v.strip()
+    return parse(inv_filter), parse(field_filter)
 
-    return i_filter, f_filter
+
+def _error_row(_node: str, exception: Optional[BaseException]) -> Dict[str, Any]:
+    """Failed hosts are reported in-band, so an agent sees why a node is missing."""
+    return {"_error": str(exception)}
+
+
+def _query(spec: ReportSpec, inv_filter: Optional[Dict[str, str]], **params: Any):
+    """Run a report's getter across the filtered inventory."""
+
+    def task_func(task: Task) -> Result:
+        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
+        return Result(host=task.host, result=spec.getter(device, **params))
+
+    nornir = get_nornir()
+    target = nornir.filter(**inv_filter) if inv_filter else nornir
+    return target.run(task=task_func, name=spec.resource, raise_on_error=False)
+
+
+def _run_report(
+    name: str,
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+    **params: Any,
+) -> str:
+    """Run a report from the registry and return its rows as JSON."""
+    spec = get_report(name)
+    i_filter, f_filter = _parse_filters(inv_filter, field_filter)
+    result = _query(spec, i_filter, **params)
+    _columns, per_node = extract(
+        spec.resource, result, field_filter=f_filter, on_error=_error_row
+    )
+    rows = [
+        {"Node": node.node, **row.values} for node in per_node for row in node.rows
+    ]
+    return json.dumps(
+        [{clean_structured_key(k): v for k, v in row.items()} for row in rows],
+        indent=2,
+        default=str,
+    )
 
 
 # ---- MCP Server definition ----
@@ -465,19 +415,13 @@ def sys_info(
     Returns chassis type, serial number, hardware MAC, last boot time, software version, etc.
 
     Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1'). Supports wildcards.
-            Matches against node labels from the topology file. Use 'show_topology' to see available keys.
-            If no labels exist, omit this to target all nodes.
-        field_filter: Field filter as comma-separated key=value pairs to filter output rows. Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_info())
-
-    data = _run_report("sys_info", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+    return _run_report("sys_info", inv_filter, field_filter)
 
 
 @mcp.tool()
@@ -493,19 +437,13 @@ def bgp_peers(
     and R/A/T on the second; JSON keys use a space instead of the newline.
 
     Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=spine'). Supports wildcards.
-            Matches against node labels from the topology file. Use 'show_topology' to see available keys.
-            If no labels exist, omit this to target all nodes.
-        field_filter: Field filter as comma-separated key=value pairs (e.g. 'session-state=established'). Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_sum_bgp())
-
-    data = _run_report("bgp_peers", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+    return _run_report("bgp_peers", inv_filter, field_filter)
 
 
 @mcp.tool()
@@ -536,21 +474,20 @@ def bgp_rib(
             (``l3vpn-v4`` / ``l3vpn-v6`` short names, or ``l3vpn-ipv4-unicast`` / ``l3vpn-ipv6-unicast``).
         route_type: Route type for EVPN (1-5). Only applicable when route_fam='evpn'.
             1=Ethernet Auto-Discovery, 2=MAC/IP, 3=Inclusive Multicast, 4=ES, 5=IP Prefix.
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        kwargs: Dict[str, Any] = {"route_fam": route_fam, "detail": True}
-        if route_type is not None:
-            kwargs["route_type"] = route_type
-        return Result(host=task.host, result=device.get_bgp_rib(**kwargs))
-
-    data = _run_report("bgp_rib", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+    return _run_report(
+        "bgp_rib",
+        inv_filter,
+        field_filter,
+        route_fam=route_fam,
+        route_type=route_type,
+        detail=True,
+    )
 
 
 @mcp.tool()
@@ -565,21 +502,13 @@ def ipv4_rib(
 
     Args:
         address: Optional IP address for longest-prefix-match (LPM) lookup (e.g. '10.0.0.1').
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(
-            host=task.host,
-            result=device.get_rib(afi="ipv4-unicast", lpm_address=address),
-        )
-
-    data = _run_report("ip_rib", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+    return _run_report("ipv4_rib", inv_filter, field_filter, address=address)
 
 
 @mcp.tool()
@@ -594,21 +523,13 @@ def ipv6_rib(
 
     Args:
         address: Optional IPv6 address for longest-prefix-match (LPM) lookup.
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(
-            host=task.host,
-            result=device.get_rib(afi="ipv6-unicast", lpm_address=address),
-        )
-
-    data = _run_report("ip_rib", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+    return _run_report("ipv6_rib", inv_filter, field_filter, address=address)
 
 
 @mcp.tool()
@@ -621,18 +542,13 @@ def static_routes(
     Returns route, admin-state, installed, metric, pref, and nhops.
 
     Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_static_routes())
-
-    data = _run_report("static_routes", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+    return _run_report("static_routes", inv_filter, field_filter)
 
 
 @mcp.tool()
@@ -648,18 +564,13 @@ def tunnel_table(
     a remote endpoint (e.g. a loopback) is reached over, and on which port.
 
     Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs (e.g. 'type=ldp'). Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_tunnel_table())
-
-    data = _run_report("tunnel_table", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+    return _run_report("tunnel_table", inv_filter, field_filter)
 
 
 @mcp.tool()
@@ -673,18 +584,13 @@ def network_instances(
     vxlan-interface, import/export RTs, and associated interfaces with IP addresses, VLANs, and MTU.
 
     Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_nwi_itf())
-
-    data = _run_report("nwi_itfs", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+    return _run_report("ni", inv_filter, field_filter)
 
 
 @mcp.tool()
@@ -698,18 +604,13 @@ def subinterfaces(
     IPv4/IPv6 addresses, VLAN ID, and more.
 
     Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_sum_subitf())
-
-    data = _run_report("subinterface", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+    return _run_report("subif", inv_filter, field_filter)
 
 
 @mcp.tool()
@@ -722,194 +623,13 @@ def lag(
     Returns LAG name, oper state, MTU, min-links, LACP config, and member interfaces.
 
     Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_lag())
-
-    data = _run_report("lag", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
-
-
-@mcp.tool()
-def lldp_neighbors(
-    inv_filter: Optional[str] = None,
-    field_filter: Optional[str] = None,
-) -> str:
-    """Get LLDP neighbor information.
-
-    Returns local interface, neighbor system name, and neighbor port ID/description.
-    Useful for understanding physical topology and connectivity.
-
-    Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
-    """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_lldp_sum())
-
-    data = _run_report("lldp_nbrs", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
-
-
-@mcp.tool()
-def mac_table(
-    inv_filter: Optional[str] = None,
-    field_filter: Optional[str] = None,
-) -> str:
-    """Get MAC address table entries.
-
-    Returns network instance, MAC address, destination (interface or VXLAN), and type (learnt/static/evpn).
-
-    Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
-    """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_mac_table())
-
-    data = _run_report("mac_table", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
-
-
-@mcp.tool()
-def irb_interfaces(
-    inv_filter: Optional[str] = None,
-    field_filter: Optional[str] = None,
-) -> str:
-    """Get IRB (Integrated Routing and Bridging) sub-interface details.
-
-    Returns IRB subinterface, network instance, IPv4/IPv6 addresses, anycast gateway config,
-    ARP/ND settings, EVPN advertising config, and ILR (Interface-Less Routing) support.
-
-    Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
-    """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_irb())
-
-    data = _run_report("irb", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
-
-
-@mcp.tool()
-def ethernet_segments(
-    inv_filter: Optional[str] = None,
-    field_filter: Optional[str] = None,
-) -> str:
-    """Get EVPN Ethernet Segment information.
-
-    Returns ESI, type, multi-homing mode, oper state, interfaces, next-hops,
-    and associated network instances with DF (Designated Forwarder) candidates.
-
-    Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
-    """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_es())
-
-    data = _run_report("es", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
-
-
-@mcp.tool()
-def es_destinations(
-    inv_filter: Optional[str] = None,
-    field_filter: Optional[str] = None,
-) -> str:
-    """Get Ethernet Segment destinations from bridge tables.
-
-    Returns tunnel name, ESI, and VTEP destinations. VTEP destinations are comma-separated list of (vtep-address, vni) and are dynamically generated, based on traffic/routing data.
-
-    Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
-    """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_es_dest())
-
-    data = _run_report("es_dest", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
-
-
-@mcp.tool()
-def vxlan_tunnels(
-    inv_filter: Optional[str] = None,
-    field_filter: Optional[str] = None,
-) -> str:
-    """Get VXLAN tunnel interfaces and unicast destinations.
-
-    Returns VXLAN interface name, associated network instance, ingress-vni,
-    and unicast destinations (vtep-address, vni).
-
-    Note: unicast destinations are populated by receipt of EVPN type-2 (MAC/IP) routes,
-    which typically requires actual traffic. If no destinations are shown, it means no
-    type-2 routes have been received for that VNI yet.
-
-    Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
-    """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_vxlan())
-
-    data = _run_report("vxlan", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
-
-
-@mcp.tool()
-def arp_table(
-    inv_filter: Optional[str] = None,
-    field_filter: Optional[str] = None,
-) -> str:
-    """Get ARP table entries.
-
-    Returns interface, network instance, IPv4 address, MAC address, type, and expiry time.
-
-    Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
-    """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_arp())
-
-    data = _run_report("arp", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+    return _run_report("lag", inv_filter, field_filter)
 
 
 @mcp.tool()
@@ -930,18 +650,154 @@ def ifstats(
 
     Args:
         interval: Seconds between the two samples (default 5).
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
+    return _run_report("ifstats", inv_filter, field_filter, interval=interval)
 
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_ifstats(interval=interval))
 
-    data = _run_report("ifstats", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+@mcp.tool()
+def mac_table(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get MAC address table entries.
+
+    Returns network instance, MAC address, destination (interface or VXLAN), and type (learnt/static/evpn).
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+    """
+    return _run_report("mac", inv_filter, field_filter)
+
+
+@mcp.tool()
+def irb_interfaces(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get IRB (Integrated Routing and Bridging) sub-interface details.
+
+    Returns IRB subinterface, network instance, IPv4/IPv6 addresses, anycast gateway config,
+    ARP/ND settings, EVPN advertising config, and ILR (Interface-Less Routing) support.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+    """
+    return _run_report("irb", inv_filter, field_filter)
+
+
+@mcp.tool()
+def ethernet_segments(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get EVPN Ethernet Segment information.
+
+    Returns ESI, type, multi-homing mode, oper state, interfaces, next-hops,
+    and associated network instances with DF (Designated Forwarder) candidates.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+    """
+    return _run_report("es", inv_filter, field_filter)
+
+
+@mcp.tool()
+def es_destinations(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get Ethernet Segment destinations from bridge tables.
+
+    Returns tunnel name, ESI, and VTEP destinations. VTEP destinations are comma-separated list of (vtep-address, vni) and are dynamically generated, based on traffic/routing data.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+    """
+    return _run_report("es_dest", inv_filter, field_filter)
+
+
+@mcp.tool()
+def vxlan_tunnels(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get VXLAN tunnel interfaces and unicast destinations.
+
+    Returns VXLAN interface name, associated network instance, ingress-vni,
+    and unicast destinations (vtep-address, vni).
+
+    Note: unicast destinations are populated by receipt of EVPN type-2 (MAC/IP) routes,
+    which typically requires actual traffic. If no destinations are shown, it means no
+    type-2 routes have been received for that VNI yet.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+    """
+    return _run_report("vxlan", inv_filter, field_filter)
+
+
+@mcp.tool()
+def lldp_neighbors(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get LLDP neighbor information.
+
+    Returns local interface, neighbor system name, and neighbor port ID/description.
+    Useful for understanding physical topology and connectivity.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+    """
+    return _run_report("lldp", inv_filter, field_filter)
+
+
+@mcp.tool()
+def arp_table(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get ARP table entries.
+
+    Returns interface, network instance, IPv4 address, MAC address, type, and expiry time.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+    """
+    return _run_report("arp", inv_filter, field_filter)
 
 
 @mcp.tool()
@@ -954,18 +810,13 @@ def ipv6_neighbors(
     Returns interface, IPv6 address, MAC address, state, type, and next state time.
 
     Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
-        field_filter: Field filter as comma-separated key=value pairs. Supports regex.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'session-state=established'). Values are case-insensitive regexes.
     """
-    i_filt, f_filt = _parse_filters(inv_filter, field_filter)
-
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_nd())
-
-    data = _run_report("nd", _task, i_filt, f_filt)
-    return json.dumps(data, indent=2, default=str)
+    return _run_report("nd", inv_filter, field_filter)
 
 
 @mcp.tool()
@@ -977,31 +828,25 @@ def routing_policies(
     Returns the structured JSON response from /routing-policy.
 
     Args:
-        inv_filter: Inventory filter as comma-separated key=value pairs. Supports wildcards.
-            Matches against node labels from the topology file. Omit if no labels are defined.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
     """
-    i_filt, _ = _parse_filters(inv_filter, None)
+    spec = get_report("routing_pol")
+    i_filter, _ = _parse_filters(inv_filter, None)
+    result = _query(spec, i_filter)
 
-    def _task(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_routing_policies())
-
-    nornir = get_nornir()
-    target = nornir.filter(**i_filt) if i_filt else nornir
-    result = target.run(task=_task, name="routing_pol", raise_on_error=False)
-
-    all_data = []
+    policies: List[Dict[str, Any]] = []
     for host, host_result in result.items():
         r = host_result[0]
-        node_name = r.host.hostname if r.host and r.host.hostname else host
+        node = r.host.hostname if r.host and r.host.hostname else host
         if r.failed:
-            all_data.append({"Node": node_name, "_error": str(r.exception)})
+            policies.append({"Node": node, "_error": str(r.exception)})
             continue
-        if r.result and r.result.get("routing_pol"):
-            for pol in r.result["routing_pol"]:
-                all_data.append({"Node": node_name, "routing-policy": pol})
+        for policy in (r.result or {}).get(spec.resource) or []:
+            policies.append({"Node": node, "routing-policy": policy})
 
-    return json.dumps(all_data, indent=2, default=str)
+    return json.dumps(policies, indent=2, default=str)
 
 
 # ---- CLI entry point ----
