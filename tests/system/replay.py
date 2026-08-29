@@ -36,6 +36,13 @@ FORMAT = 1
 class ReplayError(LookupError):
     """A getter asked for a path the recording does not hold."""
 
+    def __init__(self, path: str, datatype: str) -> None:
+        super().__init__(
+            f"no recorded response for get(path={path!r}, datatype={datatype!r})"
+        )
+        self.path = path
+        self.datatype = datatype
+
 
 @contextmanager
 def deterministic_clock(
@@ -309,9 +316,7 @@ class ReplayDevice(MixinDevice):
             self.requested.append(key)
             recorded = self._calls.get(key)
             if not recorded:
-                raise ReplayError(
-                    f"no recorded response for get(path={path!r}, datatype={datatype!r})"
-                )
+                raise ReplayError(path, datatype or "config")
             index = min(self._cursor.get(key, 0), len(recorded) - 1)
             self._cursor[key] = index + 1
             call = recorded[index]
