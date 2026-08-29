@@ -6,7 +6,7 @@ from nornir_srl.mcp_server import list_topologies
 
 
 def test_version():
-    assert __version__ == "0.5.3"
+    assert __version__ == "0.5.4"
 
 
 def test_list_topologies_recursive():
