@@ -90,6 +90,11 @@ _MIN_RATE_INTERVAL = 0.5  # seconds; below this the rate is too noisy to report
 #: neighbouring subscription rather than spending a Get of their own on.
 _SHARED_ROOTS: Tuple[str, ...] = ("interface", "network-instance")
 
+#: Seconds an in-flight Get may run before the node is reported as not answering.
+#: Healthy Gets (resync, bootstrap) finish well inside this; a Get that hangs
+#: against a dead route does not, and that is what the Nodes pane should show.
+GET_HANG_GRACE = 2.0
+
 
 @dataclass
 class PathState:
@@ -188,6 +193,7 @@ class HostStream:
         reconnect_delay: float = 5.0,
         restart_debounce: float = 1.0,
         idle_timeout: float = 900.0,
+        get_hang_grace: float = GET_HANG_GRACE,
         on_update: Optional[Callable[[], None]] = None,
     ) -> None:
         self.name = name
@@ -197,6 +203,7 @@ class HostStream:
         self.reconnect_delay = reconnect_delay
         self.restart_debounce = restart_debounce
         self.idle_timeout = idle_timeout
+        self.get_hang_grace = get_hang_grace
         self.on_update = on_update
 
         self._lock = threading.RLock()
@@ -738,13 +745,25 @@ class HostStream:
     def failing_since(self) -> Optional[float]:
         """When this node stopped answering, or ``None`` while it answers.
 
-        A Get that hangs counts as much as one that fails. A gRPC call carries
-        no deadline of its own, so one issued against an address that stopped
-        being routed - a container that was destroyed - blocks until TCP gives
-        up, holding the one-Get-at-a-time lock for as long as it does. The node
-        is equally unusable either way; only the elapsed time tells them apart.
+        A Get that hangs counts as much as one that fails, but only after it has
+        been in flight for ``get_hang_grace`` seconds. Healthy Gets (a resync,
+        bootstrapping a new report) finish well inside that window; treating
+        them as down is what made Nodes dots flash red. A Get against an
+        address that stopped being routed blocks until TCP gives up, and that
+        is what this reports.
+
+        A gRPC call carries no deadline of its own, so the elapsed time is what
+        tells a slow Get from a dead one.
         """
-        stamps = [t for t in (self._failing_since, self._get_started) if t is not None]
+        stamps = []
+        if self._failing_since is not None:
+            stamps.append(self._failing_since)
+        started = self._get_started
+        if (
+            started is not None
+            and (time.time() - started) >= self.get_hang_grace
+        ):
+            stamps.append(started)
         return min(stamps) if stamps else None
 
     @property
@@ -811,7 +830,7 @@ class HostStream:
             "sessions": (1 if self.connected else 0)
             + (1 if self._get_lock.locked() else 0),
             "gets": self._gets,
-            "failing_since": self._failing_since,
+            "failing_since": self.failing_since,
             "paths": paths,
         }
 

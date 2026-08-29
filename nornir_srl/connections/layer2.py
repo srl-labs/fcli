@@ -107,6 +107,277 @@ def _system0_addresses(subitf_details: Dict[str, Dict[str, Any]]) -> Tuple[str, 
     return ipv4, ipv6
 
 
+def _to_subnet(pfx: str) -> str:
+    """The network prefix of an interface address, e.g. ``10.1.100.1/24`` → ``10.1.100.0/24``.
+
+    Link-local and unspecified addresses are omitted; they are not service subnets.
+    """
+    text = str(pfx).strip()
+    if not text:
+        return ""
+    try:
+        net = ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        return text
+    if net.is_link_local or net.is_unspecified or net.is_multicast:
+        return ""
+    return str(net)
+
+
+def _host_ip_if_host_route(pfx: Any) -> str:
+    """The address of a host route (``/32`` or ``/128``), otherwise ``""``."""
+    text = str(pfx or "").strip()
+    if not text:
+        return ""
+    try:
+        net = ipaddress.ip_network(text, strict=False)
+    except ValueError:
+        return ""
+    if net.prefixlen != net.max_prefixlen:
+        return ""
+    if net.is_link_local or net.is_unspecified or net.is_multicast:
+        return ""
+    return str(net.network_address)
+
+
+def _host_ips_from_payload(payload: Any) -> List[str]:
+    """Host-route addresses nested anywhere in a gNMI route-table payload."""
+    found: List[str] = []
+    seen: set[str] = set()
+
+    def walk(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key in ("ipv4-prefix", "ipv6-prefix"):
+                if key in obj:
+                    ip = _host_ip_if_host_route(obj[key])
+                    if ip and ip not in seen:
+                        seen.add(ip)
+                        found.append(ip)
+            for value in obj.values():
+                walk(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                walk(item)
+
+    walk(payload)
+    return found
+
+
+def _split_host_ips(text: Any) -> List[str]:
+    """Bare addresses from a comma- or space-separated cell."""
+    if not text:
+        return []
+    ips: List[str] = []
+    for part in str(text).replace(",", " ").split():
+        host = part.split("/")[0].strip()
+        if host:
+            ips.append(host)
+    return ips
+
+
+def _underlay_hosts_from_instances(ni_list: List[Any]) -> str:
+    """Host routes in the default instance's route-table, if that table is present."""
+    for ni in as_list(ni_list):
+        if isinstance(ni, dict) and str(ni.get("name", "")).lower() == "default":
+            return ", ".join(_host_ips_from_payload(ni.get("route-table") or {}))
+    return ""
+
+
+def assign_underlay_sites(rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    """Number underlay islands ``1``, ``2``, … from default-RIB reachability of system0.
+
+    Two nodes share a site when each has the other's system0 address as a host
+    route in network-instance ``default``. When the set also includes
+    non-gateway nodes (leaves), edges between two Gateway nodes are ignored:
+    DCGWs learn each other over the WAN and would otherwise glue every DC into
+    one component. A service that is only Gateways (the WAN/DCI side) keeps
+    those edges, so dcgw1..4 that all have each other's loopbacks stay one tile.
+
+    Returns ``{}`` when there is only one island (or none), so a single fabric
+    is not labelled ``(1)``.
+    """
+    by_node: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        name = str(row.get("Node") or "unknown")
+        by_node.setdefault(name, []).append(row)
+    nodes = sorted(by_node)
+    if len(nodes) < 2:
+        return {}
+
+    system: Dict[str, List[str]] = {}
+    rib: Dict[str, set[str]] = {}
+    gateway: set[str] = set()
+    any_rib = False
+    for name in nodes:
+        sample = by_node[name][0]
+        system[name] = _split_host_ips(sample.get("System IPv4")) + _split_host_ips(
+            sample.get("System IPv6")
+        )
+        hosts = set(_split_host_ips(sample.get("Underlay Hosts")))
+        rib[name] = hosts
+        if hosts:
+            any_rib = True
+        if any(
+            r.get("Gateway") in ("Y", True, "true")
+            for r in by_node[name]
+        ):
+            gateway.add(name)
+
+    if not any_rib:
+        return {}
+
+    skip_gateway_pairs = bool(nodes) and any(n not in gateway for n in nodes)
+
+    def sees(observer: str, other: str) -> bool:
+        other_ips = system[other]
+        if not other_ips:
+            return False
+        table = rib[observer]
+        return any(ip in table for ip in other_ips)
+
+    parent = {n: n for n in nodes}
+
+    def find(x: str) -> str:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a: str, b: str) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i, a in enumerate(nodes):
+        for b in nodes[i + 1 :]:
+            if skip_gateway_pairs and a in gateway and b in gateway:
+                continue
+            if sees(a, b) and sees(b, a):
+                union(a, b)
+
+    components: Dict[str, List[str]] = {}
+    for name in nodes:
+        components.setdefault(find(name), []).append(name)
+    ordered = sorted(components.values(), key=lambda members: members[0])
+    if len(ordered) <= 1:
+        return {}
+    return {
+        name: str(index)
+        for index, members in enumerate(ordered, start=1)
+        for name in members
+    }
+
+
+def stamp_underlay_sites(rows: List[Dict[str, Any]]) -> bool:
+    """Stamp ``Site`` on each row, clustered per Bridge Domain / Router.
+
+    A DCGW appears in both the DC-side and WAN-side tiles; those tiles must be
+    clustered on their own members so the WAN tile can stay one Router while
+    the DC tile still splits by fabric.
+    """
+    groups: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        if row.get("Bridge Domain") or row.get("Service Type") == "Bridge Domain":
+            key = "bd:" + str(row.get("Bridge Domain") or row.get("Route Targets") or "")
+        else:
+            key = "rt:" + str(row.get("Router") or row.get("Route Targets") or "")
+        groups.setdefault(key, []).append(row)
+    any_site = False
+    for group in groups.values():
+        sites = assign_underlay_sites(group)
+        for row in group:
+            site = sites.get(str(row.get("Node") or ""), "")
+            if site:
+                any_site = True
+            row["Site"] = site
+    return any_site
+
+
+def _format_route_target(target: Any) -> str:
+    """A route-target as ``target:x:y``, or ``""`` if *target* is empty."""
+    if not target:
+        return ""
+    text = str(target)
+    return text if text.startswith("target:") else f"target:{text}"
+
+
+def _instance_route_targets(inst: Dict[str, Any]) -> List[str]:
+    """The import and export route-targets of one ``bgp-vpn`` instance."""
+    if not isinstance(inst, dict):
+        return []
+    rt_cfg = inst.get("route-target", {})
+    if not isinstance(rt_cfg, dict):
+        return []
+    rts: set[str] = set()
+    for key in ("import-rt", "export-rt"):
+        for item in as_list(rt_cfg.get(key)):
+            target = item.get("target") if isinstance(item, dict) else item
+            formatted = _format_route_target(target)
+            if formatted:
+                rts.add(formatted)
+    return sorted(rts)
+
+
+def _vpn_tile_groups(ni: Dict[str, Any], isolated_label: str) -> List[Dict[str, Any]]:
+    """How a network-instance is shown as service tiles, one group per tile.
+
+    A single enabled ``bgp-vpn`` instance (or none) is one tile, keyed by its
+    route-target. Two or more enabled instances with route-targets are a
+    Gateway: each instance becomes its own tile with that instance's RT so the
+    DC and WAN sides of a DCGW stay distinct.
+    """
+    enabled: List[Dict[str, Any]] = []
+    for i, inst in enumerate(
+        as_list(ni.get("protocols", {}).get("bgp-vpn", {}).get("bgp-instance")),
+        start=1,
+    ):
+        if not isinstance(inst, dict):
+            continue
+        if _clean_state(inst.get("admin-state")) in ("disable", "disabled"):
+            continue
+        iid = inst.get("id")
+        if iid is None:
+            iid = inst.get("index")
+        enabled.append(
+            {
+                "id": str(iid) if iid is not None and str(iid) != "" else str(i),
+                "rts": _instance_route_targets(inst),
+            }
+        )
+
+    with_rts = [e for e in enabled if e["rts"]]
+    if len(with_rts) < 2:
+        rts = sorted({rt for e in enabled for rt in e["rts"]})
+        return [
+            {
+                "primary": rts[0] if rts else isolated_label,
+                "rts": rts,
+                "id": with_rts[0]["id"] if len(with_rts) == 1 else "",
+                "gateway": False,
+            }
+        ]
+
+    primary_counts: Dict[str, int] = {}
+    for e in with_rts:
+        primary = e["rts"][0]
+        primary_counts[primary] = primary_counts.get(primary, 0) + 1
+
+    groups = []
+    for e in with_rts:
+        primary = e["rts"][0]
+        if primary_counts[primary] > 1:
+            primary = f"{primary} (bgp-instance {e['id']})"
+        groups.append(
+            {
+                "primary": primary,
+                "rts": e["rts"],
+                "id": e["id"],
+                "gateway": True,
+            }
+        )
+    return groups
+
+
 class Layer2Mixin:
     """Mixin providing Layer2 related getters."""
 
@@ -159,6 +430,37 @@ class Layer2Mixin:
                     si_name = f"{itf_name}.{si_name}"
                 details[si_name] = si
         return details
+
+    def _default_underlay_hosts(self, ni_list: Optional[List[Any]] = None) -> str:
+        """Host routes (``/32``, ``/128``) in network-instance ``default``.
+
+        These are the loopbacks this node can see in the underlay; services use
+        them to split a Route-Target that spans more than one DC.
+        """
+        from_ni = _underlay_hosts_from_instances(ni_list or [])
+        if from_ni:
+            return from_ni
+        hosts: List[str] = []
+        seen: set[str] = set()
+        for path in (
+            "/network-instance[name=default]/route-table/ipv4-unicast/route/ipv4-prefix",
+            "/network-instance[name=default]/route-table/ipv6-unicast/route/ipv6-prefix",
+        ):
+            with _suppress_pygnmi_client_logging():
+                try:
+                    resp = self.get(paths=[path], datatype="state")
+                except BaseException as e:
+                    if _gnmi_path_missing(e) or isinstance(e, KeyError):
+                        continue
+                    raise
+            payload: Any = first_payload(resp)
+            if not payload:
+                payload = resp
+            for ip in _host_ips_from_payload(payload):
+                if ip not in seen:
+                    seen.add(ip)
+                    hosts.append(ip)
+        return ", ".join(hosts)
 
     def get_lldp_sum(self, interface: Optional[str] = "*") -> Dict[str, Any]:
         path_spec = {
@@ -480,6 +782,7 @@ class Layer2Mixin:
         # for IRB IPv4/IPv6, anycast-gw, VLAN encapsulation, and system0
         subitf_details = self._subinterface_details()
         system_ipv4, system_ipv6 = _system0_addresses(subitf_details)
+        underlay_hosts = self._default_underlay_hosts(ni_list)
 
         # Build mapping of irb_subinterface -> associated ip-vrf / L3 network instances
         irb_to_ip_vrf: Dict[str, List[str]] = {}
@@ -495,14 +798,6 @@ class Layer2Mixin:
                             irb_to_ip_vrf[itf_name].append(vrf_name)
 
         results = []
-
-        def _to_subnet(pfx: str) -> str:
-            try:
-                import ipaddress
-                net = ipaddress.ip_network(pfx, strict=False)
-                return str(net)
-            except Exception:
-                return pfx
 
         def _extract_vlan_encap(itf_name: str, itf_dict: Dict[str, Any]) -> str:
             si = subitf_details.get(itf_name, {})
@@ -567,7 +862,7 @@ class Layer2Mixin:
                 if obj.get("anycast-gateway") is True or str(obj.get("anycast-gateway")).lower() == "true":
                     is_anycast = True
 
-            subnets = [_to_subnet(pfx) for pfx in ips]
+            subnets = [s for pfx in ips if (s := _to_subnet(pfx))]
 
             ip_part = f": {', '.join(ips)}" if ips else ""
             gw_part = f" (anycast-gw: {'true' if is_anycast else 'false'})"
@@ -583,32 +878,6 @@ class Layer2Mixin:
             if ni_type != "mac-vrf":
                 continue
             oper_state = ni.get("oper-state", "unknown")
-
-            bgp_vpn = ni.get("protocols", {}).get("bgp-vpn", {})
-            bgp_instances = bgp_vpn.get("bgp-instance", [])
-            if isinstance(bgp_instances, dict):
-                bgp_instances = [bgp_instances]
-
-            rts = set()
-            for inst in bgp_instances:
-                if not isinstance(inst, dict):
-                    continue
-                rt_cfg = inst.get("route-target", {})
-                if isinstance(rt_cfg, dict):
-                    for key in ("import-rt", "export-rt"):
-                        rts_raw = rt_cfg.get(key, [])
-                        if isinstance(rts_raw, (str, dict)):
-                            rts_raw = [rts_raw]
-                        for item in rts_raw:
-                            target = item.get("target") if isinstance(item, dict) else item
-                            if target:
-                                target_str = str(target)
-                                if not target_str.startswith("target:"):
-                                    target_str = f"target:{target_str}"
-                                rts.add(target_str)
-
-            rt_list = sorted(list(rts))
-            rt_display = ", ".join(rt_list) if rt_list else f"mac-vrf:{ni_name}"
 
             irb_subitfs = []
             bridge_subitfs = []
@@ -653,21 +922,25 @@ class Layer2Mixin:
             else:
                 effective_oper = ni_oper if ni_oper else "up"
 
-            primary_bd = rt_list[0] if rt_list else f"mac-vrf:{ni_name}"
-            results.append(
-                {
-                    "Bridge Domain": primary_bd,
-                    "MAC-VRF": ni_name,
-                    "Oper State": effective_oper,
-                    "Route Targets": rt_display,
-                    "Subnets": ", ".join(all_subnets) if all_subnets else "",
-                    "IRB Interface": ", ".join(irb_subitfs) if irb_subitfs else "-",
-                    "Sub-Interfaces": ", ".join(bridge_subitfs) if bridge_subitfs else "-",
-                    "VXLAN Interface": ", ".join(vxlan_itfs) if vxlan_itfs else "-",
-                    "System IPv4": system_ipv4,
-                    "System IPv6": system_ipv6,
-                }
-            )
+            for group in _vpn_tile_groups(ni, f"mac-vrf:{ni_name}"):
+                rt_display = ", ".join(group["rts"]) if group["rts"] else f"mac-vrf:{ni_name}"
+                results.append(
+                    {
+                        "Bridge Domain": group["primary"],
+                        "MAC-VRF": ni_name,
+                        "Oper State": effective_oper,
+                        "Route Targets": rt_display,
+                        "Subnets": ", ".join(all_subnets) if all_subnets else "",
+                        "IRB Interface": ", ".join(irb_subitfs) if irb_subitfs else "-",
+                        "Sub-Interfaces": ", ".join(bridge_subitfs) if bridge_subitfs else "-",
+                        "VXLAN Interface": ", ".join(vxlan_itfs) if vxlan_itfs else "-",
+                        "Gateway": "Y" if group["gateway"] else "",
+                        "BGP Instance": group["id"] if group["gateway"] else "",
+                        "System IPv4": system_ipv4,
+                        "System IPv6": system_ipv6,
+                        "Underlay Hosts": underlay_hosts,
+                    }
+                )
 
         return {"bridge_domains": results}
 
@@ -694,6 +967,7 @@ class Layer2Mixin:
         # and system0 shown next to the node name
         subitf_details = self._subinterface_details()
         system_ipv4, system_ipv6 = _system0_addresses(subitf_details)
+        underlay_hosts = self._default_underlay_hosts(ni_list)
 
         # Build mapping of irb_subinterface -> mac-vrf network instance name
         irb_to_mac_vrf: Dict[str, str] = {}
@@ -713,7 +987,7 @@ class Layer2Mixin:
             def _check_ip_block(ip_cfg: Any) -> None:
                 if not isinstance(ip_cfg, dict):
                     return
-                for addr in ip_cfg.get("address", []):
+                for addr in as_list(ip_cfg.get("address")):
                     if isinstance(addr, dict):
                         pfx = addr.get("ip-prefix")
                         if pfx:
@@ -738,37 +1012,12 @@ class Layer2Mixin:
                 continue
             oper_state = ni.get("oper-state", "unknown")
 
-            bgp_vpn = ni.get("protocols", {}).get("bgp-vpn", {})
-            bgp_instances = bgp_vpn.get("bgp-instance", [])
-            if isinstance(bgp_instances, dict):
-                bgp_instances = [bgp_instances]
-
-            rts = set()
-            for inst in bgp_instances:
-                if not isinstance(inst, dict):
-                    continue
-                rt_cfg = inst.get("route-target", {})
-                if isinstance(rt_cfg, dict):
-                    for key in ("import-rt", "export-rt"):
-                        rts_raw = rt_cfg.get(key, [])
-                        if isinstance(rts_raw, (str, dict)):
-                            rts_raw = [rts_raw]
-                        for item in rts_raw:
-                            target = item.get("target") if isinstance(item, dict) else item
-                            if target:
-                                target_str = str(target)
-                                if not target_str.startswith("target:"):
-                                    target_str = f"target:{target_str}"
-                                rts.add(target_str)
-
-            rt_list = sorted(list(rts))
-            rt_display = ", ".join(rt_list) if rt_list else "none (isolated)"
-
             mac_vrfs_items = []
             routed_itfs_items = []
             subitf_states = []
+            irb_subnets: List[str] = []
 
-            for i in ni.get("interface", []):
+            for i in as_list(ni.get("interface")):
                 if isinstance(i, dict) and i.get("name"):
                     name = i["name"]
                     details = subitf_details.get(name, {})
@@ -783,6 +1032,10 @@ class Layer2Mixin:
                             mac_vrfs_items.append(f"{mac_name} ({name} [{st}]: {ip_str})")
                         else:
                             mac_vrfs_items.append(f"{mac_name} ({name} [{st}])")
+                        for pfx in ips:
+                            subnet = _to_subnet(pfx)
+                            if subnet and subnet not in irb_subnets:
+                                irb_subnets.append(subnet)
                     else:
                         if ip_str:
                             routed_itfs_items.append(f"{name} [{st}] ({ip_str})")
@@ -810,20 +1063,29 @@ class Layer2Mixin:
             else:
                 effective_oper = ni_oper if ni_oper else "up"
 
-            primary_router = rt_list[0] if rt_list else f"none (isolated) - {ni_name}"
-            results.append(
-                {
-                    "Router": primary_router,
-                    "IP-VRF": ni_name,
-                    "Oper State": effective_oper,
-                    "Route Targets": rt_display,
-                    "MAC-VRFs": ", ".join(mac_vrfs_items) if mac_vrfs_items else "-",
-                    "Routed Interfaces": ", ".join(routed_itfs_items) if routed_itfs_items else "-",
-                    "VXLAN Interface": ", ".join(vxlan_itfs) if vxlan_itfs else "-",
-                    "System IPv4": system_ipv4,
-                    "System IPv6": system_ipv6,
-                }
-            )
+            for group in _vpn_tile_groups(ni, "none (isolated)"):
+                isolated = not group["rts"]
+                rt_display = ", ".join(group["rts"]) if group["rts"] else "none (isolated)"
+                primary = (
+                    f"none (isolated) - {ni_name}" if isolated else group["primary"]
+                )
+                results.append(
+                    {
+                        "Router": primary,
+                        "IP-VRF": ni_name,
+                        "Oper State": effective_oper,
+                        "Route Targets": rt_display,
+                        "MAC-VRFs": ", ".join(mac_vrfs_items) if mac_vrfs_items else "-",
+                        "Routed Interfaces": ", ".join(routed_itfs_items) if routed_itfs_items else "-",
+                        "VXLAN Interface": ", ".join(vxlan_itfs) if vxlan_itfs else "-",
+                        "Subnets": ", ".join(irb_subnets) if irb_subnets else "",
+                        "Gateway": "Y" if group["gateway"] else "",
+                        "BGP Instance": group["id"] if group["gateway"] else "",
+                        "System IPv4": system_ipv4,
+                        "System IPv6": system_ipv6,
+                        "Underlay Hosts": underlay_hosts,
+                    }
+                )
 
         return {"routers": results}
 

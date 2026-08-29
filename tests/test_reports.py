@@ -590,6 +590,8 @@ def test_get_bridge_domains():
     assert bd["IRB Interface"] == "irb1.100 [up]: 10.1.100.1/24 (anycast-gw: true) -> ip-vrf-1"
     assert bd["Sub-Interfaces"] == "ethernet-1/1.100 [up] (VLAN: 100), ethernet-1/2.100 [up] (VLAN: 100)"
     assert bd["VXLAN Interface"] == "vxlan1.100"
+    assert bd["Gateway"] == ""
+    assert bd["BGP Instance"] == ""
     assert bd["System IPv4"] == ""
     assert bd["System IPv6"] == ""
 
@@ -814,6 +816,12 @@ def test_get_routers():
                         {
                             "name": "irb1.100",
                             "ipv4": {"address": [{"ip-prefix": "10.1.100.1/24"}]},
+                            "ipv6": {
+                                "address": [
+                                    {"ip-prefix": "2001:db8:100::1/64"},
+                                    {"ip-prefix": "fe80::1/64"},
+                                ]
+                            },
                         },
                         {
                             "name": "ethernet-1/10.0",
@@ -841,9 +849,14 @@ def test_get_routers():
     assert r["IP-VRF"] == "ip-vrf-1"
     assert r["Oper State"] == "up"
     assert r["Route Targets"] == "target:65000:999"
-    assert r["MAC-VRFs"] == "mac-vrf-100 (irb1.100 [up]: 10.1.100.1/24)"
+    assert r["MAC-VRFs"] == (
+        "mac-vrf-100 (irb1.100 [up]: 10.1.100.1/24, 2001:db8:100::1/64, fe80::1/64)"
+    )
     assert r["Routed Interfaces"] == "ethernet-1/10.0 [up] (192.168.1.1/30)"
     assert r["VXLAN Interface"] == "vxlan1.1"
+    assert r["Subnets"] == "10.1.100.0/24, 2001:db8:100::/64"
+    assert r["Gateway"] == ""
+    assert r["BGP Instance"] == ""
 
     # Test isolated ip-vrf without route targets
     isolated_data = [
@@ -862,6 +875,7 @@ def test_get_routers():
     r2 = out2["routers"][0]
     assert r2["Route Targets"] == "none (isolated)"
     assert r2["Router"] == "none (isolated) - isolated-vrf"
+    assert r2["Gateway"] == ""
 
     # Test that mgmt ip-vrf is excluded
     mgmt_data = [
@@ -878,6 +892,368 @@ def test_get_routers():
     dev3 = _FakeLayer2({"network-instance": mgmt_data, "subinterface": [{}]})
     out3 = dev3.get_routers()
     assert len(out3["routers"]) == 0
+
+
+def test_host_ips_from_payload_keeps_only_host_routes():
+    from nornir_srl.connections.layer2 import _host_ips_from_payload
+
+    payload = {
+        "route": [
+            {"ipv4-prefix": "192.0.2.11/32"},
+            {"ipv4-prefix": "10.0.0.0/24"},
+            {"ipv6-prefix": "2001:db8::1/128"},
+            {"ipv6-prefix": "fe80::1/64"},
+        ]
+    }
+    assert _host_ips_from_payload(payload) == ["192.0.2.11", "2001:db8::1"]
+
+
+def test_assign_underlay_sites_splits_two_dcs_and_ignores_wan_between_gateways():
+    """Leaves see only local DCGWs; DCGWs also see the remote DCGWs over the WAN.
+
+    Gateway-to-gateway edges must not merge the two fabrics, or ipvrf-l3dci would
+    stay one tile. Each DCGW still joins the DC whose leaves have its system0.
+    """
+    from nornir_srl.connections.layer2 import assign_underlay_sites
+
+    dc1 = "192.0.2.11 192.0.2.14 192.0.2.151 192.0.2.152"
+    dc2 = "192.0.3.15 192.0.3.18 192.0.3.153 192.0.3.154"
+    wan = f"{dc1} {dc2}"
+    rows = [
+        {"Node": "leaf1", "System IPv4": "192.0.2.11", "Underlay Hosts": dc1, "Gateway": ""},
+        {"Node": "leaf4", "System IPv4": "192.0.2.14", "Underlay Hosts": dc1, "Gateway": ""},
+        {"Node": "dcgw1", "System IPv4": "192.0.2.151", "Underlay Hosts": wan, "Gateway": "Y"},
+        {"Node": "dcgw2", "System IPv4": "192.0.2.152", "Underlay Hosts": wan, "Gateway": "Y"},
+        {"Node": "leaf5", "System IPv4": "192.0.3.15", "Underlay Hosts": dc2, "Gateway": ""},
+        {"Node": "leaf8", "System IPv4": "192.0.3.18", "Underlay Hosts": dc2, "Gateway": ""},
+        {"Node": "dcgw3", "System IPv4": "192.0.3.153", "Underlay Hosts": wan, "Gateway": "Y"},
+        {"Node": "dcgw4", "System IPv4": "192.0.3.154", "Underlay Hosts": wan, "Gateway": "Y"},
+    ]
+    sites = assign_underlay_sites(rows)
+    assert set(sites.values()) == {"1", "2"}
+    assert {sites["leaf1"], sites["leaf4"], sites["dcgw1"], sites["dcgw2"]} == {"1"}
+    assert {sites["leaf5"], sites["leaf8"], sites["dcgw3"], sites["dcgw4"]} == {"2"}
+    assert sites["leaf1"] != sites["leaf5"]
+
+
+def test_assign_underlay_sites_keeps_gateways_together_when_they_all_see_each_other():
+    """The WAN/DCI tile is only DCGWs; they share system0 over the WAN, so one Router."""
+    from nornir_srl.connections.layer2 import assign_underlay_sites
+
+    wan = "192.0.2.151 192.0.2.152 192.0.3.153 192.0.3.154"
+    rows = [
+        {"Node": "dcgw1", "System IPv4": "192.0.2.151", "Underlay Hosts": wan, "Gateway": "Y"},
+        {"Node": "dcgw2", "System IPv4": "192.0.2.152", "Underlay Hosts": wan, "Gateway": "Y"},
+        {"Node": "dcgw3", "System IPv4": "192.0.3.153", "Underlay Hosts": wan, "Gateway": "Y"},
+        {"Node": "dcgw4", "System IPv4": "192.0.3.154", "Underlay Hosts": wan, "Gateway": "Y"},
+    ]
+    assert assign_underlay_sites(rows) == {}
+
+
+def test_stamp_underlay_sites_splits_dc_tile_but_not_wan_tile():
+    from nornir_srl.connections.layer2 import stamp_underlay_sites
+
+    dc1 = "192.0.2.11 192.0.2.151 192.0.2.152"
+    dc2 = "192.0.3.15 192.0.3.153 192.0.3.154"
+    wan = f"{dc1} {dc2}"
+    rows = [
+        {"Node": "leaf1", "Router": "target:3000:3000", "System IPv4": "192.0.2.11", "Underlay Hosts": dc1, "Gateway": ""},
+        {"Node": "dcgw1", "Router": "target:3000:3000", "System IPv4": "192.0.2.151", "Underlay Hosts": wan, "Gateway": "Y"},
+        {"Node": "leaf5", "Router": "target:3000:3000", "System IPv4": "192.0.3.15", "Underlay Hosts": dc2, "Gateway": ""},
+        {"Node": "dcgw3", "Router": "target:3000:3000", "System IPv4": "192.0.3.153", "Underlay Hosts": wan, "Gateway": "Y"},
+        {"Node": "dcgw1", "Router": "target:65000:3000", "System IPv4": "192.0.2.151", "Underlay Hosts": wan, "Gateway": "Y"},
+        {"Node": "dcgw3", "Router": "target:65000:3000", "System IPv4": "192.0.3.153", "Underlay Hosts": wan, "Gateway": "Y"},
+    ]
+    assert stamp_underlay_sites(rows) is True
+    dc = [r for r in rows if r["Router"] == "target:3000:3000"]
+    wan_rows = [r for r in rows if r["Router"] == "target:65000:3000"]
+    assert {r["Site"] for r in dc} == {"1", "2"}
+    assert all(r["Site"] == "" for r in wan_rows)
+
+
+def test_assign_underlay_sites_is_silent_for_a_single_fabric():
+    from nornir_srl.connections.layer2 import assign_underlay_sites
+
+    hosts = "192.0.2.11 192.0.2.12"
+    rows = [
+        {"Node": "leaf1", "System IPv4": "192.0.2.11", "Underlay Hosts": hosts, "Gateway": ""},
+        {"Node": "leaf2", "System IPv4": "192.0.2.12", "Underlay Hosts": hosts, "Gateway": ""},
+    ]
+    assert assign_underlay_sites(rows) == {}
+
+
+def test_vpn_tile_groups_reads_bare_string_route_targets():
+    """SR Linux 26.x JSON_IETF reports import/export-rt as strings, not lists of dicts.
+
+    That is what dci-srl DCGWs return for ``bgp-vpn`` instance 1 (DC) and 2 (WAN).
+    """
+    from nornir_srl.connections.layer2 import _vpn_tile_groups
+
+    ni = {
+        "protocols": {
+            "bgp-evpn": {"bgp-instance": [{"id": 1, "admin-state": "enable"}]},
+            "bgp-ipvpn": {"bgp-instance": [{"id": 2, "admin-state": "enable"}]},
+            "bgp-vpn": {
+                "bgp-instance": [
+                    {
+                        "id": 1,
+                        "route-target": {
+                            "export-rt": "target:3000:3000",
+                            "import-rt": "target:3000:3000",
+                        },
+                    },
+                    {
+                        "id": 2,
+                        "route-target": {
+                            "export-rt": "target:65000:3000",
+                            "import-rt": "target:65000:3000",
+                        },
+                    },
+                ]
+            },
+        }
+    }
+    groups = _vpn_tile_groups(ni, "none (isolated)")
+    assert [(g["primary"], g["id"], g["gateway"]) for g in groups] == [
+        ("target:3000:3000", "1", True),
+        ("target:65000:3000", "2", True),
+    ]
+
+
+def test_vpn_tile_groups_splits_two_enabled_instances():
+    from nornir_srl.connections.layer2 import _vpn_tile_groups
+
+    ni = {
+        "protocols": {
+            "bgp-vpn": {
+                "bgp-instance": [
+                    {
+                        "id": 1,
+                        "admin-state": "enable",
+                        "route-target": {
+                            "import-rt": [{"target": "target:65000:1"}],
+                            "export-rt": [{"target": "target:65000:1"}],
+                        },
+                    },
+                    {
+                        "id": 2,
+                        "admin-state": "enable",
+                        "route-target": {
+                            "import-rt": [{"target": "target:65500:1"}],
+                            "export-rt": [{"target": "target:65500:1"}],
+                        },
+                    },
+                ]
+            }
+        }
+    }
+    groups = _vpn_tile_groups(ni, "none (isolated)")
+    assert len(groups) == 2
+    assert groups[0] == {
+        "primary": "target:65000:1",
+        "rts": ["target:65000:1"],
+        "id": "1",
+        "gateway": True,
+    }
+    assert groups[1] == {
+        "primary": "target:65500:1",
+        "rts": ["target:65500:1"],
+        "id": "2",
+        "gateway": True,
+    }
+
+
+def test_vpn_tile_groups_disambiguates_shared_route_targets():
+    from nornir_srl.connections.layer2 import _vpn_tile_groups
+
+    ni = {
+        "protocols": {
+            "bgp-vpn": {
+                "bgp-instance": [
+                    {
+                        "id": 1,
+                        "route-target": {
+                            "export-rt": [{"target": "target:64500:1"}],
+                            "import-rt": [{"target": "target:64500:1"}],
+                        },
+                    },
+                    {
+                        "id": 2,
+                        "route-target": {
+                            "export-rt": [{"target": "target:64500:1"}],
+                            "import-rt": [{"target": "target:64500:1"}],
+                        },
+                    },
+                ]
+            }
+        }
+    }
+    groups = _vpn_tile_groups(ni, "mac-vrf:BD1")
+    assert [g["primary"] for g in groups] == [
+        "target:64500:1 (bgp-instance 1)",
+        "target:64500:1 (bgp-instance 2)",
+    ]
+    assert all(g["gateway"] for g in groups)
+
+
+def test_vpn_tile_groups_ignores_a_disabled_second_instance():
+    from nornir_srl.connections.layer2 import _vpn_tile_groups
+
+    ni = {
+        "protocols": {
+            "bgp-vpn": {
+                "bgp-instance": [
+                    {
+                        "id": 1,
+                        "admin-state": "enable",
+                        "route-target": {
+                            "import-rt": [{"target": "target:65000:1"}],
+                        },
+                    },
+                    {
+                        "id": 2,
+                        "admin-state": "disable",
+                        "route-target": {
+                            "import-rt": [{"target": "target:65500:1"}],
+                        },
+                    },
+                ]
+            }
+        }
+    }
+    groups = _vpn_tile_groups(ni, "none (isolated)")
+    assert len(groups) == 1
+    assert groups[0]["gateway"] is False
+    assert groups[0]["primary"] == "target:65000:1"
+    assert groups[0]["rts"] == ["target:65000:1"]
+
+
+def test_get_routers_emits_one_tile_per_gateway_bgp_instance():
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    data = [
+        {
+            "network-instance": [
+                {
+                    "name": "ipvrf-3000",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                    "protocols": {
+                        "bgp-vpn": {
+                            "bgp-instance": [
+                                {
+                                    "id": 1,
+                                    "admin-state": "enable",
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:65000:3000"}],
+                                        "export-rt": [{"target": "target:65000:3000"}],
+                                    },
+                                },
+                                {
+                                    "id": 2,
+                                    "admin-state": "enable",
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:65500:3000"}],
+                                        "export-rt": [{"target": "target:65500:3000"}],
+                                    },
+                                },
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+    ]
+    dev = _FakeLayer2({"network-instance": data, "subinterface": [{}]})
+    rows = dev.get_routers()["routers"]
+    assert len(rows) == 2
+    by_rt = {r["Router"]: r for r in rows}
+    assert set(by_rt) == {"target:65000:3000", "target:65500:3000"}
+    for rt, inst in (("target:65000:3000", "1"), ("target:65500:3000", "2")):
+        assert by_rt[rt]["IP-VRF"] == "ipvrf-3000"
+        assert by_rt[rt]["Route Targets"] == rt
+        assert by_rt[rt]["Gateway"] == "Y"
+        assert by_rt[rt]["BGP Instance"] == inst
+
+
+def test_get_bridge_domains_emits_one_tile_per_gateway_bgp_instance():
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    data = [
+        {
+            "network-instance": [
+                {
+                    "name": "BD1",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "protocols": {
+                        "bgp-vpn": {
+                            "bgp-instance": [
+                                {
+                                    "id": 1,
+                                    "admin-state": "enable",
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:64500:1"}],
+                                        "export-rt": [{"target": "target:64500:1"}],
+                                    },
+                                },
+                                {
+                                    "id": 2,
+                                    "admin-state": "enable",
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:64500:2"}],
+                                        "export-rt": [{"target": "target:64500:2"}],
+                                    },
+                                },
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+    ]
+    dev = _FakeLayer2({"network-instance": data, "subinterface": [{}]})
+    rows = dev.get_bridge_domains()["bridge_domains"]
+    assert len(rows) == 2
+    by_rt = {r["Bridge Domain"]: r for r in rows}
+    assert set(by_rt) == {"target:64500:1", "target:64500:2"}
+    for rt, inst in (("target:64500:1", "1"), ("target:64500:2", "2")):
+        assert by_rt[rt]["MAC-VRF"] == "BD1"
+        assert by_rt[rt]["Route Targets"] == rt
+        assert by_rt[rt]["Gateway"] == "Y"
+        assert by_rt[rt]["BGP Instance"] == inst
 
 
 def test_get_services():
@@ -1136,3 +1512,159 @@ def test_get_sum_subitf_names_subinterfaces_and_lists_addresses():
 def test_get_sum_subitf_survives_an_empty_response():
     device = _FakeInterfaces({"subinterface": []})
     assert device.get_sum_subitf() == {"subinterface": []}
+
+
+def test_get_arp_and_nd_label_entries_with_the_network_instance():
+    from nornir_srl.connections.neighbor_discovery import NeighborDiscoveryMixin
+
+    class _FakeNeighbors(NeighborDiscoveryMixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    nis = [
+        {
+            "network-instance": [
+                {
+                    "name": "ip-vrf-1",
+                    "interface": [{"name": "irb1.100"}],
+                },
+                {
+                    "name": "mac-vrf-100",
+                    "interface": [{"name": "irb1.100"}],
+                },
+            ]
+        }
+    ]
+    arp = [
+        {
+            "interface": [
+                {
+                    "name": "irb1",
+                    "subinterface": [
+                        {
+                            "index": 100,
+                            "ipv4": {
+                                "arp": {
+                                    "neighbor": [
+                                        {
+                                            "ipv4-address": "10.1.100.10",
+                                            "link-layer-address": "00:11:22:33:44:55",
+                                            "origin": "dynamic",
+                                        }
+                                    ]
+                                }
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    ]
+    nd = [
+        {
+            "interface": [
+                {
+                    "name": "irb1",
+                    "subinterface": [
+                        {
+                            "index": 100,
+                            "ipv6": {
+                                "neighbor-discovery": {
+                                    "neighbor": [
+                                        {
+                                            "ipv6-address": "2001:db8::10",
+                                            "link-layer-address": "00:11:22:33:44:55",
+                                            "origin": "dynamic",
+                                            "current-state": "reachable",
+                                        }
+                                    ]
+                                }
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    ]
+    device = _FakeNeighbors(
+        {"network-instance": nis, "arp/neighbor": arp, "neighbor-discovery": nd}
+    )
+
+    arp_rows = device.get_arp()["arp"]
+    assert len(arp_rows) == 1
+    assert arp_rows[0]["interface"] == "irb1.100"
+    assert arp_rows[0]["NI"] == "ip-vrf-1, mac-vrf-100"
+    assert arp_rows[0]["entries"][0]["IPv4"] == "10.1.100.10"
+
+    nd_rows = device.get_nd()["nd"]
+    assert len(nd_rows) == 1
+    assert nd_rows[0]["interface"] == "irb1.100"
+    assert nd_rows[0]["NI"] == "ip-vrf-1, mac-vrf-100"
+    assert nd_rows[0]["entries"][0]["IPv6"] == "2001:db8::10"
+
+
+def test_get_arp_reads_a_single_interface_dict_on_the_network_instance():
+    """gNMI often unwraps a one-entry YANG list to a dict; ARP must still bind NI."""
+    from nornir_srl.connections.neighbor_discovery import NeighborDiscoveryMixin
+
+    class _FakeNeighbors(NeighborDiscoveryMixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    nis = [
+        {
+            "network-instance": {
+                "name": "vrf1",
+                "interface": {"name": "irb1.100"},
+            }
+        }
+    ]
+    arp = [
+        {
+            "interface": {
+                "name": "irb1",
+                "subinterface": {
+                    "index": 100,
+                    "ipv4": {
+                        "arp": {
+                            "neighbor": [
+                                {
+                                    "ipv4-address": "10.1.100.10",
+                                    "link-layer-address": "00:11:22:33:44:55",
+                                    "origin": "dynamic",
+                                }
+                            ]
+                        }
+                    },
+                },
+            }
+        }
+    ]
+    device = _FakeNeighbors({"network-instance": nis, "arp/neighbor": arp})
+    row = device.get_arp()["arp"][0]
+    assert row["NI"] == "vrf1"
+    assert row["interface"] == "irb1.100"

@@ -494,7 +494,8 @@ def test_a_hanging_get_counts_as_the_node_not_answering():
 
     gNMI calls carry no deadline, so one issued against an address that stopped
     being routed blocks until TCP gives up while holding the Get lock. Reporting
-    the node as fine throughout would hide it from the reconnect logic.
+    the node as fine throughout would hide it from the reconnect logic. A Get
+    that is merely in flight is not that: those finish inside the hang grace.
     """
     release = threading.Event()
 
@@ -504,7 +505,9 @@ def test_a_hanging_get_counts_as_the_node_not_answering():
             return super().get(paths, datatype, strip_mod)
 
     device = Hanging({LLDP_PATH: LLDP_RESPONSE})
-    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    stream = HostStream(
+        "leaf1", device, restart_debounce=TEST_DEBOUNCE, get_hang_grace=0.05
+    )
     worker = threading.Thread(
         target=lambda: stream.direct_get(LLDP_PATH, "state"), daemon=True
     )
@@ -517,6 +520,35 @@ def test_a_hanging_get_counts_as_the_node_not_answering():
         assert wait_for(lambda: stream.failing_since is None)
     finally:
         release.set()
+        stream.stop()
+
+
+def test_an_in_flight_get_is_not_reported_as_down_until_it_hangs():
+    """A resync or bootstrap Get must not flash the Nodes pane red."""
+    release = threading.Event()
+    started = threading.Event()
+
+    class Slow(FakeDevice):
+        def get(self, paths, datatype="config", strip_mod=True):
+            started.set()
+            release.wait(timeout=10)
+            return super().get(paths, datatype, strip_mod)
+
+    device = Slow({LLDP_PATH: LLDP_RESPONSE})
+    stream = HostStream(
+        "leaf1", device, restart_debounce=TEST_DEBOUNCE, get_hang_grace=2.0
+    )
+    worker = threading.Thread(
+        target=lambda: stream.direct_get(LLDP_PATH, "state"), daemon=True
+    )
+    try:
+        worker.start()
+        assert wait_for(started.is_set)
+        time.sleep(0.1)
+        assert stream.failing_since is None
+    finally:
+        release.set()
+        worker.join(timeout=10)
         stream.stop()
 
 

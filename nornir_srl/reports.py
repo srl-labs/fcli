@@ -118,6 +118,16 @@ def _bgp_rib(
 _SERVICE_SUBSCRIPTIONS: Tuple[SubscriptionSpec, ...] = (
     SubscriptionSpec("/network-instance[name=*]", datatype="all", sample_interval=20),
     SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=20),
+    SubscriptionSpec(
+        "/network-instance[name=default]/route-table/ipv4-unicast/route/ipv4-prefix",
+        datatype="state",
+        sample_interval=20,
+    ),
+    SubscriptionSpec(
+        "/network-instance[name=default]/route-table/ipv6-unicast/route/ipv6-prefix",
+        datatype="state",
+        sample_interval=20,
+    ),
 )
 
 #: Resolving a route's next-hop needs the next-hop(-group) tables alongside it.
@@ -471,6 +481,7 @@ REPORTS: List[ReportSpec] = [
         mcp_name="ipv6_neighbors",
         subscribe=(
             SubscriptionSpec("/interface[name=*]/subinterface[index=*]/ipv6/neighbor-discovery/neighbor", datatype="all"),
+            SubscriptionSpec("/network-instance[name=*]", datatype="config"),
         ),
     ),
 ]

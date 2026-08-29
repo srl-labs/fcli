@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from nornir.core import Nornir
 
 from ..connections.srlinux import CONNECTION_NAME
+from ..connections.layer2 import stamp_underlay_sites
 from ..reports import ReportSpec, SubscriptionSpec, get_report
 from ..rows import clean_columns, flatten
 from .devices import CachedDevice, RecordingDevice
@@ -420,6 +421,10 @@ class FabricStore:
             {c: _cell(row.get(raw)) for c, raw in zip(all_columns, ["Node"] + columns)}
             for row in rows
         ]
+        if report.name in ("bridge_domains", "routers", "services"):
+            if stamp_underlay_sites(clean_rows):
+                if "Site" not in all_columns:
+                    all_columns.append("Site")
         res_table = {
             "report": report.name,
             "title": report.title,
