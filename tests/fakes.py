@@ -12,6 +12,8 @@ import queue
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from nornir_srl.connections.subscription import _CLOSED, SubscriptionClosed
+
 CAPABILITIES: Dict[str, Any] = {
     "supported_models": [
         {"name": "urn:srl_nokia/bgp:srl_nokia-bgp", "version": "2023-3-1"},
@@ -21,7 +23,7 @@ CAPABILITIES: Dict[str, Any] = {
 
 
 class FakeSubscriber:
-    """Stands in for pygnmi's ``StreamSubscriber``."""
+    """Stands in for :class:`~nornir_srl.connections.subscription.GnmiSubscription`."""
 
     def __init__(self, updates: "queue.Queue[Dict[str, Any]]") -> None:
         self._updates = updates
@@ -30,12 +32,18 @@ class FakeSubscriber:
 
     def get_update(self, timeout: Optional[float] = None) -> Dict[str, Any]:
         try:
-            return self._updates.get(timeout=timeout)
+            message = self._updates.get(timeout=timeout)
         except queue.Empty:
             raise TimeoutError("no update")
+        if message is _CLOSED:
+            raise SubscriptionClosed("subscription was closed")
+        return message
 
     def close(self) -> None:
         self.closed = True
+        # Like the real subscription, unblock a reader waiting on the queue
+        # rather than letting it sit out its timeout.
+        self._updates.put(_CLOSED)
 
 
 class FakeDevice:

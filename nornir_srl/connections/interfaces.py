@@ -4,6 +4,8 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 import jmespath
 
+from .helpers import as_list, first_payload
+
 
 class NetworkInstanceMixin:
     """Mixin providing network-instance related getters."""
@@ -30,18 +32,22 @@ class NetworkInstanceMixin:
         }
         subitf: Dict[str, Any] = {}
         resp = self.get(paths=[SUBITF_PATH], datatype="all")
-        for itf in resp[0].get("interface", []):
-            for si in itf.get("subinterface", []):
-                subif_name = itf["name"] + "." + str(si.pop("index"))
-                subitf[subif_name] = si
-                subitf[subif_name]["_mtu"] = (
+        for itf in as_list(first_payload(resp).get("interface")):
+            for si in as_list(itf.get("subinterface")):
+                subif_name = f"{itf.get('name', '')}.{si.get('index', '')}"
+                # A copy, because these details are merged into the interfaces of
+                # every network-instance that binds them and the response itself
+                # may be a cached one the streaming server hands out repeatedly.
+                details = {k: v for k, v in si.items() if k != "index"}
+                details["_mtu"] = (
                     si.get("l2-mtu") if "l2-mtu" in si else si.get("ip-mtu", "")
                 )
+                subitf[subif_name] = details
 
         resp = self.get(
             paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
         )
-        ni_list = resp[0].get("network-instance", [])
+        ni_list = as_list(first_payload(resp).get("network-instance"))
         for ni in ni_list:
             bgp_vpn = ni.get("protocols", {}).get("bgp-vpn", {})
             in_rts = []
@@ -94,7 +100,9 @@ class NetworkInstanceMixin:
                         and vrf["name"] != ni["name"]
                     )
 
-        res = jmespath.search(path_spec["jmespath"], resp[0])
+        # The projection runs against the normalized list, so a lone
+        # network-instance that gNMI returned unwrapped still yields a row.
+        res = jmespath.search(path_spec["jmespath"], {"network-instance": ni_list})
         return {"nwi_itfs": res}
 
     def get_lag(self, lag_id: str = "*") -> Dict[str, Any]:
@@ -108,10 +116,11 @@ class NetworkInstanceMixin:
         resp = self.get(
             paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
         )
-        for itf in resp[0].get("interface", []):
-            for member in itf.get("lag", {}).get("member", []):
+        lags = as_list(first_payload(resp).get("interface"))
+        for itf in lags:
+            for member in as_list(itf.get("lag", {}).get("member")):
                 member["name"] = str(member.get("name", "")).replace("ethernet", "et")
-        res = jmespath.search(path_spec["jmespath"], resp[0])
+        res = jmespath.search(path_spec["jmespath"], {"interface": lags})
         return {"lag": res}
 
     def get_sum_subitf(self, interface: str = "*") -> Dict[str, Any]:

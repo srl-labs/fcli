@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import jmespath
 
-from .helpers import lpm
+from .helpers import as_list, first_payload, lpm, model_version, version_bucket
 
 # CLI / API aliases (e.g. ``-r l3vpn-v4``) → YANG ``afi-safi-name`` used in paths.
 BGP_RIB_ROUTE_FAM_ALIASES: Dict[str, str] = {
@@ -132,16 +132,9 @@ class RoutingMixin:
         network_instance: str = "*",
         detail: bool = False,
     ) -> Dict[str, Any]:
-        BGP_RIB_MOD = "bgp-rib"
-        BGP_RIB_MOD2 = "urn:nokia.com:srlinux:bgp:rib-bgp"
-        if self.capabilities is not None:
-            mod_version = [
-                m
-                for m in self.capabilities.get("supported_models", [])
-                if BGP_RIB_MOD in m.get("name") or BGP_RIB_MOD2 in m.get("name")
-            ][0].get("version")
-        else:
-            raise Exception("Cannot get gNMI capabilities")
+        mod_version = model_version(
+            self.capabilities, "bgp-rib", "urn:nokia.com:srlinux:bgp:rib-bgp"
+        )
 
         route_fam = BGP_RIB_ROUTE_FAM_ALIASES.get(route_fam.lower(), route_fam)
 
@@ -278,23 +271,9 @@ class RoutingMixin:
             else:
                 return d
 
-        evpn_path_version = [
-            k
-            for k, v in sorted(BGP_EVPN_VERSION_MAP.items(), key=lambda item: item[0])
-            if len([ver for ver in v if mod_version.startswith(ver)]) > 0
-        ][0]
-        evpn_route_type_version = [
-            k
-            for k, v in sorted(
-                BGP_EVPN_ROUTE_TYPE_MAP.items(), key=lambda item: item[0]
-            )
-            if len([ver for ver in v if mod_version.startswith(ver)]) > 0
-        ][0]
-        ip_path_version = [
-            k
-            for k, v in sorted(BGP_IP_VERSION_MAP.items(), key=lambda item: item[0])
-            if len([ver for ver in v if mod_version.startswith(ver)]) > 0
-        ][0]
+        evpn_path_version = version_bucket(BGP_EVPN_VERSION_MAP, mod_version)
+        evpn_route_type_version = version_bucket(BGP_EVPN_ROUTE_TYPE_MAP, mod_version)
+        ip_path_version = version_bucket(BGP_IP_VERSION_MAP, mod_version)
 
         if route_fam not in ROUTE_FAMILY:
             raise ValueError(f"Invalid route family {route_fam}")
@@ -496,12 +475,14 @@ class RoutingMixin:
         attribs: Dict[str, Dict[str, Any]] = dict()
 
         resp = self.get(paths=[PATH_BGP_PATH_ATTRIBS], datatype="state")
-        for ni in resp[0].get("network-instance", []):
-            if ni["name"] not in attribs:
-                attribs[ni["name"]] = dict()
+        for ni in as_list(first_payload(resp).get("network-instance")):
+            ni_name = ni.get("name")
+            if ni_name is None:
+                continue
+            attribs.setdefault(ni_name, dict())
             for path in ni.get("bgp-rib", {}).get("attr-sets", {}).get("attr-set", []):
                 path_copy = copy.deepcopy(path)
-                attribs[ni["name"]].update({path_copy.pop("index"): path_copy})
+                attribs[ni_name].update({path_copy.pop("index"): path_copy})
 
         path_spec: Dict[str, str] = PATH_SPECS[route_fam]
         rib_path = str(path_spec.get("path"))
@@ -516,44 +497,37 @@ class RoutingMixin:
                     raise
         else:
             resp = self.get(paths=[rib_path], datatype=path_spec["datatype"])
-        for ni in resp[0].get("network-instance", []):
-            ni = augment_routes(ni, attribs[ni["name"]])
+        payload = first_payload(resp)
+        for ni in as_list(payload.get("network-instance")):
+            # A network-instance can appear in the RIB without a matching
+            # attr-set, e.g. when the two Gets straddle a routing change.
+            ni = augment_routes(ni, attribs.get(ni.get("name"), {}))
 
-        res = jmespath.search(path_spec["jmespath"], resp[0])
+        res = jmespath.search(path_spec["jmespath"], payload)
         if res is None:
             res = []
         return {"bgp_rib": res}
 
     def get_sum_bgp(self, network_instance: Optional[str] = "*") -> Dict[str, Any]:
-        BGP_MOD = "urn:srl_nokia/bgp:srl_nokia-bgp"
-        BGP_MOD2 = "urn:nokia.com:srlinux:bgp:bgp:srl_nokia-bgp"
-
-        if self.capabilities is not None:
-            mod_version = [
-                m
-                for m in self.capabilities.get("supported_models", [])
-                if BGP_MOD == m.get("name") or BGP_MOD2 == m.get("name")
-            ][0].get("version")
-        else:
-            raise Exception("Capabilities not set")
+        mod_version = model_version(
+            self.capabilities,
+            "urn:srl_nokia/bgp:srl_nokia-bgp",
+            "urn:nokia.com:srlinux:bgp:bgp:srl_nokia-bgp",
+            exact=True,
+        )
         BGP_VERSION_MAP = {1: ("2021-", "2022-"), 2: ("2023-3", "20")}
-        our_version = [
-            k
-            for k, v in sorted(BGP_VERSION_MAP.items(), key=lambda item: item[0])
-            if len([ver for ver in v if mod_version.startswith(ver)]) > 0
-        ][0]
+        our_version = version_bucket(BGP_VERSION_MAP, mod_version)
 
         def augment_resp(resp):
-            for ni in resp[0].get("network-instance", []):
+            for ni in as_list(first_payload(resp).get("network-instance")):
                 if ni.get("protocols") and ni["protocols"].get("bgp"):
-                    for peer in ni["protocols"]["bgp"]["neighbor"]:
+                    for peer in as_list(ni["protocols"]["bgp"].get("neighbor")):
                         peer_data = dict()
                         if our_version == 1:
                             peer_data["evpn"] = peer.get("evpn")
                             peer_data["ipv4-unicast"] = peer.get("ipv4-unicast")
-                            peer_data["local-as"] = peer.get("local-as", [{}])[0].get(
-                                "as-number", "-"
-                            )
+                            local_as = as_list(peer.get("local-as")) or [{}]
+                            peer_data["local-as"] = local_as[0].get("as-number", "-")
                         elif our_version == 2:
                             peer_data["local-as"] = peer.get("local-as", {}).get(
                                 "as-number", "-"
@@ -709,7 +683,7 @@ class RoutingMixin:
             paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
         )
         augment_resp(resp)
-        res = jmespath.search(path_spec["jmespath"], resp[0])
+        res = jmespath.search(path_spec["jmespath"], first_payload(resp))
         return {"bgp_peers": res}
 
     def get_rib(
@@ -742,11 +716,15 @@ class RoutingMixin:
             datatype="state",
         )
 
+        # The next-hop, next-hop-group and route tables are three separate Gets,
+        # so they can disagree: a route can name a group, or a group a next-hop,
+        # that the neighbouring Get did not (or no longer) return. Resolving
+        # defensively degrades one row instead of failing the whole report.
         nh_mapping: Dict[str, Dict[str, Any]] = {}
-        for ni in nhs[0].get("network-instance", {}):
+        for ni in as_list(first_payload(nhs).get("network-instance")):
             tmp_map: Dict[str, Any] = {}
-            for nh in ni["route-table"]["next-hop"]:
-                tmp_map[nh["index"]] = {
+            for nh in as_list(ni.get("route-table", {}).get("next-hop")):
+                entry: Dict[str, Any] = {
                     "ip-address": nh.get("ip-address"),
                     "type": nh.get("type"),
                     "subinterface": nh.get("subinterface"),
@@ -759,124 +737,82 @@ class RoutingMixin:
                     "resolving-route", nh.get("resolving-route")
                 )
                 if resolving_tunnel:
-                    tmp_map[nh["index"]].update(
-                        {
-                            "tunnel": resolving_tunnel.get("tunnel-type")
-                            + ":"
-                            + resolving_tunnel.get("ip-prefix")
-                        }
-                    )
+                    tunnel_type = resolving_tunnel.get("tunnel-type") or ""
+                    tunnel_prefix = resolving_tunnel.get("ip-prefix") or ""
+                    entry["tunnel"] = f"{tunnel_type}:{tunnel_prefix}"
                 if resolving_route:
-                    tmp_map[nh["index"]].update(
-                        {"resolving-route": resolving_route.get("ip-prefix")}
-                    )
+                    entry["resolving-route"] = resolving_route.get("ip-prefix")
+                tmp_map[nh.get("index")] = entry
+            nh_mapping[ni.get("name")] = tmp_map
 
-            nh_mapping.update({ni["name"]: tmp_map})
         nhgroup_mapping: Dict[str, Dict[str, List[Any]]] = {}
-        for ni in nhgroups[0].get("network-instance", {}):
-            network_instance = ni["name"]
+        for ni in as_list(first_payload(nhgroups).get("network-instance")):
+            ni_name = ni.get("name")
             nh_map: Dict[str, List[Any]] = {}
-            for nhgroup in ni["route-table"]["next-hop-group"]:
-                nh_map[nhgroup["index"]] = [
-                    nh_mapping[network_instance][nh.get("next-hop")]
-                    for nh in nhgroup.get("next-hop", [])
+            for nhgroup in as_list(ni.get("route-table", {}).get("next-hop-group")):
+                nh_map[nhgroup.get("index")] = [
+                    nh_mapping.get(ni_name, {}).get(nh.get("next-hop"), {})
+                    for nh in as_list(nhgroup.get("next-hop"))
                 ]
-            nhgroup_mapping.update({ni["name"]: nh_map})
+            nhgroup_mapping[ni_name] = nh_map
 
         resp = self.get(
             paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
         )
-        for ni in resp[0].get("network-instance", {}):
-            if len(ni["route-table"][afi]) == 0:
+        payload = first_payload(resp)
+        prefix_key = "ipv4-prefix" if afi == "ipv4-unicast" else "ipv6-prefix"
+        for ni in as_list(payload.get("network-instance")):
+            afi_table = ni.get("route-table", {}).get(afi) or {}
+            if not afi_table:
                 ni["_hasrib"] = False
-            else:
-                ni["_hasrib"] = True
-                if lpm_address:
-                    lpm_prefix = lpm(
-                        lpm_address,
-                        [
-                            route[
-                                (
-                                    "ipv4-prefix"
-                                    if afi == "ipv4-unicast"
-                                    else "ipv6-prefix"
-                                )
-                            ]
-                            for route in ni["route-table"][afi]["route"]
-                        ],
+                continue
+            ni["_hasrib"] = True
+            if lpm_address:
+                routes = as_list(afi_table.get("route"))
+                lpm_prefix = lpm(
+                    lpm_address, [r[prefix_key] for r in routes if prefix_key in r]
+                )
+                if not lpm_prefix:
+                    afi_table["route"] = []
+                    ni["_hasrib"] = False
+                    continue
+                afi_table["route"] = [
+                    r for r in routes if r.get(prefix_key) == lpm_prefix
+                ]
+            for route in as_list(afi_table.get("route")):
+                route["active"] = "yes" if route.get("active") else "no"
+                if "next-hop-group" not in route:
+                    continue
+                leaked = False
+                nh_ni = route.get("origin-network-instance", ni.get("name"))
+                if nh_ni != ni.get("name"):
+                    leaked = True
+                    route["_orig_vrf"] = nh_ni
+                resolved = nhgroup_mapping.get(nh_ni, {}).get(
+                    route["next-hop-group"], []
+                )
+                route["_next-hop"] = [
+                    (
+                        nh["resolving-route"] + " (indirect)"
+                        if nh.get("type") == "indirect" and nh.get("resolving-route")
+                        else nh.get("ip-address")
                     )
-                    if lpm_prefix:
-                        ni["route-table"][afi]["route"] = [
-                            r
-                            for r in ni["route-table"][afi]["route"]
-                            if r[
-                                (
-                                    "ipv4-prefix"
-                                    if afi == "ipv4-unicast"
-                                    else "ipv6-prefix"
-                                )
-                            ]
-                            == lpm_prefix
-                        ]
-                    else:
-                        ni["route-table"][afi]["route"] = []
-                        ni["_hasrib"] = False
+                    for nh in resolved
+                ]
+                # The egress interface is the most useful thing to show; a tunnel
+                # or the route the next-hop resolves through stand in when the
+                # next-hop is not resolved down to an interface.
+                route["_nh_itf"] = []
+                for key in ("subinterface", "tunnel", "resolving-route"):
+                    hops = [nh[key] for nh in resolved if nh.get(key)]
+                    if not hops:
                         continue
-                for route in ni["route-table"][afi].get("route", []):
-                    if route["active"]:
-                        route["active"] = "yes"
-                    else:
-                        route["active"] = "no"
-                    if "next-hop-group" in route:
-                        leaked = False
-                        if "origin-network-instance" in route:
-                            nh_ni = route["origin-network-instance"]
-                            if nh_ni != ni["name"]:
-                                leaked = True
-                                route["_orig_vrf"] = nh_ni
-                        else:
-                            nh_ni = ni["name"]
-                        route["_next-hop"] = [
-                            (
-                                nh.get("resolving-route") + " (indirect)"
-                                if nh.get("type") == "indirect"
-                                and nh.get("resolving-route")
-                                else nh.get("ip-address")
-                            )
-                            for nh in nhgroup_mapping[nh_ni].get(
-                                route["next-hop-group"], {}
-                            )
-                        ]
+                    if key == "subinterface" and leaked:
+                        hops = [f"{hop}@vrf:{nh_ni}" for hop in hops]
+                    route["_nh_itf"] = hops
+                    break
 
-                        route["_nh_itf"] = [
-                            (
-                                nh.get("subinterface") + f"@vrf:{nh_ni}"
-                                if leaked
-                                else nh.get("subinterface")
-                            )
-                            for nh in nhgroup_mapping[nh_ni].get(
-                                route["next-hop-group"], {}
-                            )
-                            if nh.get("subinterface")
-                        ]
-                        if len(route["_nh_itf"]) == 0:
-                            route["_nh_itf"] = [
-                                nh.get("tunnel")
-                                for nh in nhgroup_mapping[nh_ni].get(
-                                    route["next-hop-group"], {}
-                                )
-                                if nh.get("tunnel")
-                            ]
-                        if len(route["_nh_itf"]) == 0:
-                            route["_nh_itf"] = [
-                                nh.get("resolving-route")
-                                for nh in nhgroup_mapping[nh_ni].get(
-                                    route["next-hop-group"], {}
-                                )
-                                if nh.get("resolving-route")
-                            ]
-
-        res = jmespath.search(path_spec["jmespath"], resp[0])
+        res = jmespath.search(path_spec["jmespath"], payload)
         return {"ip_rib": res}
 
     def get_tunnel_table(self, network_instance: str = "*") -> Dict[str, Any]:
@@ -902,7 +838,7 @@ class RoutingMixin:
         )
 
         nh_mapping: Dict[str, Dict[str, Dict[str, Any]]] = {}
-        for ni in nhs[0].get("network-instance", []):
+        for ni in as_list(first_payload(nhs).get("network-instance")):
             tmp_map: Dict[str, Dict[str, Any]] = {}
             for nh in ni.get("route-table", {}).get("next-hop", []):
                 label_stack = nh.get("mpls-encapsulation", {}).get(
@@ -917,7 +853,7 @@ class RoutingMixin:
             nh_mapping[ni["name"]] = tmp_map
 
         nhgroup_mapping: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
-        for ni in nhgroups[0].get("network-instance", []):
+        for ni in as_list(first_payload(nhgroups).get("network-instance")):
             ni_name = ni["name"]
             nh_map: Dict[str, List[Dict[str, Any]]] = {}
             for nhgroup in ni.get("route-table", {}).get("next-hop-group", []):
@@ -933,7 +869,7 @@ class RoutingMixin:
         )
 
         rows: List[Dict[str, Any]] = []
-        for ni in resp[0].get("network-instance", []):
+        for ni in as_list(first_payload(resp).get("network-instance")):
             ni_name = ni["name"]
             tunnel_table = ni.get("tunnel-table", {})
             for afi in ("ipv4", "ipv6"):

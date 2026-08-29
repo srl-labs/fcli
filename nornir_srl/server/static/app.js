@@ -25,6 +25,8 @@
     nodeSummary: el("node-summary"),
     topoBadge: el("topo-badge"),
     version: el("version"),
+    navBack: el("nav-back"),
+    navForward: el("nav-forward"),
     title: el("report-title"),
     desc: el("report-desc"),
     liveDot: el("live-dot"),
@@ -101,9 +103,12 @@
     viewMode: "tree",
     collapsedCards: new Set(),
     collapsedNodes: new Set(),
+    navStack: [],
+    navIndex: -1,
   };
 
   let overviewTimer = null;
+  let navSeq = 0;
 
   /* ------------------------------------------------------------ helpers */
 
@@ -170,6 +175,9 @@
       const hiddenData = localStorage.getItem(`fcli-hidden-${state.report.name}`);
       if (hiddenData) {
         JSON.parse(hiddenData).forEach((col) => state.hidden.add(col));
+      } else if (["bridge_domains", "services", "routers"].includes(state.report.name)) {
+        // Node identifiers shown next to the name in the tree, not as table columns.
+        ["System IPv4", "System IPv6", "Gateway", "BGP Instance", "Underlay Hosts", "Site"].forEach((c) => state.hidden.add(c));
       }
       const filtersData = localStorage.getItem(`fcli-filters-${state.report.name}`);
       if (filtersData) {
@@ -386,8 +394,114 @@
     }
   }
 
-  function selectReport(report) {
-    if (state.report) saveReportPreferences();
+  /* ---------------------------------------------------------- page history */
+
+  function currentNavSnap() {
+    return {
+      id: 0,
+      name: state.report.name,
+      title: state.report.title,
+      filters: [...state.colFilters.entries()],
+      viewMode: state.viewMode,
+    };
+  }
+
+  function navPageKey(snap) {
+    const viewMode = ["bridge_domains", "services", "routers"].includes(snap.name)
+      ? snap.viewMode
+      : "";
+    return JSON.stringify({ name: snap.name, filters: snap.filters, viewMode });
+  }
+
+  function applyNavSnap(snap) {
+    state.colFilters.clear();
+    for (const [column, pattern] of snap.filters || []) {
+      if (pattern) state.colFilters.set(column, pattern);
+    }
+    if (snap.viewMode) state.viewMode = snap.viewMode;
+    saveReportPreferences();
+    if (snap.viewMode && state.report) {
+      try {
+        localStorage.setItem(`fcli-viewmode-${state.report.name}`, snap.viewMode);
+      } catch (_err) {}
+    }
+  }
+
+  function updateNavButtons() {
+    if (!dom.navBack || !dom.navForward) return;
+    const canBack = state.navIndex > 0;
+    const canFwd = state.navIndex >= 0 && state.navIndex < state.navStack.length - 1;
+    dom.navBack.disabled = !canBack;
+    dom.navForward.disabled = !canFwd;
+    const prev = canBack ? state.navStack[state.navIndex - 1] : null;
+    const next = canFwd ? state.navStack[state.navIndex + 1] : null;
+    dom.navBack.title = prev ? `Back to ${prev.title}` : "Back";
+    dom.navForward.title = next ? `Forward to ${next.title}` : "Forward";
+  }
+
+  function syncCurrentVisit() {
+    if (!state.report || state.navIndex < 0) return;
+    const snap = currentNavSnap();
+    snap.id = state.navStack[state.navIndex].id;
+    state.navStack[state.navIndex] = snap;
+    history.replaceState({ page: snap }, "", "#" + snap.name);
+  }
+
+  function recordVisit() {
+    if (!state.report) return;
+    const snap = currentNavSnap();
+    const current = state.navStack[state.navIndex];
+    if (current && navPageKey(current) === navPageKey(snap)) {
+      snap.id = current.id;
+      state.navStack[state.navIndex] = snap;
+      history.replaceState({ page: snap }, "", "#" + snap.name);
+      updateNavButtons();
+      return;
+    }
+    snap.id = ++navSeq;
+    const url = "#" + snap.name;
+    if (state.navIndex < 0) {
+      state.navStack = [snap];
+      state.navIndex = 0;
+      history.replaceState({ page: snap }, "", url);
+    } else {
+      state.navStack = state.navStack.slice(0, state.navIndex + 1);
+      state.navStack.push(snap);
+      state.navIndex = state.navStack.length - 1;
+      history.pushState({ page: snap }, "", url);
+    }
+    updateNavButtons();
+  }
+
+  function restoreNavSnap(snap) {
+    const report = state.reports.find((r) => r.name === snap.name);
+    if (!report) return;
+    if (state.report && state.report.name === snap.name) {
+      applyNavSnap(snap);
+      updateFilterUI();
+      if (["bridge_domains", "services", "routers"].includes(snap.name)) {
+        if (dom.viewModeBtn) {
+          dom.viewModeBtn.hidden = false;
+          dom.viewModeBtn.textContent =
+            state.viewMode === "tree" ? "📊 Table View" : "🌲 Services View";
+        }
+        renderBody();
+      } else {
+        renderHead();
+        renderBody();
+      }
+      updateNavButtons();
+      return;
+    }
+    selectReport(report, { fromPop: true, snap });
+    updateNavButtons();
+  }
+
+  function selectReport(report, { fromPop = false, snap = null } = {}) {
+    if (state.report && !fromPop) {
+      saveReportPreferences();
+      syncCurrentVisit();
+    }
     state.report = report;
     state.columns = [];
     state.rows = [];
@@ -397,7 +511,6 @@
     state.identityColumn = null;
     state.firstPaint = true;
     state.windowSize = WINDOW_STEP;
-    location.hash = report.name;
     dom.title.textContent = report.title;
     dom.desc.textContent = report.description;
     dom.body.replaceChildren();
@@ -410,6 +523,12 @@
     }
 
     loadReportPreferences();
+    if (snap) {
+      state.pendingFilters = null;
+      applyNavSnap(snap);
+    } else {
+      applyPendingFilters();
+    }
     updateFilterUI();
     renderReportList();
 
@@ -431,7 +550,9 @@
       dom.columnsBtn.hidden = false;
       dom.exportBtn.hidden = false;
       if (["bridge_domains", "services", "routers"].includes(report.name)) {
-        state.viewMode = localStorage.getItem(`fcli-viewmode-${report.name}`) || "tree";
+        if (!(snap && snap.viewMode)) {
+          state.viewMode = localStorage.getItem(`fcli-viewmode-${report.name}`) || "tree";
+        }
         dom.viewModeBtn.hidden = false;
         dom.viewModeBtn.textContent = state.viewMode === "tree" ? "📊 Table View" : "🌲 Services View";
       } else {
@@ -440,6 +561,7 @@
       dom.rowCount.textContent = "loading...";
       connect();
     }
+    if (!fromPop) recordVisit();
   }
 
   /* ------------------------------------------------------------- stream */
@@ -654,6 +776,92 @@
   const rowKey = (row, column) =>
     column ? `${row.Node} ${row[column]}` : state.columns.map((c) => row[c]).join(" ");
 
+  function escapeRegex(value) {
+    return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  /** A column-filter pattern that matches any of *values* exactly. */
+  function exactMatchPattern(values) {
+    const unique = [...new Set((values || []).map((v) => String(v || "").trim()).filter(Boolean))];
+    if (!unique.length) return "";
+    if (unique.length === 1) return `^${escapeRegex(unique[0])}$`;
+    return `^(${unique.map(escapeRegex).join("|")})$`;
+  }
+
+  function applyPendingFilters() {
+    if (!state.pendingFilters) return;
+    if (!state.report || state.report.name !== state.pendingFilters.report) return;
+    state.colFilters.clear();
+    for (const [column, pattern] of Object.entries(state.pendingFilters.filters || {})) {
+      if (pattern) state.colFilters.set(column, pattern);
+    }
+    state.pendingFilters = null;
+    saveReportPreferences();
+  }
+
+  /** A column-filter pattern that matches any of *values* as a whole token.
+
+  Used for network-instance names, which may share a cell with other VRFs
+  (an IRB sits in both a mac-vrf and an ip-vrf).
+  */
+  function tokenMatchPattern(values) {
+    const unique = [...new Set((values || []).map((v) => String(v || "").trim()).filter(Boolean))];
+    if (!unique.length) return "";
+    const parts = unique.map((v) => {
+      const e = escapeRegex(v);
+      // The NI cell may be a single name ("vrf1"), a comma list ("vrf1, mac-vrf-1"
+      // for an IRB in both VRFs), or a JSON list leftover ("[\"vrf1\"]").
+      return `(?:^|[,\\[\\]"'\\s])${e}(?=$|[,\\]\\]"'\\s])`;
+    });
+    return parts.length === 1 ? parts[0] : `(?:${parts.join("|")})`;
+  }
+
+  function jumpToFilteredReport(reportName, niNames, nodeNames) {
+    const filters = {};
+    const ni = tokenMatchPattern(niNames);
+    const nodes = exactMatchPattern(nodeNames);
+    if (ni) filters.NI = ni;
+    if (nodes) filters.Node = nodes;
+    state.pendingFilters = { report: reportName, filters };
+
+    if (state.report && state.report.name === reportName) {
+      syncCurrentVisit();
+      applyPendingFilters();
+      updateFilterUI();
+      renderHead();
+      renderBody();
+      recordVisit();
+      return;
+    }
+    const report = state.reports.find((r) => r.name === reportName);
+    if (report) {
+      selectReport(report);
+    } else {
+      state.pendingFilters = null;
+    }
+  }
+
+  function makeReportJumpButton(label, title, reportName, niNames, nodeNames) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "bd-report-jump-btn";
+    button.textContent = label;
+    button.title = title;
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      jumpToFilteredReport(reportName, niNames, nodeNames);
+    });
+    return button;
+  }
+
+  function reportJumpGroup(buttons) {
+    const group = document.createElement("div");
+    group.className = "bd-report-jump-group";
+    group.append(...buttons);
+    return group;
+  }
+
   function jumpToVrf(targetType, vrfName, nodeName) {
     state.pendingJump = { targetType, vrfName, nodeName };
     const currentReportName = state.report ? state.report.name : "";
@@ -732,41 +940,155 @@
     }
   }
 
+  const UP_STATES = ["up", "enable", "enabled", "active", "established"];
+  const DOWN_STATES = ["down", "disable", "disabled"];
+
+  // Anything that is neither plainly up nor plainly down counts as degraded -
+  // notably the "degraded" a service gets when only some of its interfaces are
+  // up, which red would put on a par with a service that is entirely gone.
+  function stateKind(state) {
+    const st = String(state || "").toLowerCase().trim();
+    if (!st) return "";
+    if (UP_STATES.includes(st)) return "up";
+    if (DOWN_STATES.includes(st)) return "down";
+    return "degraded";
+  }
+
+  // The reports label an interface with its state, and a down one carries the
+  // reason with it: "irb0.0 [down: net-inst-down]: 172.16.20.254/24".
+  function labelledState(text) {
+    const match = /\[([^\]]+)\]/.exec(text || "");
+    return match ? stateKind(match[1].split(":")[0]) : "";
+  }
+
+  // *markUp* is off for pills that already carry a colour of their own to say
+  // what kind of object they are; those only change colour when something is
+  // wrong with them.
+  function applyPillState(pill, text, { markUp = true } = {}) {
+    const kind = labelledState(text);
+    if (!kind || (kind === "up" && !markUp)) return;
+    pill.classList.add(`pill-${kind}`);
+  }
+
   function aggregateServiceState(rows) {
     if (!rows || !rows.length) {
       return { status: "unknown", className: "state-badge-down", badgeText: "UNKNOWN" };
     }
-    let upCount = 0;
-    let downCount = 0;
-
+    const counts = { up: 0, down: 0, degraded: 0 };
     for (const row of rows) {
-      const st = String(row["Oper State"] || "").toLowerCase().trim();
-      if (st === "up" || st === "enable" || st === "enabled" || st === "active" || st === "established") {
-        upCount++;
-      } else {
-        downCount++;
-      }
+      counts[stateKind(row["Oper State"]) || "degraded"] += 1;
     }
 
-    if (upCount === rows.length) {
+    if (counts.up === rows.length) {
       return { status: "up", className: "state-badge-up", badgeText: "UP" };
     }
-    if (downCount === rows.length) {
+    if (counts.down === rows.length) {
       return { status: "down", className: "state-badge-down", badgeText: "DOWN" };
     }
     return { status: "degraded", className: "state-badge-warn", badgeText: "DEGRADED" };
+  }
+
+  function compareSubnets(a, b) {
+    const v6a = a.includes(":") ? 1 : 0;
+    const v6b = b.includes(":") ? 1 : 0;
+    if (v6a !== v6b) return v6a - v6b;
+    return a.localeCompare(b);
+  }
+
+  function unionSubnets(rows) {
+    const seen = [];
+    for (const r of rows) {
+      if (!r["Subnets"]) continue;
+      for (const s of String(r["Subnets"]).split(",").map((x) => x.trim())) {
+        if (s && !seen.includes(s)) seen.push(s);
+      }
+    }
+    return seen.sort(compareSubnets);
+  }
+
+  function subnetPills(subnets) {
+    const el = document.createElement("div");
+    el.className = "bd-header-subnets";
+    for (const s of subnets) {
+      const pill = document.createElement("span");
+      pill.className = "bd-subnet-pill";
+      pill.textContent = s;
+      el.append(pill);
+    }
+    return el;
+  }
+
+  function isGatewayRow(row) {
+    const value = row && row["Gateway"];
+    return value === "Y" || value === true || value === "true";
+  }
+
+  function isDciService(rows) {
+    return Boolean(rows && rows.length && rows.every(isGatewayRow));
+  }
+
+  function roleBadge(text, className) {
+    const el = document.createElement("span");
+    el.className = className;
+    el.textContent = text;
+    return el;
+  }
+
+  function nodeNameWithIps(nodeName, nodeRows) {
+    const wrap = document.createElement("span");
+    wrap.className = "bd-node-name";
+
+    const name = document.createElement("span");
+    name.textContent = `🖥️ Node: ${nodeName}`;
+    wrap.append(name);
+
+    const isGateway = (nodeRows || []).some(isGatewayRow);
+    if (isGateway) wrap.append(roleBadge("Gateway", "bd-gateway-badge"));
+
+    const row = (nodeRows && nodeRows[0]) || {};
+    const ips = [row["System IPv4"], row["System IPv6"]]
+      .map((v) => (typeof v === "string" ? v.trim() : ""))
+      .filter(Boolean);
+    if (ips.length) {
+      const ipSpan = document.createElement("span");
+      ipSpan.className = "bd-node-ips";
+      ipSpan.textContent = ips.join("  ·  ");
+      wrap.append(ipSpan);
+    }
+    return wrap;
+  }
+
+  // A network-instance covered by another report, as a button that jumps to it -
+  // the association is worth a control of its own rather than a link buried in
+  // the text of a pill.
+  function makeJumpButton(report, target, node, title) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "pill pill-jump";
+    button.textContent = target;
+    button.title = title;
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      jumpToVrf(report, target, node);
+    });
+    return button;
   }
 
   function renderBridgeDomainsCards(rows) {
     const bdMap = new Map();
     for (const row of rows) {
       const bdName = row["Bridge Domain"] || row["Route Targets"] || "unassigned";
-      if (!bdMap.has(bdName)) bdMap.set(bdName, []);
-      bdMap.get(bdName).push(row);
+      const site = row["Site"] ? String(row["Site"]) : "";
+      const groupKey = site ? `${bdName}@@${site}` : bdName;
+      if (!bdMap.has(groupKey)) bdMap.set(groupKey, []);
+      bdMap.get(groupKey).push(row);
     }
 
-    for (const [bdName, bdRows] of bdMap) {
-      const cardKey = `bd:${bdName}`;
+    for (const [groupKey, bdRows] of bdMap) {
+      const bdName = (bdRows[0] && (bdRows[0]["Bridge Domain"] || bdRows[0]["Route Targets"])) || groupKey.split("@@")[0];
+      const site = (bdRows[0] && bdRows[0]["Site"]) ? String(bdRows[0]["Site"]) : "";
+      const siteSuffix = site ? ` (${site})` : "";
+      const cardKey = `bd:${groupKey}`;
       const isCardCollapsed = state.collapsedCards.has(cardKey);
       const cardAgg = aggregateServiceState(bdRows);
 
@@ -814,7 +1136,7 @@
       const title = document.createElement("span");
       title.className = "bd-title";
       const vrfTitleStr = vrfNames.join(", ") + (hasVrfMismatch ? " (!)" : "");
-      title.textContent = `Bridge-domain: ${vrfTitleStr}${subnetsStr}`;
+      title.textContent = `Bridge-domain: ${vrfTitleStr}${siteSuffix}${subnetsStr}`;
 
       const stateBadge = document.createElement("span");
       stateBadge.className = `bd-state-badge ${cardAgg.className}`;
@@ -825,7 +1147,9 @@
       badge.className = "bd-badge-count";
       badge.textContent = `${nodesCount} Node${nodesCount === 1 ? "" : "s"}`;
 
-      topRow.append(chevron, icon, title, stateBadge, badge);
+      topRow.append(chevron, icon, title);
+      if (isDciService(bdRows)) topRow.append(roleBadge("DCI", "bd-dci-badge"));
+      topRow.append(stateBadge, badge);
       header.append(topRow);
 
       const subRow = document.createElement("div");
@@ -842,6 +1166,21 @@
         mismatchBadge.textContent = `⚠️ Mismatched VRF Names (${vrfNames.join(" vs ")})`;
         subRow.append(mismatchBadge);
       }
+
+      const nodeNames = [...new Set(bdRows.map((r) => r.Node).filter(Boolean))];
+      const niHint = vrfNames.length ? vrfNames.join(", ") : "this bridge domain";
+      const nodeHint = nodeNames.length ? nodeNames.join(", ") : "participating nodes";
+      subRow.append(
+        reportJumpGroup([
+          makeReportJumpButton(
+            "Bridge table",
+            `MAC table for ${niHint} on ${nodeHint}`,
+            "mac",
+            vrfNames,
+            nodeNames,
+          ),
+        ]),
+      );
 
       header.append(subRow);
       card.append(header);
@@ -902,8 +1241,7 @@
         nodeChevron.setAttribute("aria-hidden", "true");
         nodeChevron.textContent = "▼";
 
-        const nodeText = document.createElement("span");
-        nodeText.textContent = `🖥️ Node: ${nodeName}`;
+        const nodeText = nodeNameWithIps(nodeName, nodeRows);
 
         const nodeAgg = aggregateServiceState(nodeRows);
 
@@ -958,18 +1296,28 @@
           const subnetsStr = row["Subnets"] ? ` (${row["Subnets"]})` : "";
           vrfName.textContent = `📦 MAC-VRF: ${row["MAC-VRF"] || "-"}${subnetsStr}`;
 
+          const vrfTitle = document.createElement("span");
+          vrfTitle.className = "bd-vrf-title";
+          vrfTitle.append(vrfName);
+          if (row["BGP Instance"]) {
+            const instBadge = document.createElement("span");
+            instBadge.className = "bd-bgp-inst-badge";
+            instBadge.textContent = `bgp-instance ${row["BGP Instance"]}`;
+            vrfTitle.append(instBadge);
+          }
+
           const stateSpan = document.createElement("span");
           const instanceAgg = aggregateServiceState([row]);
           stateSpan.className = instanceAgg.className;
           stateSpan.textContent = row["Oper State"] || instanceAgg.badgeText;
 
-          vrfHeader.append(vrfName, stateSpan);
+          vrfHeader.append(vrfTitle, stateSpan);
           vrfDiv.append(vrfHeader);
 
           const details = document.createElement("div");
           details.className = "bd-details";
 
-          // 1. IRB interface (max 1, includes associated ip-vrf name if present)
+          // 1. IRB interface (max 1; its ip-vrf, if any, gets its own button)
           const irbStr = row["IRB Interface"] || "-";
           if (irbStr !== "-") {
             const irbRowDiv = document.createElement("div");
@@ -982,36 +1330,31 @@
 
             const pillGroup = document.createElement("div");
             pillGroup.className = "pill-group";
-            irbStr.split(",").forEach((s) => {
+            // Split only where a new IRB starts, so the commas inside an address
+            // list or a list of VRFs stay where they belong.
+            irbStr.split(/,\s*(?=irb)/i).forEach((entry) => {
+              const [itfText, ...vrfText] = entry.split("->");
+
               const p = document.createElement("span");
-              p.className = "pill pill-irb";
-              if (s.toLowerCase().includes("[down]")) p.classList.add("pill-down");
-
-              if (s.includes("->")) {
-                const parts = s.split("->");
-                const preText = parts[0] + "-> ";
-                const vrfsText = parts.slice(1).join("->").trim();
-
-                p.append(document.createTextNode(preText));
-
-                const vrfs = vrfsText.split(",").map((v) => v.trim()).filter(Boolean);
-                vrfs.forEach((vrf, idx) => {
-                  if (idx > 0) p.append(document.createTextNode(", "));
-                  const link = document.createElement("a");
-                  link.className = "vrf-link";
-                  link.textContent = vrf;
-                  link.href = "#";
-                  link.title = `Jump to Router ${vrf}`;
-                  link.addEventListener("click", (e) => {
-                    e.preventDefault();
-                    jumpToVrf("routers", vrf, nodeName);
-                  });
-                  p.append(link);
-                });
-              } else {
-                p.textContent = s.trim();
-              }
+              p.className = "pill";
+              applyPillState(p, itfText);
+              p.textContent = itfText.trim();
               pillGroup.append(p);
+
+              const vrfs = vrfText
+                .join("->")
+                .split(",")
+                .map((v) => v.trim())
+                .filter(Boolean);
+              vrfs.forEach((vrf) => {
+                const arrow = document.createElement("span");
+                arrow.className = "pill-arrow";
+                arrow.textContent = "→";
+                pillGroup.append(
+                  arrow,
+                  makeJumpButton("routers", vrf, nodeName, `Jump to Router ${vrf}`),
+                );
+              });
             });
             irbRowDiv.append(pillGroup);
             details.append(irbRowDiv);
@@ -1033,7 +1376,7 @@
             subitfStr.split(",").forEach((s) => {
               const p = document.createElement("span");
               p.className = "pill";
-              if (s.toLowerCase().includes("[down]")) p.classList.add("pill-down");
+              applyPillState(p, s);
               p.textContent = s.trim();
               pillGroup.append(p);
             });
@@ -1080,12 +1423,17 @@
     for (const row of rows) {
       if (row["IP-VRF"] === "mgmt") continue;
       const routerName = row["Router"] || row["Route Targets"] || "unassigned";
-      if (!routerMap.has(routerName)) routerMap.set(routerName, []);
-      routerMap.get(routerName).push(row);
+      const site = row["Site"] ? String(row["Site"]) : "";
+      const groupKey = site ? `${routerName}@@${site}` : routerName;
+      if (!routerMap.has(groupKey)) routerMap.set(groupKey, []);
+      routerMap.get(groupKey).push(row);
     }
 
-    for (const [routerName, rRows] of routerMap) {
-      const cardKey = `router:${routerName}`;
+    for (const [groupKey, rRows] of routerMap) {
+      const routerName = (rRows[0] && (rRows[0]["Router"] || rRows[0]["Route Targets"])) || groupKey.split("@@")[0];
+      const site = (rRows[0] && rRows[0]["Site"]) ? String(rRows[0]["Site"]) : "";
+      const siteSuffix = site ? ` (${site})` : "";
+      const cardKey = `router:${groupKey}`;
       const isCardCollapsed = state.collapsedCards.has(cardKey);
       const cardAgg = aggregateServiceState(rRows);
 
@@ -1122,7 +1470,7 @@
       const title = document.createElement("span");
       title.className = "bd-title";
       const vrfTitleStr = vrfNames.join(", ") + (hasVrfMismatch ? " (!)" : "");
-      title.textContent = `Router: ${vrfTitleStr}`;
+      title.textContent = `Router: ${vrfTitleStr}${siteSuffix}`;
 
       const stateBadge = document.createElement("span");
       stateBadge.className = `bd-state-badge ${cardAgg.className}`;
@@ -1133,17 +1481,26 @@
       badge.className = "bd-badge-count";
       badge.textContent = `${nodesCount} Node${nodesCount === 1 ? "" : "s"}`;
 
-      topRow.append(chevron, icon, title, stateBadge, badge);
+      topRow.append(chevron, icon, title);
+      if (isDciService(rRows)) topRow.append(roleBadge("DCI", "bd-dci-badge"));
+      topRow.append(stateBadge, badge);
       header.append(topRow);
 
       const subRow = document.createElement("div");
       subRow.className = "bd-header-sub";
 
+      const rtBlock = document.createElement("div");
+      rtBlock.className = "bd-rt-block";
+
       const rtLabel = document.createElement("span");
       rtLabel.className = "bd-rt-label";
       const isIsolated = !routerName || routerName === "none (isolated)" || routerName.startsWith("none (isolated)") || routerName.startsWith("ip-vrf:") || routerName === "unassigned";
       rtLabel.textContent = isIsolated ? "Route-target: none (isolated)" : `Route-target: ${routerName}`;
-      subRow.append(rtLabel);
+      rtBlock.append(rtLabel);
+
+      const allSubnets = unionSubnets(rRows);
+      if (allSubnets.length) rtBlock.append(subnetPills(allSubnets));
+      subRow.append(rtBlock);
 
       if (hasVrfMismatch) {
         const mismatchBadge = document.createElement("span");
@@ -1151,6 +1508,42 @@
         mismatchBadge.textContent = `⚠️ Mismatched VRF Names (${vrfNames.join(" vs ")})`;
         subRow.append(mismatchBadge);
       }
+
+      const nodeNames = [...new Set(rRows.map((r) => r.Node).filter(Boolean))];
+      const niHint = vrfNames.length ? vrfNames.join(", ") : "this router";
+      const nodeHint = nodeNames.length ? nodeNames.join(", ") : "participating nodes";
+      subRow.append(
+        reportJumpGroup([
+          makeReportJumpButton(
+            "IPv4 RIB",
+            `IPv4 routes for ${niHint} on ${nodeHint}`,
+            "ipv4_rib",
+            vrfNames,
+            nodeNames,
+          ),
+          makeReportJumpButton(
+            "IPv6 RIB",
+            `IPv6 routes for ${niHint} on ${nodeHint}`,
+            "ipv6_rib",
+            vrfNames,
+            nodeNames,
+          ),
+          makeReportJumpButton(
+            "ARP",
+            `ARP table for ${niHint} on ${nodeHint}`,
+            "arp",
+            vrfNames,
+            nodeNames,
+          ),
+          makeReportJumpButton(
+            "ND",
+            `IPv6 neighbors for ${niHint} on ${nodeHint}`,
+            "nd",
+            vrfNames,
+            nodeNames,
+          ),
+        ]),
+      );
 
       header.append(subRow);
       card.append(header);
@@ -1211,8 +1604,7 @@
         nodeChevron.setAttribute("aria-hidden", "true");
         nodeChevron.textContent = "▼";
 
-        const nodeText = document.createElement("span");
-        nodeText.textContent = `🖥️ Node: ${nodeName}`;
+        const nodeText = nodeNameWithIps(nodeName, nodeRows);
 
         const nodeAgg = aggregateServiceState(nodeRows);
 
@@ -1266,12 +1658,22 @@
           const vrfName = document.createElement("span");
           vrfName.textContent = `📦 IP-VRF: ${row["IP-VRF"] || "-"}`;
 
+          const vrfTitle = document.createElement("span");
+          vrfTitle.className = "bd-vrf-title";
+          vrfTitle.append(vrfName);
+          if (row["BGP Instance"]) {
+            const instBadge = document.createElement("span");
+            instBadge.className = "bd-bgp-inst-badge";
+            instBadge.textContent = `bgp-instance ${row["BGP Instance"]}`;
+            vrfTitle.append(instBadge);
+          }
+
           const stateSpan = document.createElement("span");
           const instanceAgg = aggregateServiceState([row]);
           stateSpan.className = instanceAgg.className;
           stateSpan.textContent = row["Oper State"] || instanceAgg.badgeText;
 
-          vrfHeader.append(vrfName, stateSpan);
+          vrfHeader.append(vrfTitle, stateSpan);
           vrfDiv.append(vrfHeader);
 
           const details = document.createElement("div");
@@ -1294,7 +1696,7 @@
             items.forEach((itemStr) => {
               const p = document.createElement("span");
               p.className = "pill pill-macvrf";
-              if (itemStr.toLowerCase().includes("[down]")) p.classList.add("pill-down");
+              applyPillState(p, itemStr);
 
               const match = itemStr.trim().match(/^([^\s(]+)(.*)$/);
               if (match) {
@@ -1337,7 +1739,7 @@
             routedStr.split(",").forEach((s) => {
               const p = document.createElement("span");
               p.className = "pill";
-              if (s.toLowerCase().includes("[down]")) p.classList.add("pill-down");
+              applyPillState(p, s);
               p.textContent = s.trim();
               pillGroup.append(p);
             });
@@ -1598,6 +2000,30 @@
   }
 
   /* ------------------------------------------------------------- wiring */
+
+  if (dom.navBack) {
+    dom.navBack.addEventListener("click", () => {
+      if (state.navIndex > 0) history.back();
+    });
+  }
+  if (dom.navForward) {
+    dom.navForward.addEventListener("click", () => {
+      if (state.navIndex < state.navStack.length - 1) history.forward();
+    });
+  }
+  window.addEventListener("popstate", (event) => {
+    const snap = event.state && event.state.page;
+    if (!snap || !state.reports.length) return;
+    const idx = state.navStack.findIndex((entry) => entry.id === snap.id);
+    if (idx >= 0) {
+      state.navIndex = idx;
+    } else {
+      state.navStack = [snap];
+      state.navIndex = 0;
+      if (snap.id > navSeq) navSeq = snap.id;
+    }
+    restoreNavSnap(snap);
+  });
 
   dom.reportSearch.addEventListener("input", debounce(renderReportList, 120));
   dom.globalSearch.addEventListener(

@@ -1,8 +1,6 @@
 import csv
-import re
 import io
 import json
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Callable
@@ -19,11 +17,12 @@ from rich.theme import Theme
 from nornir import InitNornir
 from nornir.core import Nornir
 from nornir.core.task import Result, Task, AggregatedResult
-from nornir.core.inventory import Host
 
 from .connections.srlinux import CONNECTION_NAME
 from .connections.routing import BGP_RIB_ROUTE_FAM_ALIASES
 from .connections.helpers import clean_structured_key
+from .reports import ReportSpec, get_report
+from .rows import NodeRows, clean_columns, extract
 from .utils.logging_config import setup_logging
 from . import __version__
 
@@ -75,110 +74,13 @@ NORNIR_DEFAULT_CONFIG: Dict[str, Any] = {
 # ------------------------- helpers -------------------------
 
 
-def _get_fields(b, depth=0):
-    fields: List[str] = []
-    if isinstance(b, list) and len(b) > 0:
-        fields.extend(_get_fields(b[0], depth=depth + 1))
-    elif isinstance(b, dict):
-        for k, v in b.items():
-            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
-                fields.extend(_get_fields(v[0], depth=depth + 1))
-            elif isinstance(v, dict):
-                fields.extend(_get_fields(v, depth=depth + 1))
-            else:
-                fields.append(k)
-        if depth > 0:
-            fields = sorted(fields)
-    return fields
+def _report_failure(resource: str) -> Callable[[str, Optional[BaseException]], None]:
+    """Report a host that failed, and leave it out of the table."""
 
+    def on_error(node: str, exception: Optional[BaseException]) -> None:
+        typer.echo(f"Failed to get {resource} for {node}. Exception: {exception}")
 
-def _pass_filter(row, filter):
-    if filter is None:
-        return True
-    filter = {str(k).lower(): v for k, v in filter.items()}
-    if len(
-        {
-            k: v
-            for k, v in row.items()
-            if filter.get(str(k).lower())
-            and re.search(str(filter[str(k).lower()]), str(row[k]), re.IGNORECASE)
-        }
-    ) < len(filter):
-        return False
-    else:
-        return True
-
-
-def _extract_data(
-    resource: str,
-    results: AggregatedResult,
-    filter: Optional[Dict],
-) -> tuple:
-    """Extract flat row data from AggregatedResult.
-
-    Returns (col_names, all_rows) where each row is a dict with a 'Node' key.
-    """
-    col_names: List[str] = []
-    all_rows: List[Dict[str, Any]] = []
-
-    for host, host_result in results.items():
-        r: Result = host_result[0]
-        node: Host = r.host if r.host else Host("unknown")
-        if r.failed:
-            typer.echo(f"Failed to get {resource} for {host}. Exception: {r.exception}")
-            continue
-        if r.result and r.result.get(resource) is not None:
-            for l in r.result.get(resource):
-                if len(col_names) == 0:
-                    col_names = _get_fields(l)
-                common = {
-                    x: y
-                    for x, y in l.items()
-                    if isinstance(y, (str, int, float))
-                    or (
-                        isinstance(y, list)
-                        and len(y) > 0
-                        and not isinstance(y[0], dict)
-                    )
-                }
-                node_name = node.hostname if node.hostname else node.name
-                if (
-                    len(
-                        [
-                            v
-                            for v in l.values()
-                            if isinstance(v, list)
-                            and len(v) > 0
-                            and isinstance(v[0], dict)
-                        ]
-                    )
-                    == 0
-                ):
-                    if _pass_filter(common, filter):
-                        all_rows.append({"Node": node_name, **common})
-                else:
-                    for key, v in l.items():
-                        if (
-                            isinstance(v, list)
-                            and len(v) > 0
-                            and isinstance(v[0], dict)
-                        ):
-                            for item in v:
-                                row = {
-                                    k: y
-                                    for k, y in item.items()
-                                    if isinstance(y, (str, int, float))
-                                    or (
-                                        isinstance(y, list)
-                                        and len(y) > 0
-                                        and not isinstance(y[0], dict)
-                                    )
-                                }
-                                if _pass_filter({**common, **row}, filter):
-                                    all_rows.append(
-                                        {"Node": node_name, **common, **row}
-                                    )
-    return col_names, all_rows
+    return on_error
 
 
 def print_structured(
@@ -191,7 +93,7 @@ def print_structured(
         typer.echo("No data...")
         return
 
-    col_names = [clean_structured_key(c) for c in col_names]
+    col_names = clean_columns(col_names)
     rows = [{clean_structured_key(k): v for k, v in row.items()} for row in rows]
 
     all_cols = ["Node"] + col_names
@@ -209,156 +111,71 @@ def print_structured(
         typer.echo(buf.getvalue().rstrip())
 
 
+TABLE_THEME = Theme(
+    {"ok": "green", "warn": "orange3", "info": "blue", "err": "bold red"}
+)
+
+#: Values worth colouring wherever they turn up in a table.
+STYLE_MAP = {
+    "up": "[ok]",
+    "down": "[err]",
+    "enable": "[ok]",
+    "disable": "[info]",
+    "routed": "[cyan]",
+    "bridged": "[blue]",
+    "established": "[ok]",
+    "active": "[cyan]",
+}
+
+
+def _box(box_type: Optional[str]) -> Any:
+    if not box_type:
+        return MINIMAL_DOUBLE_HEAD
+    name = str(box_type).upper()
+    try:
+        return getattr(__import__("rich.box", fromlist=["box"]), name)
+    except AttributeError:
+        typer.echo(
+            f"Unknown box type {name}. Check 'python -m rich.box' for valid box types."
+        )
+        return MINIMAL_DOUBLE_HEAD
+
+
+def _cell(value: Any) -> str:
+    text = str(value)
+    return STYLE_MAP.get(text, "") + text
+
+
 def print_table(
     title: str,
-    resource: str,
-    results: AggregatedResult,
-    filter: Optional[Dict],
+    columns: List[str],
+    per_node: List[NodeRows],
     *,
     box_type: Optional[str] = None,
 ) -> None:
-    table_theme = Theme(
-        {"ok": "green", "warn": "orange3", "info": "blue", "err": "bold red"}
-    )
-    STYLE_MAP = {
-        "up": "[ok]",
-        "down": "[err]",
-        "enable": "[ok]",
-        "disable": "[info]",
-        "routed": "[cyan]",
-        "bridged": "[blue]",
-        "established": "[ok]",
-        "active": "[cyan]",
-    }
-
-    console = Console(theme=table_theme)
+    """Render the extracted rows as a rich table, one section per node."""
+    console = Console(theme=TABLE_THEME)
     console._emoji = False
-    if box_type:
-        box_type = str(box_type).upper()
-        try:
-            box_t = getattr(__import__("rich.box", fromlist=["box"]), box_type)
-        except AttributeError:
-            typer.echo(
-                f"Unknown box type {box_type}. Check 'python -m rich.box' for valid box types."
-            )
-            box_t = MINIMAL_DOUBLE_HEAD
-    else:
-        box_t = MINIMAL_DOUBLE_HEAD
-    table = Table(title=title, highlight=True, box=box_t)
+    table = Table(title=title, highlight=True, box=_box(box_type))
     table.add_column("Node", no_wrap=True)
+    for col in columns:
+        table.add_column(col, no_wrap=False)
 
-    def get_fields(b, depth=0):
-        fields: List[str] = []
-        if isinstance(b, list) and len(b) > 0:
-            fields.extend(get_fields(b[0], depth=depth + 1))
-        elif isinstance(b, dict):
-            for k, v in b.items():
-                if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
-                    fields.extend(get_fields(v[0], depth=depth + 1))
-                elif isinstance(v, dict):
-                    fields.extend(get_fields(v, depth=depth + 1))
-                else:
-                    fields.append(k)
-            if depth > 0:
-                fields = sorted(fields)
-        return fields
-
-    def pass_filter(row, filter):
-        if filter is None:
-            return True
-        filter = {str(k).lower(): v for k, v in filter.items()}
-        if len(
-            {
-                k: v
-                for k, v in row.items()
-                if filter.get(str(k).lower())
-                and re.search(str(filter[str(k).lower()]), str(row[k]), re.IGNORECASE)
-            }
-        ) < len(filter):
-            return False
-        else:
-            return True
-
-    col_names: List[str] = []
-    for host, host_result in results.items():
-        rows = []
-        r: Result = host_result[0]
-        node: Host = r.host if r.host else Host("unknown")
-        if r.failed:
-            typer.echo(f"Failed to get {resource} for {host}. Exception: {r.exception}")
-            continue
-        if r.result and r.result.get(resource) is not None:
-            for l in r.result.get(resource):
-                if len(col_names) == 0:
-                    col_names = get_fields(l)
-                    for col in col_names:
-                        table.add_column(col, no_wrap=False)
-                common = {
-                    x: y
-                    for x, y in l.items()
-                    if isinstance(y, (str, int, float))
-                    or (
-                        isinstance(y, list)
-                        and len(y) > 0
-                        and not isinstance(y[0], dict)
-                    )
-                }
-                if (
-                    len(
-                        [
-                            v
-                            for v in l.values()
-                            if isinstance(v, list)
-                            and len(v) > 0
-                            and isinstance(v[0], dict)
-                        ]
-                    )
-                    == 0
-                ):
-                    if pass_filter(common, filter):
-                        rows.append(common)
-                else:
-                    for key, v in l.items():
-                        if (
-                            isinstance(v, list)
-                            and len(v) > 0
-                            and isinstance(v[0], dict)
-                        ):
-                            first_row = True
-                            for item in v:
-                                row = {
-                                    k: y
-                                    for k, y in item.items()
-                                    if isinstance(y, (str, int, float))
-                                    or (
-                                        isinstance(y, list)
-                                        and len(y) > 0
-                                        and not isinstance(y[0], dict)
-                                    )
-                                }
-                                if pass_filter({**common, **row}, filter):
-                                    if first_row:
-                                        rows.append({**common, **row})
-                                    else:
-                                        rows.append(row)
-                                    first_row = False
-        first_row = True
-        for row in rows:
-            for k, v in row.items():
-                row[k] = str(STYLE_MAP.get(str(v), "")) + str(v)
-            values = [str(row.get(k, "")) for k in col_names]
-            if first_row:
-                node_name: str = node.hostname if node.hostname else node.name
-                table.add_row(node_name, *values)
-                first_row = False
-            else:
-                table.add_row("", *values)
+    for node in per_node:
+        first = True
+        for row in node.rows:
+            # Fields a row inherited from its parent item are shown once, so a
+            # parent with many sub-rows reads as one entry spanning them.
+            cells = row.cells(group=True)
+            values = [_cell(cells.get(col, "")) for col in columns]
+            table.add_row(node.node if first else "", *values)
+            first = False
         table.add_section()
+
     if len(table.columns) > 1:
         console.print(table)
     else:
         console.print("[i]No data...[/i]")
-        logger.debug("No data returned for %s: %s", resource, results)
 
 
 def print_report(
@@ -370,6 +187,12 @@ def print_report(
     i_filter: Optional[Dict] = None,
     output: OutputFormat = OutputFormat.TABLE,
 ) -> None:
+    columns, per_node = extract(
+        result.name,
+        result,
+        field_filter=f_filter,
+        on_error=_report_failure(result.name),
+    )
     if output == OutputFormat.TABLE:
         title = "[bold]" + name + "[/bold]"
         if f_filter:
@@ -378,20 +201,14 @@ def print_report(
             title += "\nInventory filter:" + str(i_filter)
         if len(failed_hosts) > 0:
             title += "\n[red]Failed hosts:" + str(failed_hosts)
-        print_table(
-            title=title,
-            resource=result.name,
-            results=result,
-            filter=f_filter,
-            box_type=box_type,
-        )
+        if not columns:
+            logger.debug("No data returned for %s: %s", result.name, result)
+        print_table(title, columns, per_node, box_type=box_type)
     else:
-        col_names, rows = _extract_data(
-            resource=result.name,
-            results=result,
-            filter=f_filter,
-        )
-        print_structured(col_names, rows, output)
+        rows = [
+            {"Node": node.node, **row.values} for node in per_node for row in node.rows
+        ]
+        print_structured(columns, rows, output)
 
 
 # ------------------------- root callback -------------------------
@@ -565,22 +382,43 @@ def main(
 # ------------------------- command helpers -------------------------
 
 
-def run_show(
+def _task_for(spec: ReportSpec, params: Dict[str, Any]) -> Callable[[Task], Result]:
+    """Wrap a report's getter as a Nornir task."""
+
+    def task_func(task: Task) -> Result:
+        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
+        return Result(host=task.host, result=spec.getter(device, **params))
+
+    return task_func
+
+
+def run_query(
+    ctx: typer.Context, spec: ReportSpec, **params: Any
+) -> AggregatedResult:
+    """Run a report's getter across the filtered inventory."""
+    result = ctx.obj["target"].run(
+        task=_task_for(spec, params), name=spec.resource, raise_on_error=False
+    )
+    logger.debug("Aggregated result for %s: %s", spec.name, result)
+    return result
+
+
+def run_report(
     ctx: typer.Context,
     name: str,
-    task_func: Callable[[Task], Result],
-    field_filter: Optional[List[str]],
+    field_filter: Optional[List[str]] = None,
     title: Optional[str] = None,
+    **params: Any,
 ) -> None:
+    """Run the named report from the registry and print it."""
+    spec = get_report(name)
     f_filter = (
         {k: v for k, v in (f.split("=") for f in field_filter)} if field_filter else {}
     )
-    result = ctx.obj["target"].run(task=task_func, name=name, raise_on_error=False)
-    logger.debug("Aggregated result for %s: %s", name, result)
-    display_name = title if title else name.replace("_", " ").title()
+    result = run_query(ctx, spec, **params)
     print_report(
         result=result,
-        name=display_name,
+        name=title or spec.title,
         failed_hosts=result.failed_hosts,
         box_type=ctx.obj["box_type"],
         f_filter=f_filter,
@@ -650,134 +488,31 @@ def server(
     )
 
 
-@app.command()
-def bgp_peers(
-    ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
-) -> None:
-    """Displays BGP Peers and their status"""
-
-    def _bgp(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_sum_bgp())
-
-    run_show(ctx, "bgp_peers", _bgp, field_filter)
+FIELD_FILTER = typer.Option(
+    None,
+    "--field-filter",
+    "-f",
+    help="Filter rows on field values, e.g. -f oper-state=down. Values are "
+    "case-insensitive regexes; repeat the option to filter on several fields",
+)
 
 
 @app.command()
 def sys_info(
     ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
 ) -> None:
     """Displays System Info of nodes"""
-
-    def _sys_info(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_info())
-
-    run_show(ctx, "sys_info", _sys_info, field_filter)
+    run_report(ctx, "sys_info", field_filter)
 
 
 @app.command()
-def subif(
+def bgp_peers(
     ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
 ) -> None:
-    """Displays Sub-Interfaces of nodes"""
-
-    def _sub(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_sum_subitf())
-
-    run_show(ctx, "subinterface", _sub, field_filter)
-
-
-@app.command()
-def lag(
-    ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
-) -> None:
-    """Displays LAGs of nodes"""
-
-    def _lag(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_lag())
-
-    run_show(ctx, "lag", _lag, field_filter)
-
-
-@app.command()
-def ipv4_rib(
-    ctx: typer.Context,
-    address: Optional[str] = typer.Option(
-        None,
-        "--address",
-        "-a",
-        help="Look up specified address in the IPv4 RIB using LPM",
-    ),
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
-) -> None:
-    """Displays IPv4 RIB entries"""
-
-    def _ipv4(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(
-            host=task.host,
-            result=device.get_rib(afi="ipv4-unicast", lpm_address=address),
-        )
-
-    run_show(ctx, "ip_rib", _ipv4, field_filter)
-
-
-@app.command()
-def ipv6_rib(
-    ctx: typer.Context,
-    address: Optional[str] = typer.Option(
-        None,
-        "--address",
-        "-a",
-        help="Look up specified address in the IPv6 RIB using LPM",
-    ),
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
-) -> None:
-    """Displays IPv6 RIB entries"""
-
-    def _ipv6(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(
-            host=task.host,
-            result=device.get_rib(afi="ipv6-unicast", lpm_address=address),
-        )
-
-    run_show(ctx, "ip_rib", _ipv6, field_filter)
-
-
-@app.command()
-def static_routes(
-    ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
-) -> None:
-    """Displays static routes"""
-
-    def _static(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_static_routes())
-
-    run_show(ctx, "static_routes", _static, field_filter)
-
-
-@app.command()
-def tunnel_table(
-    ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
-) -> None:
-    """Displays the IP tunnel-table (LDP, SR-ISIS, RSVP, VXLAN, ...)"""
-
-    def _tunnel(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_tunnel_table())
-
-    run_show(ctx, "tunnel_table", _tunnel, field_filter, title="Tunnel Table")
+    """Displays BGP Peers and their status"""
+    run_report(ctx, "bgp_peers", field_filter)
 
 
 @app.command()
@@ -801,221 +536,219 @@ def bgp_rib(
         help="Include all path attributes (communities, SoO, D-PATH, tunnel-encap, "
         "status). Automatically enabled for non-table output (json/yaml/csv).",
     ),
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
 ) -> None:
     """Displays BGP RIB"""
-
-    want_detail = detail or ctx.obj["output"] != OutputFormat.TABLE
-
-    def _bgp_rib(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        kwargs: Dict[str, Any] = {"route_fam": route_fam, "detail": want_detail}
-        if route_type is not None:
-            kwargs["route_type"] = route_type
-        return Result(host=task.host, result=device.get_bgp_rib(**kwargs))
-
-    rib_title = (
-        "BGP RIB (" + BGP_RIB_ROUTE_FAM_ALIASES.get(route_fam.lower(), route_fam) + ")"
+    family = BGP_RIB_ROUTE_FAM_ALIASES.get(route_fam.lower(), route_fam)
+    run_report(
+        ctx,
+        "bgp_rib",
+        field_filter,
+        title=f"BGP RIB ({family})",
+        route_fam=route_fam,
+        route_type=route_type,
+        # Structured output has room for every attribute, so always include them.
+        detail=detail or ctx.obj["output"] != OutputFormat.TABLE,
     )
-    run_show(ctx, "bgp_rib", _bgp_rib, field_filter, title=rib_title)
 
 
 @app.command()
-def mac(
+def ipv4_rib(
     ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
+    address: Optional[str] = typer.Option(
+        None,
+        "--address",
+        "-a",
+        help="Look up specified address in the IPv4 RIB using LPM",
+    ),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
 ) -> None:
-    """Displays MAC Table"""
+    """Displays IPv4 RIB entries"""
+    run_report(ctx, "ipv4_rib", field_filter, address=address)
 
-    def _mac(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_mac_table())
 
-    run_show(ctx, "mac_table", _mac, field_filter)
+@app.command()
+def ipv6_rib(
+    ctx: typer.Context,
+    address: Optional[str] = typer.Option(
+        None,
+        "--address",
+        "-a",
+        help="Look up specified address in the IPv6 RIB using LPM",
+    ),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays IPv6 RIB entries"""
+    run_report(ctx, "ipv6_rib", field_filter, address=address)
+
+
+@app.command()
+def static_routes(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays static routes"""
+    run_report(ctx, "static_routes", field_filter)
+
+
+@app.command()
+def tunnel_table(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays the IP tunnel-table (LDP, SR-ISIS, RSVP, VXLAN, ...)"""
+    run_report(ctx, "tunnel_table", field_filter)
 
 
 @app.command()
 def ni(
     ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
 ) -> None:
     """Displays Network Instances and interfaces"""
-
-    def _ni(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_nwi_itf())
-
-    run_show(ctx, "nwi_itfs", _ni, field_filter)
+    run_report(ctx, "ni", field_filter)
 
 
 @app.command()
-def lldp(
+def subif(
     ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
 ) -> None:
-    """Displays LLDP Neighbors"""
-
-    def _lldp(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_lldp_sum())
-
-    run_show(ctx, "lldp_nbrs", _lldp, field_filter)
+    """Displays Sub-Interfaces of nodes"""
+    run_report(ctx, "subif", field_filter)
 
 
 @app.command()
-def irb(
+def lag(
     ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
 ) -> None:
-    """Displays IRB sub-interfaces"""
-
-    def _irb(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_irb())
-
-    run_show(ctx, "irb", _irb, field_filter)
-
-
-@app.command()
-def es(
-    ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
-) -> None:
-    """Displays Ethernet Segments"""
-
-    def _es(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_es())
-
-    run_show(ctx, "es", _es, field_filter)
-
-
-@app.command()
-def es_dest(
-    ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
-) -> None:
-    """Displays ES Destinations on the bridge table"""
-
-    def _es_dest(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_es_dest())
-
-    run_show(ctx, "es_dest", _es_dest, field_filter, title="L2-ES Destinations")
-
-
-@app.command()
-def vxlan(
-    ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
-) -> None:
-    """Displays VXLAN tunnel interfaces and unicast destinations"""
-
-    def _vxlan(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_vxlan())
-
-    run_show(ctx, "vxlan", _vxlan, field_filter, title="VXLAN Tunnels")
-
-
-@app.command()
-def arp(
-    ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
-) -> None:
-    """Displays ARP table"""
-
-    def _arp(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_arp())
-
-    run_show(ctx, "arp", _arp, field_filter)
+    """Displays LAGs of nodes"""
+    run_report(ctx, "lag", field_filter)
 
 
 @app.command()
 def ifstats(
     ctx: typer.Context,
     interval: int = typer.Option(5, "--interval", "-s", help="Seconds between samples"),
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
 ) -> None:
     """Displays per-interface in/out bps from two consecutive samples"""
-
-    def _ifstats(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_ifstats(interval=interval))
-
-    run_show(
+    run_report(
         ctx,
         "ifstats",
-        _ifstats,
         field_filter,
         title=f"Interface Stats ({interval}s interval)",
+        interval=interval,
     )
 
 
 @app.command()
-def routing_pol(
+def mac(
     ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
 ) -> None:
-    """Displays Routing Policies"""
+    """Displays MAC Table"""
+    run_report(ctx, "mac", field_filter)
 
-    if ctx.obj["output"] == OutputFormat.TABLE:
-        typer.echo(
-            "Warning: routing-pol report only supports json or yaml output. Table format is not supported.",
-            err=True,
-        )
-        raise typer.Exit(1)
 
-    def _routing_pol(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_routing_policies())
+@app.command()
+def irb(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays IRB sub-interfaces"""
+    run_report(ctx, "irb", field_filter)
 
-    result = ctx.obj["target"].run(
-        task=_routing_pol, name="routing_pol", raise_on_error=False
-    )
 
-    # Extract raw data to print
-    all_data = []
-    for host, host_result in result.items():
-        r: Result = host_result[0]
-        node_name = r.host.hostname if r.host and r.host.hostname else host
-        if r.failed:
-            typer.echo(
-                f"Failed to get routing_pol for {host}. Exception: {r.exception}",
-                err=True,
-            )
-            continue
-        if r.result and r.result.get("routing_pol"):
-            for pol in r.result["routing_pol"]:
-                all_data.append({"Node": node_name, "routing-policy": pol})
+@app.command()
+def es(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays Ethernet Segments"""
+    run_report(ctx, "es", field_filter)
 
-    if not all_data:
-        typer.echo("No data...")
-        return
 
-    if ctx.obj["output"] == OutputFormat.JSON:
-        typer.echo(json.dumps(all_data, indent=2, default=str))
-    elif ctx.obj["output"] == OutputFormat.YAML:
-        typer.echo(yaml.safe_dump(all_data, default_flow_style=False).rstrip())
-    else:
-        typer.echo(
-            "Warning: routing-pol report only supports json or yaml output.", err=True
-        )
-        raise typer.Exit(1)
+@app.command()
+def es_dest(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays ES Destinations on the bridge table"""
+    run_report(ctx, "es_dest", field_filter)
+
+
+@app.command()
+def vxlan(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays VXLAN tunnel interfaces and unicast destinations"""
+    run_report(ctx, "vxlan", field_filter)
+
+
+@app.command()
+def lldp(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays LLDP Neighbors"""
+    run_report(ctx, "lldp", field_filter)
+
+
+@app.command()
+def arp(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays ARP table"""
+    run_report(ctx, "arp", field_filter)
 
 
 @app.command()
 def nd(
     ctx: typer.Context,
-    field_filter: Optional[List[str]] = typer.Option(None, "--field-filter", "-f"),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
 ) -> None:
     """Displays IPv6 Neighbors"""
+    run_report(ctx, "nd", field_filter)
 
-    def _nd(task: Task) -> Result:
-        device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-        return Result(host=task.host, result=device.get_nd())
 
-    run_show(ctx, "nd", _nd, field_filter)
+@app.command()
+def routing_pol(ctx: typer.Context) -> None:
+    """Displays Routing Policies"""
+    spec = get_report("routing_pol")
+    # Policies nest arbitrarily deep, so there is no table to render them as.
+    if ctx.obj["output"] not in (OutputFormat.JSON, OutputFormat.YAML):
+        typer.echo(
+            f"Warning: the {spec.name.replace('_', '-')} report only supports json "
+            "or yaml output.",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    result = run_query(ctx, spec)
+    policies: List[Dict[str, Any]] = []
+    for host, host_result in result.items():
+        r: Result = host_result[0]
+        node = r.host.hostname if r.host and r.host.hostname else host
+        if r.failed:
+            typer.echo(
+                f"Failed to get {spec.resource} for {host}. Exception: {r.exception}",
+                err=True,
+            )
+            continue
+        for policy in (r.result or {}).get(spec.resource) or []:
+            policies.append({"Node": node, "routing-policy": policy})
+
+    if not policies:
+        typer.echo("No data...")
+        return
+    if ctx.obj["output"] == OutputFormat.JSON:
+        typer.echo(json.dumps(policies, indent=2, default=str))
+    else:
+        typer.echo(yaml.safe_dump(policies, default_flow_style=False).rstrip())
 
 
 if __name__ == "__main__":

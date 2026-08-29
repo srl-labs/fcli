@@ -10,9 +10,9 @@ import yaml
 from nornir import InitNornir
 from starlette.testclient import TestClient
 
+from nornir_srl.reports import SERVER, get_report, reports_for
+from nornir_srl.rows import flatten, get_fields, is_scalar
 from nornir_srl.server.app import create_app, parse_kv, table_digest, table_events
-from nornir_srl.server.reports import REPORTS, REPORTS_BY_NAME, get_report
-from nornir_srl.server.rows import flatten, get_fields, is_scalar
 from nornir_srl.server.store import FabricStore
 
 from .fakes import (
@@ -293,7 +293,7 @@ def test_table_caching_and_invalidation(store):
 
 def test_all_static_reports_have_predeclared_subscriptions():
     """Verify that core static reports have explicit subscribe specs defined."""
-    reports_with_subscribe = [r for r in REPORTS if r.subscribe]
+    reports_with_subscribe = [r for r in reports_for(SERVER) if r.subscribe]
     assert len(reports_with_subscribe) >= 10
 
 
@@ -305,7 +305,7 @@ def test_opening_every_report_costs_one_session_per_node(store):
     the session count with it.
     """
     fabric_store, devices = store
-    for report in REPORTS:
+    for report in reports_for(SERVER):
         fabric_store.table(report)
     assert wait_for(
         lambda: fabric_store.status()["max_sessions_per_node"] == 1, timeout=10
@@ -581,7 +581,9 @@ def test_static_assets_are_served(client):
 def test_reports_endpoint_lists_every_report(client):
     test_client, _devices = client
     payload = test_client.get("/api/reports").json()
-    assert {r["name"] for r in payload["reports"]} == set(REPORTS_BY_NAME)
+    assert {r["name"] for r in payload["reports"]} == {
+        r.name for r in reports_for(SERVER)
+    }
     assert all(r["title"] and r["description"] for r in payload["reports"])
 
 

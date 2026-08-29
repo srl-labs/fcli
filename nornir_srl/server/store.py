@@ -6,16 +6,17 @@ import logging
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from nornir.core import Nornir
 
 from ..connections.srlinux import CONNECTION_NAME
+from ..connections.layer2 import stamp_underlay_sites
+from ..reports import ReportSpec, SubscriptionSpec, get_report
+from ..rows import clean_columns, flatten
 from .devices import CachedDevice, RecordingDevice
-from .reports import Report
-from .rows import clean_columns, flatten
-from .stream import HostStream, SubscriptionSpec
-from .tree import materialize
+from .stream import HostStream
 
 logger = logging.getLogger(__name__)
 
@@ -112,16 +113,27 @@ class FabricStore:
                 self._last_state_change = time.time()
             return
         with self._lock:
-            self._connect_errors.pop(name, None)
-            self._streams[name] = HostStream(
-                name,
-                device,
-                default_sample_interval=self.sample_interval or 15,
-                restart_debounce=self.restart_debounce,
-                idle_timeout=self.idle_timeout,
-                on_update=self._on_host_update,
-            )
-            self._last_state_change = time.time()
+            if self._stop.is_set():
+                # Lost the race with stop(). Keeping this would leave a session
+                # open on the node with nothing left to close it.
+                stopping = True
+            else:
+                stopping = False
+                self._connect_errors.pop(name, None)
+                self._streams[name] = HostStream(
+                    name,
+                    device,
+                    default_sample_interval=self.sample_interval or 15,
+                    restart_debounce=self.restart_debounce,
+                    idle_timeout=self.idle_timeout,
+                    on_update=self._on_host_update,
+                )
+                self._last_state_change = time.time()
+        if stopping:
+            try:
+                host.close_connection(CONNECTION_NAME)
+            except Exception as exc:  # noqa: BLE001 - best effort teardown
+                logger.debug("%s: closing a late connection failed: %s", name, exc)
 
     def _heal_connections(self, names: List[str]) -> None:
         """Reconnect the nodes among *names* whose gNMI connection does not work.
@@ -202,13 +214,15 @@ class FabricStore:
         """
         cursor = 0
         while True:
-            names = list(self._streams)
-            if self._stop.wait(self.resync_interval / max(len(names), 1)):
+            with self._lock:
+                node_count = len(self._streams)
+            if self._stop.wait(self.resync_interval / max(node_count, 1)):
                 return
-            names = list(self._streams)
-            if not names:
-                continue
-            stream = self._streams.get(names[cursor % len(names)])
+            with self._lock:
+                names = list(self._streams)
+                if not names:
+                    continue
+                stream = self._streams.get(names[cursor % len(names)])
             cursor += 1
             if stream is None:
                 continue
@@ -221,9 +235,15 @@ class FabricStore:
         self._stop.set()
         with self._lock:
             self._table_cache.clear()
+            # Handed over rather than read: a connect still queued on the pool
+            # would otherwise register a fresh stream behind our back, and
+            # nothing would be left to shut it down again.
+            streams = list(self._streams.values())
+            self._streams.clear()
+        if self._resync_thread is not None:
+            self._resync_thread.join(timeout=5)
 
         hosts = list(self.nornir.inventory.hosts.items())
-        streams = list(self._streams.values())
 
         def _close_host(item: Tuple[str, Any]) -> None:
             name, host = item
@@ -235,11 +255,13 @@ class FabricStore:
         def _stop_stream(stream: Any) -> None:
             try:
                 stream.stop()
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("%s: error stopping stream: %s", stream.name, exc)
 
-        list(self._pool.map(_close_host, hosts))
+        # Streams first: stopping one cancels its Subscribe RPC, which is what
+        # actually releases the session on the node.
         list(self._pool.map(_stop_stream, streams))
+        list(self._pool.map(_close_host, hosts))
         self._pool.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------ #
@@ -247,9 +269,12 @@ class FabricStore:
     # ------------------------------------------------------------------ #
 
     def inventory(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            streams = dict(self._streams)
+            connect_errors = dict(self._connect_errors)
         result = []
         for name, host in self.nornir.inventory.hosts.items():
-            stream = self._streams.get(name)
+            stream = streams.get(name)
             result.append(
                 {
                     "name": name,
@@ -271,7 +296,7 @@ class FabricStore:
                         and stream.stale_for is None
                     ),
                     "streaming": bool(stream and stream.connected),
-                    "error": self._connect_errors.get(name)
+                    "error": connect_errors.get(name)
                     or (stream.last_error if stream else None),
                     "last_update": stream.last_update if stream else None,
                 }
@@ -282,29 +307,34 @@ class FabricStore:
         target = self.nornir.filter(**inv_filter) if inv_filter else self.nornir
         return list(target.inventory.hosts)
 
+    def _streams_for(self, names: List[str]) -> List[HostStream]:
+        with self._lock:
+            return [self._streams[n] for n in names if n in self._streams]
+
     # ------------------------------------------------------------------ #
     # report activation
     # ------------------------------------------------------------------ #
 
-    def activate(self, report: Report, hosts: Optional[List[str]] = None) -> None:
+    def activate(self, report: ReportSpec, hosts: Optional[List[str]] = None) -> None:
         """Make sure every node streams the paths *report* needs.
 
         This runs on every render, not just the first one: re-asserting the paths
         is what marks them as still in use, so a report someone is watching is
         never retired from under it.
         """
-        names = hosts if hosts is not None else list(self._streams)
-        pending = [n for n in names if n in self._streams]
+        with self._lock:
+            names = hosts if hosts is not None else list(self._streams)
+            pending = [n for n in names if n in self._streams]
         if not pending:
             return
         list(self._pool.map(lambda n: self._activate_host(report, n), pending))
 
-    def _activate_host(self, report: Report, name: str) -> None:
-        stream = self._streams.get(name)
-        if stream is None:
-            return
+    def _activate_host(self, report: ReportSpec, name: str) -> None:
         key = (name, report.name)
         with self._lock:
+            stream = self._streams.get(name)
+            if stream is None:
+                return
             failed = self._activation_errors.get(key)
             if failed is not None:
                 # Discovery runs the report's getter against the device, so a
@@ -328,7 +358,7 @@ class FabricStore:
             with self._lock:
                 self._activation_errors[key] = (time.time(), str(exc))
 
-    def _discover(self, report: Report, stream: HostStream) -> List[SubscriptionSpec]:
+    def _discover(self, report: ReportSpec, stream: HostStream) -> List[SubscriptionSpec]:
         """Determine which gNMI paths a report needs on this node."""
         if report.subscribe:
             interval = self.sample_interval
@@ -354,7 +384,7 @@ class FabricStore:
 
     def table(
         self,
-        report: Report,
+        report: ReportSpec,
         inv_filter: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Render *report* across the (filtered) inventory from streamed state."""
@@ -391,6 +421,10 @@ class FabricStore:
             {c: _cell(row.get(raw)) for c, raw in zip(all_columns, ["Node"] + columns)}
             for row in rows
         ]
+        if report.name in ("bridge_domains", "routers", "services"):
+            if stamp_underlay_sites(clean_rows):
+                if "Site" not in all_columns:
+                    all_columns.append("Site")
         res_table = {
             "report": report.name,
             "title": report.title,
@@ -400,21 +434,28 @@ class FabricStore:
             "nodes": len(names),
             "generated": started,
             "render_ms": round((time.time() - started) * 1000, 1),
-            "oldest_update": _oldest_update(
-                [self._streams[n] for n in names if n in self._streams]
-            ),
+            "oldest_update": _oldest_update(self._streams_for(names)),
         }
         with self._lock:
+            # The cache is keyed by inventory filter as well as report, and API
+            # clients pick the filter, so the key space has no natural bound.
+            if (
+                cache_key not in self._table_cache
+                and len(self._table_cache) >= _MAX_CACHED_TABLES
+            ):
+                oldest = min(self._table_cache, key=lambda k: self._table_cache[k][0])
+                del self._table_cache[oldest]
             self._table_cache[cache_key] = (started, res_table)
         return res_table
 
     def _host_rows(
-        self, report: Report, name: str
+        self, report: ReportSpec, name: str
     ) -> Tuple[str, List[str], List[Dict[str, Any]], Optional[str]]:
-        stream = self._streams.get(name)
-        if stream is None:
-            return name, [], [], self._connect_errors.get(name, "not connected")
-        activation_error = self._activation_errors.get((name, report.name))
+        with self._lock:
+            stream = self._streams.get(name)
+            if stream is None:
+                return name, [], [], self._connect_errors.get(name, "not connected")
+            activation_error = self._activation_errors.get((name, report.name))
         if activation_error:
             return name, [], [], activation_error[1]
         host = self.nornir.inventory.hosts.get(name)
@@ -433,12 +474,13 @@ class FabricStore:
     # ------------------------------------------------------------------ #
 
     def status(self) -> Dict[str, Any]:
-        streams = [s.status() for s in self._streams.values()]
+        with self._lock:
+            host_streams = list(self._streams.values())
+            connect_errors = dict(self._connect_errors)
+        streams = [s.status() for s in host_streams]
         return {
             "nodes": streams,
-            "unreachable": [
-                {"node": n, "error": e} for n, e in self._connect_errors.items()
-            ],
+            "unreachable": [{"node": n, "error": e} for n, e in connect_errors.items()],
             "subscriptions": sum(len(s["paths"]) for s in streams),
             # The gRPC sessions a single node spends on us. SR Linux allows 20
             # per gRPC server by default, shared with every other client, so
@@ -448,241 +490,277 @@ class FabricStore:
         }
 
     def overview(self, inv_filter: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        """Aggregate high-level health and topology metrics for executive dashboard."""
-        from .reports import get_report
-
+        """Aggregate fabric-wide health and topology metrics for the dashboard."""
         names = self._targets(inv_filter)
         self._heal_connections(names)
         try:
-            ov_report = get_report("overview")
-            self.activate(ov_report, names)
-        except Exception:
-            pass
+            self.activate(get_report("overview"), names)
+        except Exception as exc:  # noqa: BLE001 - the summary still renders
+            logger.warning("activating the overview report failed: %s", exc)
 
         hosts = self.inventory()
-        total_nodes = len(hosts)
-        connected_nodes = sum(1 for h in hosts if h["connected"])
-        streaming_nodes = sum(1 for h in hosts if h["streaming"])
-        unreachable_nodes = len(self._connect_errors)
-
-        bgp_total = 0
-        bgp_established = 0
-        bgp_down = 0
-
-        itf_total = 0
-        itf_down = 0
-        itf_errors = 0
-
-        bd_instances_list: List[Dict[str, Any]] = []
-        router_instances_list: List[Dict[str, Any]] = []
-
-        def _clean_val(v: Any) -> str:
-            if not v:
-                return ""
-            s = str(v).lower()
-            return s.split(":")[-1]
-
         with self._lock:
-            for name in names:
-                stream = self._streams.get(name)
-                if stream is None:
-                    continue
-                with stream._lock:
-                    itf_node = stream._tree.get("interface")
-                    itfs = materialize(itf_node) if itf_node is not None else None
-                    ni_node = stream._tree.get("network-instance")
-                    nis = materialize(ni_node) if ni_node is not None else None
+            streams = [self._streams[n] for n in names if n in self._streams]
+            unreachable_nodes = len(self._connect_errors)
+            cached_tables = len(self._table_cache)
+            all_streams = list(self._streams.values())
 
-                if itfs is not None:
-                    if isinstance(itfs, list):
-                        for item in itfs:
-                            if isinstance(item, dict):
-                                admin = _clean_val(item.get("admin-state"))
-                                if admin in ("disable", "disabled"):
-                                    continue
-                                subitfs = item.get("subinterface", [])
-                                has_subitfs = len(subitfs) > 0 if isinstance(subitfs, list) else bool(subitfs)
-                                has_desc = bool(item.get("description"))
-                                eth_cfg = item.get("ethernet", {})
-                                has_lag = bool(eth_cfg.get("aggregate-id")) if isinstance(eth_cfg, dict) else False
-                                itf_name = str(item.get("name", ""))
-                                is_sys = itf_name.startswith(("mgmt", "system", "lo", "lag"))
-                                oper_st = _clean_val(item.get("oper-state"))
-
-                                is_configured = (
-                                    oper_st == "up"
-                                    or is_sys
-                                    or has_subitfs
-                                    or has_desc
-                                    or has_lag
-                                )
-                                if not is_configured:
-                                    continue
-                                itf_total += 1
-                                if oper_st == "down":
-                                    itf_down += 1
-                                stats = item.get("statistics", {})
-                                if isinstance(stats, dict):
-                                    err_cnt = (
-                                        int(stats.get("in-error-packets", 0) or 0)
-                                        + int(stats.get("out-error-packets", 0) or 0)
-                                        + int(stats.get("in-discarded-packets", 0) or 0)
-                                        + int(stats.get("out-discarded-packets", 0) or 0)
-                                    )
-                                    if err_cnt > 0:
-                                        itf_errors += 1
-
-                if nis is not None:
-                    if isinstance(nis, list):
-                        for ni in nis:
-                            if not isinstance(ni, dict):
-                                continue
-                            ni_name = str(ni.get("name", ""))
-                            ni_type = _clean_val(ni.get("type"))
-                            oper_state = _clean_val(ni.get("oper-state")) or "unknown"
-
-                            bgp = ni.get("protocols", {}).get("bgp", {})
-                            for nbr in bgp.get("neighbor", []):
-                                if isinstance(nbr, dict):
-                                    bgp_total += 1
-                                    state = _clean_val(nbr.get("session-state"))
-                                    if state == "established":
-                                        bgp_established += 1
-                                    else:
-                                        bgp_down += 1
-
-                            bgp_vpn = ni.get("protocols", {}).get("bgp-vpn", {})
-                            bgp_instances = bgp_vpn.get("bgp-instance", [])
-                            if isinstance(bgp_instances, dict):
-                                bgp_instances = [bgp_instances]
-                            rts = set()
-                            for inst in bgp_instances:
-                                if isinstance(inst, dict):
-                                    rt_cfg = inst.get("route-target", {})
-                                    if isinstance(rt_cfg, dict):
-                                        for key in ("import-rt", "export-rt"):
-                                            rts_raw = rt_cfg.get(key, [])
-                                            if isinstance(rts_raw, (str, dict)):
-                                                rts_raw = [rts_raw]
-                                            for item in rts_raw:
-                                                target = item.get("target") if isinstance(item, dict) else item
-                                                if target:
-                                                    t_str = str(target)
-                                                    if not t_str.startswith("target:"):
-                                                        t_str = f"target:{t_str}"
-                                                    rts.add(t_str)
-                            rt_list = sorted(list(rts))
-
-                            # Determine effective_ni_state incorporating sub-interfaces
-                            sub_states = []
-                            for i in ni.get("interface", []):
-                                if isinstance(i, dict) and i.get("name"):
-                                    i_name = str(i["name"])
-                                    if itfs and isinstance(itfs, list):
-                                        for itf_item in itfs:
-                                            if isinstance(itf_item, dict) and itf_item.get("name") == i_name:
-                                                op = _clean_val(itf_item.get("oper-state"))
-                                                if op:
-                                                    sub_states.append(op)
-
-                            if oper_state == "down":
-                                effective_ni_state = "down"
-                            elif sub_states:
-                                up_cnt = sum(1 for s in sub_states if s in ("up", "enable", "enabled", "active"))
-                                down_cnt = sum(1 for s in sub_states if s in ("down", "disable", "disabled"))
-                                if up_cnt == len(sub_states):
-                                    effective_ni_state = "up"
-                                elif down_cnt == len(sub_states):
-                                    effective_ni_state = "down"
-                                else:
-                                    effective_ni_state = "degraded"
-                            else:
-                                effective_ni_state = oper_state
-
-                            if ni_type == "mac-vrf":
-                                primary_bd = rt_list[0] if rt_list else f"mac-vrf:{ni_name}"
-                                bd_instances_list.append({
-                                    "name": primary_bd,
-                                    "oper_state": effective_ni_state,
-                                })
-                            elif ni_type in ("ip-vrf", "vrf") and ni_name != "mgmt":
-                                primary_router = rt_list[0] if rt_list else f"ip-vrf:{ni_name}"
-                                router_instances_list.append({
-                                    "name": primary_router,
-                                    "oper_state": effective_ni_state,
-                                })
-
-        # Aggregate Bridge Domains
-        bd_map: Dict[str, List[str]] = {}
-        for item in bd_instances_list:
-            bd_map.setdefault(item["name"], []).append(item["oper_state"])
-
-        bd_up = 0
-        bd_degraded = 0
-        bd_down = 0
-        for _bd_name, st_list in bd_map.items():
-            up_cnt = sum(1 for s in st_list if s in ("up", "enable", "enabled", "active", "established"))
-            if up_cnt == len(st_list):
-                bd_up += 1
-            elif up_cnt == 0:
-                bd_down += 1
-            else:
-                bd_degraded += 1
-
-        # Aggregate Routers
-        router_map: Dict[str, List[str]] = {}
-        for item in router_instances_list:
-            router_map.setdefault(item["name"], []).append(item["oper_state"])
-
-        r_up = 0
-        r_degraded = 0
-        r_down = 0
-        for _r_name, st_list in router_map.items():
-            up_cnt = sum(1 for s in st_list if s in ("up", "enable", "enabled", "active", "established"))
-            if up_cnt == len(st_list):
-                r_up += 1
-            elif up_cnt == 0:
-                r_down += 1
-            else:
-                r_degraded += 1
+        # Each snapshot is taken under its own node's lock and nothing else, so
+        # summarizing the fabric does not stall the renders of every report on it.
+        health = _Health()
+        for stream in streams:
+            snapshot = stream.snapshot_roots(_OVERVIEW_ROOTS)
+            itfs = snapshot.get("interface")
+            _tally_interfaces(health, itfs)
+            _tally_network_instances(health, snapshot.get("network-instance"), itfs)
 
         return {
             "nodes": {
-                "total": total_nodes,
-                "connected": connected_nodes,
-                "streaming": streaming_nodes,
+                "total": len(hosts),
+                "connected": sum(1 for h in hosts if h["connected"]),
+                "streaming": sum(1 for h in hosts if h["streaming"]),
                 "unreachable": unreachable_nodes,
             },
             "bgp": {
-                "total": bgp_total,
-                "established": bgp_established,
-                "down": bgp_down,
+                "total": health.bgp_total,
+                "established": health.bgp_established,
+                "down": health.bgp_down,
             },
             "interfaces": {
-                "total": itf_total,
-                "down": itf_down,
-                "errors": itf_errors,
+                "total": health.itf_total,
+                "down": health.itf_down,
+                "errors": health.itf_errors,
             },
-            "bridge_domains": {
-                "total": len(bd_map),
-                "up": bd_up,
-                "degraded": bd_degraded,
-                "down": bd_down,
-                "instances": len(bd_instances_list),
-            },
-            "routers": {
-                "total": len(router_map),
-                "up": r_up,
-                "degraded": r_degraded,
-                "down": r_down,
-                "instances": len(router_instances_list),
-            },
+            "bridge_domains": _roll_up(health.bridge_domains),
+            "routers": _roll_up(health.routers),
             "telemetry": {
-                "subscriptions": sum(len(s.status()["paths"]) for s in self._streams.values()),
+                "subscriptions": sum(len(s.status()["paths"]) for s in all_streams),
                 "resync_interval": self.resync_interval,
-                "cached_tables": len(self._table_cache),
+                "cached_tables": cached_tables,
             },
         }
+
+
+#: Tree roots the overview summarizes.
+_OVERVIEW_ROOTS: Tuple[str, ...] = ("interface", "network-instance")
+
+#: Cap on cached rendered tables, evicting the oldest beyond it.
+_MAX_CACHED_TABLES = 256
+
+_UP_STATES = frozenset({"up", "enable", "enabled", "active"})
+_DOWN_STATES = frozenset({"down", "disable", "disabled"})
+#: A network-instance reports itself established rather than up.
+_MEMBER_UP_STATES = _UP_STATES | {"established"}
+
+_ERROR_COUNTERS: Tuple[str, ...] = (
+    "in-error-packets",
+    "out-error-packets",
+    "in-discarded-packets",
+    "out-discarded-packets",
+)
+
+
+@dataclass
+class _Health:
+    """Tallies accumulated across the nodes of the fabric."""
+
+    bgp_total: int = 0
+    bgp_established: int = 0
+    bgp_down: int = 0
+    itf_total: int = 0
+    itf_down: int = 0
+    itf_errors: int = 0
+    #: (service name, state) per node, rolled up by :func:`_roll_up`.
+    bridge_domains: List[Tuple[str, str]] = field(default_factory=list)
+    routers: List[Tuple[str, str]] = field(default_factory=list)
+
+
+def _leaf(value: Any) -> str:
+    """Normalize a YANG enum leaf to its bare, lower-case value."""
+    if not value:
+        return ""
+    return str(value).lower().split(":")[-1]
+
+
+def _is_configured(itf: Dict[str, Any], oper_state: str) -> bool:
+    """Whether an interface is in use, and so worth counting as healthy or not.
+
+    Most ports of a fabric leaf are never patched, and an unused port is down by
+    definition; counting those as faults would bury the ones that matter. A port
+    counts once anything says it is meant to carry traffic.
+    """
+    name = str(itf.get("name", ""))
+    if name.startswith(("mgmt", "system", "lo", "lag")):
+        return True
+    if oper_state == "up" or itf.get("description"):
+        return True
+    subinterfaces = itf.get("subinterface", [])
+    if subinterfaces:
+        return True
+    ethernet = itf.get("ethernet", {})
+    return isinstance(ethernet, dict) and bool(ethernet.get("aggregate-id"))
+
+
+def _tally_interfaces(health: _Health, itfs: Any) -> None:
+    """Count the configured interfaces of one node by health."""
+    if not isinstance(itfs, list):
+        return
+    for itf in itfs:
+        if not isinstance(itf, dict):
+            continue
+        if _leaf(itf.get("admin-state")) in _DOWN_STATES:
+            continue
+        oper_state = _leaf(itf.get("oper-state"))
+        if not _is_configured(itf, oper_state):
+            continue
+        health.itf_total += 1
+        if oper_state == "down":
+            health.itf_down += 1
+        stats = itf.get("statistics", {})
+        if not isinstance(stats, dict):
+            continue
+        errors = 0
+        for counter in _ERROR_COUNTERS:
+            try:
+                errors += int(stats.get(counter, 0) or 0)
+            except (TypeError, ValueError):
+                continue
+        if errors > 0:
+            health.itf_errors += 1
+
+
+def _route_targets(ni: Dict[str, Any]) -> List[str]:
+    """The route-targets of a network-instance, as ``target:x:y`` strings."""
+    instances = _branch(ni, "protocols", "bgp-vpn").get("bgp-instance", [])
+    if isinstance(instances, dict):
+        instances = [instances]
+    if not isinstance(instances, list):
+        return []
+    targets = set()
+    for instance in instances:
+        if not isinstance(instance, dict):
+            continue
+        config = instance.get("route-target", {})
+        if not isinstance(config, dict):
+            continue
+        for key in ("import-rt", "export-rt"):
+            raw = config.get(key, [])
+            if isinstance(raw, (str, dict)):
+                raw = [raw]
+            if not isinstance(raw, list):
+                continue
+            for item in raw:
+                target = item.get("target") if isinstance(item, dict) else item
+                if not target:
+                    continue
+                text = str(target)
+                targets.add(text if text.startswith("target:") else f"target:{text}")
+    return sorted(targets)
+
+
+def _branch(node: Any, *names: str) -> Dict[str, Any]:
+    """Descend through nested containers, yielding ``{}`` at the first miss."""
+    for name in names:
+        if not isinstance(node, dict):
+            return {}
+        node = node.get(name, {})
+    return node if isinstance(node, dict) else {}
+
+
+def _effective_state(ni: Dict[str, Any], oper_state: str, itf_states: Dict[str, str]) -> str:
+    """The state of a network-instance, refined by the interfaces attached to it.
+
+    A network-instance reports itself up while some of the interfaces placed in
+    it are down, which is what 'degraded' is for: the service exists on the node
+    but is not carrying everything it was meant to.
+    """
+    if oper_state == "down":
+        return "down"
+    attached = ni.get("interface", [])
+    if not isinstance(attached, list):
+        return oper_state
+    states = [
+        state
+        for state in (
+            itf_states.get(str(itf.get("name", "")))
+            for itf in attached
+            if isinstance(itf, dict) and itf.get("name")
+        )
+        if state
+    ]
+    if not states:
+        return oper_state
+    if all(state in _UP_STATES for state in states):
+        return "up"
+    if all(state in _DOWN_STATES for state in states):
+        return "down"
+    return "degraded"
+
+
+def _tally_network_instances(health: _Health, nis: Any, itfs: Any) -> None:
+    """Count BGP sessions and record the services of one node."""
+    if not isinstance(nis, list):
+        return
+    itf_states: Dict[str, str] = {}
+    if isinstance(itfs, list):
+        for itf in itfs:
+            if isinstance(itf, dict) and itf.get("name"):
+                state = _leaf(itf.get("oper-state"))
+                if state:
+                    itf_states[str(itf["name"])] = state
+    for ni in nis:
+        if not isinstance(ni, dict):
+            continue
+        name = str(ni.get("name", ""))
+        ni_type = _leaf(ni.get("type"))
+        oper_state = _leaf(ni.get("oper-state")) or "unknown"
+
+        neighbors = _branch(ni, "protocols", "bgp").get("neighbor", [])
+        if isinstance(neighbors, list):
+            for neighbor in neighbors:
+                if not isinstance(neighbor, dict):
+                    continue
+                health.bgp_total += 1
+                if _leaf(neighbor.get("session-state")) == "established":
+                    health.bgp_established += 1
+                else:
+                    health.bgp_down += 1
+
+        state = _effective_state(ni, oper_state, itf_states)
+        targets = _route_targets(ni)
+        # A service spans nodes, and its route-target is what identifies it
+        # across them; the local name is only a fallback for an unnamed one.
+        if ni_type == "mac-vrf":
+            health.bridge_domains.append(
+                (targets[0] if targets else f"mac-vrf:{name}", state)
+            )
+        elif ni_type in ("ip-vrf", "vrf") and name != "mgmt":
+            health.routers.append(
+                (targets[0] if targets else f"ip-vrf:{name}", state)
+            )
+
+
+def _roll_up(instances: List[Tuple[str, str]]) -> Dict[str, int]:
+    """Group per-node service instances into fabric-wide service health."""
+    by_name: Dict[str, List[str]] = {}
+    for name, state in instances:
+        by_name.setdefault(name, []).append(state)
+    up = degraded = down = 0
+    for states in by_name.values():
+        up_count = sum(1 for s in states if s in _MEMBER_UP_STATES)
+        if up_count == len(states):
+            up += 1
+        elif up_count == 0:
+            down += 1
+        else:
+            degraded += 1
+    return {
+        "total": len(by_name),
+        "up": up,
+        "degraded": degraded,
+        "down": down,
+        "instances": len(instances),
+    }
 
 
 def _cell(value: Any) -> Any:

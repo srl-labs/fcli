@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+from .helpers import as_list, first_payload
+
 
 class InterfaceStatsMixin:
     """Mixin providing interface traffic-rate statistics."""
@@ -41,7 +43,7 @@ class InterfaceStatsMixin:
         # Build lookup: interface-name -> counters for each sample
         def _parse(resp: List[Dict[str, Any]]) -> Dict[str, Dict[str, int]]:
             result: Dict[str, Dict[str, int]] = {}
-            for itf in resp[0].get("interface", []):
+            for itf in as_list(first_payload(resp).get("interface")):
                 name = itf.get("name", "")
                 stats = itf.get("statistics", {})
                 result[name] = {
@@ -60,17 +62,22 @@ class InterfaceStatsMixin:
         s2 = _parse(resp2)
 
         rows: List[Dict[str, Any]] = []
+
+        def _delta(name: str, counter: str) -> int:
+            # A counter that went backwards was reset (or the interface was
+            # re-created) between the two samples; a negative rate is never a
+            # truthful reading of that, so report no traffic for this interval.
+            return max(s2[name][counter] - s1[name][counter], 0)
+
         for name in sorted(s2.keys()):
             if name not in s1:
                 continue
-            d_in = s2[name]["in-octets"] - s1[name]["in-octets"]
-            d_out = s2[name]["out-octets"] - s1[name]["out-octets"]
-            in_bps = round(d_in * 8 / dt)
-            out_bps = round(d_out * 8 / dt)
-            in_err = s2[name]["in-errors"] - s1[name]["in-errors"]
-            out_err = s2[name]["out-errors"] - s1[name]["out-errors"]
-            in_disc = s2[name]["in-discards"] - s1[name]["in-discards"]
-            out_disc = s2[name]["out-discards"] - s1[name]["out-discards"]
+            in_bps = round(_delta(name, "in-octets") * 8 / dt)
+            out_bps = round(_delta(name, "out-octets") * 8 / dt)
+            in_err = _delta(name, "in-errors")
+            out_err = _delta(name, "out-errors")
+            in_disc = _delta(name, "in-discards")
+            out_disc = _delta(name, "out-discards")
             # Cumulative counters are always reported (even for idle interfaces)
             # so tests and agents can read raw packet/octet totals.
             rows.append(
