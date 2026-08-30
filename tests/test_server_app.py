@@ -13,10 +13,19 @@ from starlette.testclient import TestClient
 
 from nornir_srl.reports import SERVER, get_report, reports_for
 from nornir_srl.rows import flatten, get_fields, is_scalar
-from nornir_srl.server.app import create_app, parse_kv, table_digest, table_events
+from nornir_srl.server.app import (
+    ASSET_TOKEN,
+    asset_version,
+    create_app,
+    parse_kv,
+    table_digest,
+    table_events,
+)
 from nornir_srl.server.store import FabricStore
 
 from .fakes import (
+    ES_PATH,
+    HOSTNAME_PATH,
     IFADMIN_PATH,
     IFADMIN_RESPONSE,
     IFSTATE_PATH,
@@ -27,6 +36,8 @@ from .fakes import (
     LLDP_RESPONSE,
     SYS_INFO_RESPONSES,
     FakeDevice,
+    es_response,
+    hostname_response,
     wait_for,
 )
 
@@ -41,10 +52,15 @@ HOSTS = {
     "spine1": {"hostname": "spine1", "platform": "srlinux", "data": {"role": "spine"}},
 }
 
+#: The segment both fake nodes report on lag1, as a multi-homing pair does.
+ES_ESI = "00:00:00:00:01:01:01:01:01:01"
 
-def _responses():
+
+def _responses(name="leaf1"):
     return {
         LLDP_PATH: LLDP_RESPONSE,
+        HOSTNAME_PATH: hostname_response(name),
+        ES_PATH: es_response("mh-1", ES_ESI, "lag1"),
         IFSTATS_PATH: IFSTATS_RESPONSE,
         IFSTATE_PATH: IFSTATE_RESPONSE,
         IFADMIN_PATH: IFADMIN_RESPONSE,
@@ -89,7 +105,7 @@ def fabric(monkeypatch):
             runner={"plugin": "serial"},
             logging={"enabled": False},
         )
-        devices = {name: FakeDevice(_responses()) for name in HOSTS}
+        devices = {name: FakeDevice(_responses(name)) for name in HOSTS}
         monkeypatch.setattr(
             "nornir.core.inventory.Host.get_connection",
             lambda self, name, config: devices[self.name],
@@ -583,6 +599,25 @@ def test_static_assets_are_served(client):
     assert test_client.get("/static/style.css").status_code == 200
 
 
+def test_the_page_is_never_cached_and_its_assets_are_fingerprinted(client):
+    test_client, _devices = client
+    response = test_client.get("/")
+    assert response.headers["cache-control"] == "no-cache"
+    assert ASSET_TOKEN not in response.text
+    assert f"/static/app.js?v={asset_version()}" in response.text
+    assert f"/static/style.css?v={asset_version()}" in response.text
+
+
+def test_the_asset_version_follows_the_assets(tmp_path, monkeypatch):
+    monkeypatch.setattr("nornir_srl.server.app.STATIC_DIR", tmp_path)
+    (tmp_path / "app.js").write_text("//")
+    (tmp_path / "style.css").write_text("/**/")
+    before = asset_version()
+
+    os.utime(tmp_path / "app.js", ns=(0, 2_000_000_000_000_000_000))
+    assert asset_version() != before
+
+
 def test_reports_endpoint_lists_every_report(client):
     test_client, _devices = client
     payload = test_client.get("/api/reports").json()
@@ -717,6 +752,139 @@ def test_store_overview_method(store):
     assert isinstance(data["telemetry"]["subscriptions"], int)
     assert isinstance(data["bridge_domains"]["total"], int)
     assert isinstance(data["routers"]["total"], int)
+
+
+def _push_services(stream, *instances):
+    """Give a node the network-instance state the topology classifies it on."""
+    stream._tree["network-instance"] = list(instances)
+
+
+def _mac_vrf(*route_targets):
+    return {
+        "name": "mac-vrf-100",
+        "type": "mac-vrf",
+        "protocols": {
+            "bgp-vpn": {
+                "bgp-instance": [
+                    {"id": index, "route-target": {"export-rt": rt, "import-rt": rt}}
+                    for index, rt in enumerate(route_targets, start=1)
+                ]
+            }
+        },
+    }
+
+
+def test_topology_endpoint(client):
+    test_client, _devices = client
+    resp = test_client.get("/api/topology")
+    assert resp.status_code == 200
+    graph = resp.json()
+    assert {n["name"] for n in graph["nodes"]} >= set(HOSTS)
+    assert any({link["a"], link["b"]} == {"leaf1", "spine1"} for link in graph["links"])
+    # Both nodes advertise a neighbour the inventory does not have.
+    assert graph["unresolved"] == [{"peer": "spine2", "seen_by": ["leaf1", "spine1"]}]
+
+
+def test_topology_endpoint_honours_the_inventory_filter(client):
+    test_client, _devices = client
+    graph = test_client.get("/api/topology?inv_filter=role%3Dspine").json()
+    assert {n["name"] for n in graph["nodes"] if not n["external"]} == {"spine1"}
+
+
+def test_topology_subscribes_to_lldp_and_the_services(store):
+    fabric_store, devices = store
+    fabric_store.topology()
+    assert wait_for(lambda: devices["leaf1"].subscribe_requests)
+    streamed = [s["path"] for s in devices["leaf1"].subscribe_requests[-1]["subscription"]]
+    assert LLDP_PATH in streamed
+    assert HOSTNAME_PATH in streamed
+    # The service paths are registered as well; this fake node answers nothing
+    # for them, which leaves them pending rather than streaming.
+    registered = {p["path"] for p in fabric_store._streams["leaf1"].status()["paths"]}
+    assert "/network-instance[name=*]/type" in registered
+    assert "/network-instance[name=*]/protocols/bgp-vpn" in registered
+    assert "/network-instance[name=*]/interface" in registered
+    assert "/system/network-instance/protocols/evpn/ethernet-segments" in registered
+
+
+def test_topology_infers_the_tier_from_the_services_of_a_node(store):
+    fabric_store, _devices = store
+    fabric_store.topology()
+    _push_services(
+        fabric_store._streams["leaf1"],
+        {"name": "default", "type": "default"},
+        _mac_vrf("target:100:100"),
+    )
+    _push_services(
+        fabric_store._streams["spine1"], {"name": "default", "type": "default"}
+    )
+    graph = fabric_store.topology()
+    roles = {n["name"]: n["role"] for n in graph["nodes"]}
+    assert roles["leaf1"] == "leaf"
+    # spine1 runs no services and leaf1 reports it as a neighbour.
+    assert roles["spine1"] == "spine"
+    assert [layer["index"] for layer in graph["layers"]] == [4, 3, 2]
+
+
+def test_topology_marks_a_stitched_service_as_a_gateway(store):
+    fabric_store, _devices = store
+    fabric_store.topology()
+    _push_services(
+        fabric_store._streams["leaf1"],
+        {"name": "default", "type": "default"},
+        _mac_vrf("target:100:100", "target:64500:100"),
+    )
+    graph = fabric_store.topology()
+    leaf1 = next(n for n in graph["nodes"] if n["name"] == "leaf1")
+    assert leaf1["role"] == "dcgw"
+    assert leaf1["stitched"] == 1
+
+
+def test_topology_hangs_a_client_off_the_port_a_service_is_bound_to(store):
+    fabric_store, _devices = store
+    fabric_store.topology()
+    mac_vrf = _mac_vrf("target:100:100")
+    mac_vrf["interface"] = [{"name": "irb0.100"}, {"name": "ethernet-1/10.100"}]
+    _push_services(
+        fabric_store._streams["leaf1"], {"name": "default", "type": "default"}, mac_vrf
+    )
+    graph = fabric_store.topology()
+    client = next(n for n in graph["nodes"] if n["role"] == "client")
+    assert (client["name"], client["layer"]) == ("leaf1:ethernet-1/10", 0)
+    assert client["peers"] == ["leaf1"]
+    assert client["services"] == ["mac-vrf-100"]
+    assert graph["layers"][-1]["label"] == "Clients"
+    leaf1 = next(n for n in graph["nodes"] if n["name"] == "leaf1")
+    assert leaf1["clients"] == 1
+
+
+def test_topology_merges_a_multi_homed_client_by_its_ethernet_segment(store):
+    """The ESI has to survive the trip from the Get through the streamed tree."""
+    fabric_store, _devices = store
+    fabric_store.topology()
+    for name in HOSTS:
+        mac_vrf = _mac_vrf("target:100:100")
+        mac_vrf["interface"] = [{"name": "lag1.100"}]
+        _push_services(
+            fabric_store._streams[name], {"name": "default", "type": "default"}, mac_vrf
+        )
+    graph = fabric_store.topology()
+    clients = [n for n in graph["nodes"] if n["role"] == "client"]
+    assert len(clients) == 1
+    assert clients[0]["name"] == ES_ESI
+    # It hangs off the one bundle, which is what spans the two nodes.
+    segment = next(n for n in graph["nodes"] if n["role"] == "segment")
+    assert (segment["label"], segment["esi"]) == ("ES 01:01", ES_ESI)
+    assert segment["names"] == ["mh-1"]
+    assert segment["peers"] == [ES_ESI, "leaf1", "spine1"]
+    assert clients[0]["peers"] == [segment["name"]]
+
+
+def test_topology_keeps_a_node_that_has_streamed_nothing(store):
+    fabric_store, _devices = store
+    graph = fabric_store.topology()
+    assert {n["role"] for n in graph["nodes"] if n["name"] in HOSTS} == {"unknown"}
+    assert all(n["connected"] for n in graph["nodes"] if n["name"] in HOSTS)
 
 
 @pytest.mark.anyio

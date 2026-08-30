@@ -43,6 +43,12 @@
     errors: el("errors"),
     tableWrap: el("table-wrap"),
     overviewDashboard: el("overview-dashboard"),
+    topologyView: el("topology-view"),
+    topoCanvas: el("topo-canvas"),
+    topoLegend: el("topo-legend"),
+    topoStats: el("topo-stats"),
+    topoDetail: el("topo-detail"),
+    topoPortLabels: el("topo-port-labels"),
     servicesTreeView: el("services-tree-view"),
     viewModeBtn: el("view-mode-btn"),
     headRow: el("head-row"),
@@ -101,6 +107,9 @@
     identityColumn: null,
     firstPaint: true,
     viewMode: "tree",
+    topology: null,
+    topoSelection: null,
+    topoKey: "",
     collapsedCards: new Set(),
     collapsedNodes: new Set(),
     navStack: [],
@@ -108,6 +117,7 @@
   };
 
   let overviewTimer = null;
+  let topologyTimer = null;
   let navSeq = 0;
 
   /* ------------------------------------------------------------ helpers */
@@ -135,6 +145,9 @@
   const isNumeric = (value) =>
     value !== "" && value !== null && value !== undefined && !isNaN(Number(value));
 
+  /** Reports the server computes for a panel of their own, not as a table. */
+  const isPanelReport = (name) => name === "overview" || name === "topology";
+
   /** Natural compare, so ethernet-1/10 sorts after ethernet-1/2. */
   const collator = new Intl.Collator(undefined, {
     numeric: true,
@@ -149,7 +162,7 @@
   /* ------------------------------------------------ persistence */
 
   function saveReportPreferences() {
-    if (!state.report || state.report.name === "overview") return;
+    if (!state.report || isPanelReport(state.report.name)) return;
     try {
       localStorage.setItem(
         `fcli-hidden-${state.report.name}`,
@@ -168,7 +181,7 @@
   }
 
   function loadReportPreferences() {
-    if (!state.report || state.report.name === "overview") return;
+    if (!state.report || isPanelReport(state.report.name)) return;
     state.hidden.clear();
     state.colFilters.clear();
     try {
@@ -210,9 +223,9 @@
     updateFilterUI();
     renderHead();
     renderBody();
-    if (state.report && state.report.name !== "overview") {
-      connect();
-    }
+    if (!state.report) return;
+    if (state.report.name === "topology") loadTopology();
+    else if (state.report.name !== "overview") connect();
   }
 
   /* --------------------------------------------------------- report list */
@@ -394,6 +407,600 @@
     }
   }
 
+  /* ------------------------------------------------------------- topology */
+
+  const SVG_NS = "http://www.w3.org/2000/svg";
+
+  /** Create an SVG element with its attributes in one call. */
+  function svgEl(name, attrs) {
+    const node = document.createElementNS(SVG_NS, name);
+    for (const key in attrs || {}) node.setAttribute(key, attrs[key]);
+    return node;
+  }
+
+  const ROLE_LABELS = {
+    client: "Client",
+    segment: "Ethernet segment",
+    leaf: "Leaf",
+    spine: "Spine",
+    dcgw: "DCGW",
+    core: "WAN / core",
+    unknown: "Unclassified",
+    external: "Outside inventory",
+  };
+
+  const TOPO = {
+    nodeHeight: 46,
+    minNodeWidth: 96,
+    gapX: 26,
+    siteGap: 30,
+    rowHeight: 122,
+    padLeft: 124, // room for the tier label down the left edge
+    padRight: 28,
+    padY: 24,
+  };
+
+  const shortPort = (port) => String(port || "").replace(/^ethernet-/, "e");
+
+  async function loadTopology() {
+    if (!state.report || state.report.name !== "topology" || state.paused) return;
+    try {
+      const inv = dom.invFilter.value.trim();
+      const params = new URLSearchParams();
+      if (inv) params.set("inv_filter", inv);
+      const res = await fetch("/api/topology" + (inv ? `?${params}` : ""));
+      const graph = await res.json();
+      setLive("live", "live");
+      dom.rowCount.textContent = `${graph.nodes.length} node(s), ${graph.links.length} link(s)`;
+      dom.streamInfo.textContent = `LLDP topology, rendered in ${graph.render_ms} ms`;
+      dom.updated.textContent = "updated " + new Date().toLocaleTimeString();
+      // Re-drawing would drop the hover and lose the scroll position, and a
+      // fabric changes far less often than it is polled.
+      const key = JSON.stringify(graph.nodes) + JSON.stringify(graph.links);
+      if (key === state.topoKey) return;
+      state.topoKey = key;
+      state.topology = graph;
+      renderTopology(graph);
+    } catch (_err) {
+      setLive("error", "error");
+    }
+  }
+
+  /** Place every node on the tier its role puts it in, one row per tier. */
+  function layoutTopology(graph) {
+    const byName = new Map(graph.nodes.map((node) => [node.name, node]));
+    const rows = [];
+    let widest = 0;
+    for (const layer of graph.layers) {
+      const nodes = layer.nodes.map((name) => byName.get(name)).filter(Boolean);
+      let width = 0;
+      let site = null;
+      const sized = nodes.map((node) => {
+        // Wide enough for whichever of the two lines in the box is the longer.
+        const text = Math.max(node.label.length * 8, topoNodeSub(node).length * 6.2);
+        const w = Math.max(TOPO.minNodeWidth, text + 28);
+        if (width) width += TOPO.gapX;
+        if (site !== null && node.site !== site) width += TOPO.siteGap - TOPO.gapX;
+        site = node.site;
+        const placed = { node, w, offset: width };
+        width += w;
+        return placed;
+      });
+      widest = Math.max(widest, width);
+      rows.push({ layer, nodes: sized, width });
+    }
+
+    const canvasWidth = TOPO.padLeft + widest + TOPO.padRight;
+    const positions = new Map();
+    rows.forEach((row, index) => {
+      const y = TOPO.padY + index * TOPO.rowHeight;
+      const start = TOPO.padLeft + (widest - row.width) / 2;
+      row.y = y;
+      for (const placed of row.nodes) {
+        const x = start + placed.offset;
+        positions.set(placed.node.name, {
+          x,
+          y,
+          w: placed.w,
+          h: TOPO.nodeHeight,
+          cx: x + placed.w / 2,
+          cy: y + TOPO.nodeHeight / 2,
+        });
+      }
+    });
+
+    return {
+      rows,
+      positions,
+      width: canvasWidth,
+      height: TOPO.padY * 2 + rows.length * TOPO.rowHeight,
+    };
+  }
+
+  function renderTopology(graph) {
+    dom.topoCanvas.replaceChildren();
+    renderTopoLegend(graph);
+    dom.topoStats.textContent = topoSummary(graph);
+    if (!graph.nodes.length) {
+      const empty = document.createElement("p");
+      empty.className = "empty";
+      empty.textContent = "No nodes are streaming LLDP yet.";
+      dom.topoCanvas.append(empty);
+      return;
+    }
+
+    const layout = layoutTopology(graph);
+    const svg = svgEl("svg", {
+      class: "topo-svg",
+      viewBox: `0 0 ${layout.width} ${layout.height}`,
+      width: layout.width,
+      height: layout.height,
+      role: "img",
+      "aria-label": "Fabric topology",
+    });
+
+    const bands = svgEl("g", { class: "topo-bands" });
+    for (const row of layout.rows) {
+      bands.append(
+        svgEl("rect", {
+          class: "topo-band",
+          x: 8,
+          y: row.y - 18,
+          width: layout.width - 16,
+          height: TOPO.nodeHeight + 36,
+          rx: 10,
+        })
+      );
+      const label = svgEl("text", {
+        class: "topo-band-label",
+        x: 20,
+        y: row.y + TOPO.nodeHeight / 2 + 4,
+      });
+      label.textContent = row.layer.label;
+      bands.append(label);
+    }
+    svg.append(bands);
+
+    svg.append(renderTopoLinks(graph, layout));
+    svg.append(renderTopoNodes(graph, layout));
+    dom.topoCanvas.append(svg);
+
+    svg.addEventListener("mouseover", (event) => {
+      const target = event.target.closest("[data-node]");
+      highlightTopo(target ? target.dataset.node : null);
+    });
+    svg.addEventListener("mouseleave", () => highlightTopo(null));
+    svg.addEventListener("click", (event) => {
+      const node = event.target.closest("[data-node]");
+      const link = event.target.closest("[data-link]");
+      if (node) selectTopo({ kind: "node", id: node.dataset.node });
+      else if (link) selectTopo({ kind: "link", id: link.dataset.link });
+      else selectTopo(null);
+    });
+
+    applyTopoSelection();
+  }
+
+  function renderTopoLinks(graph, layout) {
+    const group = svgEl("g", { class: "topo-links" });
+    for (const link of graph.links) {
+      const a = layout.positions.get(link.a);
+      const b = layout.positions.get(link.b);
+      if (!a || !b) continue;
+      const id = `${link.a}\u0000${link.b}`;
+      const aIsTop = a.y <= b.y;
+      const [top, bottom] = aIsTop ? [a, b] : [b, a];
+      const shape = link.intra_layer
+        ? svgEl("path", {
+            // An arc under the tier, so a DCGW mesh or a spine pair does not
+            // draw a line straight through the nodes between its ends.
+            d: `M ${a.cx} ${a.y + a.h} Q ${(a.cx + b.cx) / 2} ${a.y + a.h + 46} ${b.cx} ${b.y + b.h}`,
+            fill: "none",
+          })
+        : svgEl("line", {
+            x1: top.cx,
+            y1: top.y + top.h,
+            x2: bottom.cx,
+            y2: bottom.y,
+          });
+      shape.setAttribute(
+        "class",
+        `topo-link link-${link.state}${link.access ? " is-access" : ""}`
+      );
+      shape.setAttribute("data-link", id);
+      shape.setAttribute("data-a", link.a);
+      shape.setAttribute("data-b", link.b);
+      const title = svgEl("title");
+      title.textContent = topoLinkTitle(link);
+      shape.append(title);
+      group.append(shape);
+
+      if (link.count > 1) {
+        const badge = svgEl("text", {
+          class: "topo-link-count",
+          x: (a.cx + b.cx) / 2,
+          y: (a.cy + b.cy) / 2,
+          "text-anchor": "middle",
+        });
+        badge.textContent = `${link.count}\u00d7`;
+        group.append(badge);
+      }
+      // Only a single cable can be labelled without the two ends colliding;
+      // a bundle shows its size instead, and its ports in the detail panel.
+      if (dom.topoPortLabels.checked && !link.intra_layer && link.count === 1) {
+        const ports = link.ports[0];
+        group.append(
+          portLabel(top, bottom, 0.18, shortPort(aIsTop ? ports.a_port : ports.b_port)),
+          portLabel(top, bottom, 0.82, shortPort(aIsTop ? ports.b_port : ports.a_port))
+        );
+      }
+    }
+    return group;
+  }
+
+  /** A port name placed a fraction of the way down a link. */
+  function portLabel(top, bottom, fraction, text) {
+    const label = svgEl("text", {
+      class: "topo-port",
+      x: top.cx + (bottom.cx - top.cx) * fraction,
+      y: top.y + top.h + (bottom.y - top.y - top.h) * fraction,
+      "text-anchor": "middle",
+    });
+    label.textContent = text;
+    return label;
+  }
+
+  function renderTopoNodes(graph, layout) {
+    const group = svgEl("g", { class: "topo-nodes" });
+    for (const node of graph.nodes) {
+      const box = layout.positions.get(node.name);
+      if (!box) continue;
+      const cell = svgEl("g", {
+        class: `topo-node role-${node.role}${node.connected ? "" : " is-down"}`,
+        "data-node": node.name,
+        tabindex: "0",
+      });
+      cell.append(
+        svgEl("rect", { x: box.x, y: box.y, width: box.w, height: box.h, rx: 8 })
+      );
+      const label = svgEl("text", {
+        class: "topo-node-label",
+        x: box.cx,
+        y: box.y + 20,
+        "text-anchor": "middle",
+      });
+      label.textContent = node.label;
+      const sub = svgEl("text", {
+        class: "topo-node-sub",
+        x: box.cx,
+        y: box.y + 35,
+        "text-anchor": "middle",
+      });
+      sub.textContent = topoNodeSub(node);
+      const title = svgEl("title");
+      title.textContent = topoNodeTitle(node);
+      cell.append(label, sub, title);
+      group.append(cell);
+    }
+    return group;
+  }
+
+  function topoNodeSub(node) {
+    if (isTopoAttached(node)) {
+      // Being multi-homed is said before what is carried: the leaves under the
+      // box are the point of it being a single box.
+      const leaves = new Set(node.attachments.map((a) => a.node)).size;
+      if (leaves > 1) return `multi-homed, ${leaves} leaves`;
+      const services = node.services || [];
+      if (services.length === 1) return services[0];
+      if (services.length) return `${services.length} services`;
+      return `${node.ports} port(s)`;
+    }
+    if (node.mac_vrfs || node.ip_vrfs) {
+      const parts = [];
+      if (node.mac_vrfs) parts.push(`${node.mac_vrfs} mac`);
+      if (node.ip_vrfs) parts.push(`${node.ip_vrfs} ip`);
+      if (node.stitched) parts.push(`${node.stitched} gw`);
+      return parts.join(" · ");
+    }
+    return node.site || ROLE_LABELS[node.role] || node.role;
+  }
+
+  /** Whether a node is drawn from its attachments: a client or a segment. */
+  function isTopoAttached(node) {
+    return node.role === "client" || node.role === "segment";
+  }
+
+  function topoNodeTitle(node) {
+    const lines = [node.name, ROLE_LABELS[node.role] || node.role];
+    if (isTopoAttached(node)) {
+      for (const attachment of node.attachments || []) {
+        lines.push(attachmentText(attachment));
+      }
+      return lines.join(" - ");
+    }
+    if (node.site) lines.push(`site ${node.site}`);
+    if (node.mac_vrfs || node.ip_vrfs) {
+      lines.push(`${node.mac_vrfs} mac-vrf, ${node.ip_vrfs} ip-vrf`);
+    }
+    if (node.stitched) lines.push(`${node.stitched} stitched service(s)`);
+    if (node.clients) lines.push(`${node.clients} client(s)`);
+    if (node.error) lines.push(node.error);
+    return lines.join(" - ");
+  }
+
+  /** One attachment as a line: where it lands and what it carries. */
+  function attachmentText(attachment) {
+    const parts = [`${attachment.node} ${shortPort(attachment.subinterface)}`];
+    if (attachment.service) parts.push(attachment.service);
+    if (attachment.vlan) parts.push(`vlan ${attachment.vlan}`);
+    if (attachment.ip) parts.push(attachment.ip);
+    return parts.join(" · ");
+  }
+
+  function topoLinkTitle(link) {
+    const ports = link.ports
+      .map((pair) => cableText(pair.a_port, pair.b_port, "↔"))
+      .join(", ");
+    return `${link.a} ↔ ${link.b}${ports ? " (" + ports + ")" : ""}`;
+  }
+
+  /** Both ends of a cable, or the one end of it a client does not report. */
+  function cableText(near, far, arrow) {
+    if (!far) return shortPort(near);
+    if (!near) return shortPort(far);
+    return `${shortPort(near)} ${arrow} ${shortPort(far)}`;
+  }
+
+  function topoSummary(graph) {
+    const parts = [`${graph.nodes.length} nodes`, `${graph.links.length} links`];
+    if (graph.unresolved.length) {
+      parts.push(`${graph.unresolved.length} neighbour(s) outside the inventory`);
+    }
+    return parts.join(" · ");
+  }
+
+  function renderTopoLegend(graph) {
+    dom.topoLegend.replaceChildren();
+    const order = ["client", "segment", "leaf", "spine", "dcgw", "core", "unknown", "external"];
+    for (const role of order) {
+      const count = graph.roles[role];
+      if (!count) continue;
+      const chip = document.createElement("span");
+      chip.className = `topo-chip role-${role}`;
+      const swatch = document.createElement("span");
+      swatch.className = "topo-swatch";
+      const text = document.createElement("span");
+      text.textContent = `${ROLE_LABELS[role]} ${count}`;
+      chip.append(swatch, text);
+      dom.topoLegend.append(chip);
+    }
+  }
+
+  /** Dim everything that is not *name* and what it is cabled to. */
+  function highlightTopo(name) {
+    const svg = dom.topoCanvas.querySelector(".topo-svg");
+    if (!svg) return;
+    svg.querySelectorAll(".is-hot").forEach((node) => node.classList.remove("is-hot"));
+    if (!name) {
+      svg.classList.toggle("is-focused", Boolean(state.topoSelection));
+      if (state.topoSelection) applyTopoSelection();
+      return;
+    }
+    svg.classList.add("is-focused");
+    markTopoNode(svg, name);
+  }
+
+  function markTopoNode(svg, name) {
+    const node = svg.querySelector(`[data-node="${CSS.escape(name)}"]`);
+    if (node) node.classList.add("is-hot");
+    svg
+      .querySelectorAll(`[data-a="${CSS.escape(name)}"], [data-b="${CSS.escape(name)}"]`)
+      .forEach((link) => {
+        link.classList.add("is-hot");
+        const peer = link.dataset.a === name ? link.dataset.b : link.dataset.a;
+        const box = svg.querySelector(`[data-node="${CSS.escape(peer)}"]`);
+        if (box) box.classList.add("is-hot");
+      });
+  }
+
+  function selectTopo(selection) {
+    state.topoSelection = selection;
+    applyTopoSelection();
+  }
+
+  function applyTopoSelection() {
+    const svg = dom.topoCanvas.querySelector(".topo-svg");
+    if (!svg) return;
+    svg.querySelectorAll(".is-hot").forEach((node) => node.classList.remove("is-hot"));
+    const selection = state.topoSelection;
+    svg.classList.toggle("is-focused", Boolean(selection));
+    if (!selection) {
+      dom.topoDetail.hidden = true;
+      dom.topoDetail.replaceChildren();
+      return;
+    }
+    if (selection.kind === "node") {
+      markTopoNode(svg, selection.id);
+      renderTopoNodeDetail(selection.id);
+    } else {
+      const link = svg.querySelector(`[data-link="${CSS.escape(selection.id)}"]`);
+      if (link) {
+        link.classList.add("is-hot");
+        for (const end of [link.dataset.a, link.dataset.b]) {
+          const box = svg.querySelector(`[data-node="${CSS.escape(end)}"]`);
+          if (box) box.classList.add("is-hot");
+        }
+      }
+      renderTopoLinkDetail(selection.id);
+    }
+  }
+
+  function topoDetailShell(title, subtitle) {
+    dom.topoDetail.replaceChildren();
+    dom.topoDetail.hidden = false;
+    const head = document.createElement("header");
+    const heading = document.createElement("h2");
+    heading.textContent = title;
+    const close = document.createElement("button");
+    close.type = "button";
+    close.className = "btn btn-ghost";
+    close.textContent = "✕";
+    close.title = "Close";
+    close.addEventListener("click", () => selectTopo(null));
+    head.append(heading, close);
+    dom.topoDetail.append(head);
+    if (subtitle) {
+      const sub = document.createElement("p");
+      sub.className = "muted";
+      sub.textContent = subtitle;
+      dom.topoDetail.append(sub);
+    }
+    return dom.topoDetail;
+  }
+
+  function topoDetailRow(term, description) {
+    const row = document.createElement("div");
+    row.className = "topo-detail-row";
+    const label = document.createElement("span");
+    label.className = "muted";
+    label.textContent = term;
+    const value = document.createElement("span");
+    value.textContent = description;
+    row.append(label, value);
+    return row;
+  }
+
+  function renderTopoNodeDetail(name) {
+    const graph = state.topology;
+    if (!graph) return;
+    const node = graph.nodes.find((n) => n.name === name);
+    if (!node) {
+      // The node went away between two polls; drop the selection with it.
+      selectTopo(null);
+      return;
+    }
+    if (isTopoAttached(node)) {
+      renderTopoAttachedDetail(node, graph);
+      return;
+    }
+    const panel = topoDetailShell(node.label, node.name === node.label ? "" : node.name);
+    panel.append(topoDetailRow("role", ROLE_LABELS[node.role] || node.role));
+    if (node.site) panel.append(topoDetailRow("site", node.site));
+    panel.append(
+      topoDetailRow("services", `${node.mac_vrfs} mac-vrf · ${node.ip_vrfs} ip-vrf`)
+    );
+    if (node.stitched) {
+      panel.append(topoDetailRow("stitched", `${node.stitched} service(s), two bgp-vpn instances`));
+    }
+    if (node.clients) panel.append(topoDetailRow("clients", String(node.clients)));
+    if (node.error) panel.append(topoDetailRow("error", node.error));
+
+    const links = graph.links.filter((l) => l.a === name || l.b === name);
+    const heading = document.createElement("h3");
+    heading.textContent = `${links.length} link(s)`;
+    panel.append(heading);
+    const list = document.createElement("ul");
+    list.className = "topo-peer-list";
+    for (const link of links) {
+      const peer = link.a === name ? link.b : link.a;
+      const item = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "topo-peer";
+      const peerNode = graph.nodes.find((n) => n.name === peer);
+      const title = document.createElement("span");
+      title.textContent = peerNode ? peerNode.label : peer;
+      const ports = document.createElement("span");
+      ports.className = "muted";
+      ports.textContent = link.ports
+        .map((pair) =>
+          link.a === name
+            ? cableText(pair.a_port, pair.b_port, "→")
+            : cableText(pair.b_port, pair.a_port, "→")
+        )
+        .join(", ");
+      button.append(title, ports);
+      button.addEventListener("click", () => selectTopo({ kind: "node", id: peer }));
+      item.append(button);
+      list.append(item);
+    }
+    panel.append(list);
+  }
+
+  /** A client or a segment is its attachments: where it lands, in which service. */
+  function renderTopoAttachedDetail(node, graph) {
+    const label = (name) => {
+      const peer = graph.nodes.find((n) => n.name === name);
+      return peer ? peer.label : name;
+    };
+    const panel = topoDetailShell(node.label, node.peers.map(label).join(", "));
+    panel.append(topoDetailRow("role", ROLE_LABELS[node.role] || node.role));
+    if (node.advertised) panel.append(topoDetailRow("lldp name", node.advertised));
+    if ((node.names || []).length) {
+      panel.append(topoDetailRow("configured as", node.names.join(" · ")));
+    }
+    if (node.site) panel.append(topoDetailRow("site", node.site));
+    const kinds = [...new Set(node.attachments.map((a) => a.kind))];
+    if (kinds.length) panel.append(topoDetailRow("attached", kinds.join(" · ")));
+    if (node.esi) panel.append(topoDetailRow("esi", node.esi));
+
+    const heading = document.createElement("h3");
+    heading.textContent = `${node.attachments.length} attachment(s)`;
+    panel.append(heading);
+    const list = document.createElement("ul");
+    list.className = "topo-peer-list";
+    for (const attachment of node.attachments) {
+      const item = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "topo-peer";
+      const title = document.createElement("span");
+      title.textContent = `${label(attachment.node)} ${shortPort(attachment.subinterface)}`;
+      const detail = document.createElement("span");
+      detail.className = "muted";
+      const parts = [attachment.service];
+      if (attachment.vlan) parts.push(`vlan ${attachment.vlan}`);
+      if (attachment.ip) parts.push(attachment.ip);
+      if (attachment.state) parts.push(attachment.state);
+      detail.textContent = parts.filter(Boolean).join(" · ");
+      button.append(title, detail);
+      button.addEventListener("click", () =>
+        selectTopo({ kind: "node", id: attachment.node })
+      );
+      item.append(button);
+      list.append(item);
+    }
+    panel.append(list);
+  }
+
+  function renderTopoLinkDetail(id) {
+    const graph = state.topology;
+    if (!graph) return;
+    const [a, b] = id.split("\u0000");
+    const link = graph.links.find((l) => l.a === a && l.b === b);
+    if (!link) {
+      selectTopo(null);
+      return;
+    }
+    const label = (name) => {
+      const node = graph.nodes.find((n) => n.name === name);
+      return node ? node.label : name;
+    };
+    const panel = topoDetailShell(`${label(a)} ↔ ${label(b)}`, "");
+    panel.append(topoDetailRow("state", link.state));
+    panel.append(topoDetailRow("cables", String(link.count)));
+    const list = document.createElement("ul");
+    list.className = "topo-peer-list";
+    for (const pair of link.ports) {
+      const item = document.createElement("li");
+      item.className = "topo-cable";
+      item.textContent = cableText(pair.a_port, pair.b_port, "↔");
+      list.append(item);
+    }
+    panel.append(list);
+  }
+
   /* ---------------------------------------------------------- page history */
 
   function currentNavSnap() {
@@ -521,6 +1128,10 @@
       clearInterval(overviewTimer);
       overviewTimer = null;
     }
+    if (topologyTimer) {
+      clearInterval(topologyTimer);
+      topologyTimer = null;
+    }
 
     loadReportPreferences();
     if (snap) {
@@ -532,21 +1143,31 @@
     updateFilterUI();
     renderReportList();
 
-    if (report.name === "overview") {
+    if (isPanelReport(report.name)) {
+      // A panel draws itself from its own endpoint instead of a table stream.
       dom.tableWrap.hidden = true;
       dom.servicesTreeView.hidden = true;
       dom.viewModeBtn.hidden = true;
       dom.columnsBtn.hidden = true;
       dom.exportBtn.hidden = true;
-      dom.overviewDashboard.hidden = false;
+      dom.overviewDashboard.hidden = report.name !== "overview";
+      dom.topologyView.hidden = report.name !== "topology";
       if (state.source) {
         state.source.close();
         state.source = null;
       }
-      loadOverview();
-      overviewTimer = setInterval(loadOverview, 5000);
+      if (report.name === "overview") {
+        loadOverview();
+        overviewTimer = setInterval(loadOverview, 5000);
+      } else {
+        state.topoKey = "";
+        state.topoSelection = null;
+        loadTopology();
+        topologyTimer = setInterval(loadTopology, 5000);
+      }
     } else {
       dom.overviewDashboard.hidden = true;
+      dom.topologyView.hidden = true;
       dom.columnsBtn.hidden = false;
       dom.exportBtn.hidden = false;
       if (["bridge_domains", "services", "routers"].includes(report.name)) {
@@ -576,7 +1197,7 @@
       state.source.close();
       state.source = null;
     }
-    if (!state.report || state.report.name === "overview" || state.paused) return;
+    if (!state.report || isPanelReport(state.report.name) || state.paused) return;
     const params = new URLSearchParams({ refresh: dom.refresh.value });
     const inv = dom.invFilter.value.trim();
     if (inv) params.set("inv_filter", inv);
@@ -1876,6 +2497,8 @@
   }
 
   function renderBody() {
+    // Overview and Topology own the main area; a table would be drawn over them.
+    if (state.report && isPanelReport(state.report.name)) return;
     const rows = filteredRows();
 
     if (
@@ -2086,7 +2709,12 @@
     () => {
       saveReportPreferences();
       updateFilterUI();
-      connect();
+      if (state.report && state.report.name === "topology") {
+        state.topoKey = "";
+        loadTopology();
+      } else {
+        connect();
+      }
     }
   );
   dom.refresh.addEventListener(
@@ -2131,9 +2759,20 @@
       if (state.source) state.source.close();
       state.source = null;
       setLive("paused", "paused");
+    } else if (state.report && state.report.name === "topology") {
+      loadTopology();
     } else {
       connect();
     }
+  });
+
+  dom.topoPortLabels.addEventListener("change", () => {
+    try {
+      localStorage.setItem("fcli-topo-ports", dom.topoPortLabels.checked ? "1" : "");
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
+    if (state.topology) renderTopology(state.topology);
   });
 
   dom.columnsBtn.addEventListener("click", () => {
@@ -2171,6 +2810,7 @@
   try {
     const stored = localStorage.getItem("fcli-theme");
     if (stored) document.documentElement.dataset.theme = stored;
+    dom.topoPortLabels.checked = Boolean(localStorage.getItem("fcli-topo-ports"));
   } catch (_err) {
     /* storage may be unavailable */
   }

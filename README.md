@@ -561,6 +561,57 @@ to a subset of the fabric (`-i`):
 * **Columns** hides columns you do not need, **CSV** downloads exactly what the
   table currently shows (filters, column selection and all).
 
+## Topology
+
+The **Topology** page draws the fabric from LLDP, one tier per row, and works out
+what each node is from what it runs rather than from an inventory label:
+
+* a node with **mac-vrfs**, and optionally ip-vrfs, is a **leaf** — the tier where
+  a service meets a port;
+* a node whose services carry **two enabled `bgp-vpn` instances** is a **DCGW**:
+  the second instance is the WAN side of a stitched service, which only a gateway
+  out of the DC has;
+* a node with **no mac-vrf and no ip-vrf** that sees two or more leaves is a
+  **spine**: it interconnects them without terminating anything;
+* anything else without services is **WAN / core** — P/PE routers and
+  super-spines, which transit the fabric but attach to no leaf of it.
+
+Under all of them is the **client** tier, which is not made of inventory nodes at
+all but of what the services are configured towards: a bridged sub-interface of a
+mac-vrf, or a routed port of an ip-vrf. Only ports facing nothing else we know of
+count, so the WAN sub-interface of a stitched ip-vrf stays a link to the DCGW's
+neighbour rather than becoming a customer, and IRBs, loopbacks and `system0` are
+left out. Several vlans on one cable are one client, and which ports belong to
+the same client is answered by whichever of these the fabric can tell us: the
+name an unmatched LLDP neighbour advertises, since a client that says who it is
+says the same to every leaf; failing that the **ESI** of the ethernet-segment the
+port is in, which is how a multi-homed client that runs no LLDP is still drawn as
+one box spanning its leaves rather than one box per leaf; and failing both, the
+port itself. Every client box just reads `client`: what it was named after is a
+guess drawn from an ESI or a port, which would read like an identity it does not
+have. Clicking one lists every sub-interface it attaches on, with its service,
+vlan and address, and walks to the leaf from there.
+
+Between the leaves and the clients sit the **ethernet-segments**. A multi-homed
+client reaches its leaves over one bundle rather than a cable each, and that
+bundle is a configured object of its own — it has a name, an ESI every leaf on it
+agrees on, and it is where multi-homing goes wrong — so it gets a tier, with the
+client hanging off it. A segment box reads `ES` and the last two bytes of its
+ESI, which is what tells the segments of a fabric apart; the name each leaf gave
+it is in the panel, where two leaves disagreeing on it shows up.
+
+Cables come from LLDP and are de-duplicated: both ends report the same link, and
+parallel cables between two nodes are drawn as one line marked `2×`. A link is
+coloured by the oper-state of the ports it lands on. Hovering a node pushes back
+everything it is not cabled to; clicking one opens its services and its per-port
+peer list, and clicking a peer from there walks the fabric.
+
+Neighbours are matched back to the inventory through the name they advertise, so
+a containerlab node the inventory calls `clab-dc1-leaf1` is recognized when its
+neighbour reports it as `leaf1`. A neighbour that matches no node of the
+inventory is still drawn, as an *outside* node, and a node that has not streamed
+anything yet is drawn as *unclassified* rather than left out.
+
 ## How the live data works
 
 1. When a report is opened for the first time, the server runs its getter once
@@ -669,6 +720,7 @@ The UI is a client of a small JSON API, which is just as usable from scripts:
 | `GET /api/reports` | The available reports and their metadata |
 | `GET /api/inventory` | Inventory nodes, labels and connection state |
 | `GET /api/status` | Per-node subscription state |
+| `GET /api/topology` | The fabric graph: nodes with their inferred tier, the clients hanging off them, and the links between them |
 | `GET /api/report/{name}` | One rendered table as JSON |
 | `GET /api/stream/{name}` | The same table, pushed as server-sent events |
 

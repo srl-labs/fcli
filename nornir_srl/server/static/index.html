@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>fcli - SR Linux fabric</title>
-    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/style.css?v=__ASSETS__" />
     <link
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230f766e'/%3E%3Ctext x='16' y='23' font-family='monospace' font-size='18' fill='white' text-anchor='middle'%3Ef%3C/text%3E%3C/svg%3E"
@@ -178,6 +178,21 @@
           </div>
         </div>
 
+        <div id="topology-view" class="topo-wrap" hidden>
+          <div class="topo-bar">
+            <div id="topo-legend" class="topo-legend"></div>
+            <label class="field topo-ports">
+              <input id="topo-port-labels" type="checkbox" />
+              <span class="muted">port labels</span>
+            </label>
+            <span id="topo-stats" class="muted"></span>
+          </div>
+          <div class="topo-body">
+            <div id="topo-canvas" class="topo-canvas"></div>
+            <aside id="topo-detail" class="topo-detail" hidden></aside>
+          </div>
+        </div>
+
         <div id="services-tree-view" class="services-tree-wrap" hidden></div>
 
         <div class="table-wrap" id="table-wrap">
@@ -198,6 +213,6 @@
         </footer>
       </main>
     </div>
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=__ASSETS__"></script>
   </body>
 </html>
