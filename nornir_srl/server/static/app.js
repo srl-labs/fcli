@@ -1969,12 +1969,54 @@
 
   /* ---------------------------------------------------------- inventory */
 
+  function transferIcon() {
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("class", "node-xfer");
+    svg.setAttribute("aria-hidden", "true");
+    const path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+    path.setAttribute(
+      "d",
+      "M2 5h9.5m0 0L9 2.75M11.5 5 9 7.25M14 11H4.5m0 0L7 8.75M4.5 11 7 13.25"
+    );
+    path.setAttribute("fill", "none");
+    path.setAttribute("stroke", "currentColor");
+    path.setAttribute("stroke-width", "1.4");
+    path.setAttribute("stroke-linecap", "round");
+    path.setAttribute("stroke-linejoin", "round");
+    svg.append(path);
+    return svg;
+  }
+
+  let inventoryKey = "";
+  const getCounts = new Map();
+
+  // A Get is over in milliseconds, so sampling "one is in flight" would almost
+  // never catch it. The node's Get counter moving between two polls is what
+  // shows gNMI activity.
+  function pollsGnmi(host) {
+    const seen = getCounts.get(host.name);
+    getCounts.set(host.name, host.gets);
+    return host.getting || (seen !== undefined && host.gets > seen);
+  }
+
   async function loadInventory() {
     try {
       const res = await fetch("/api/inventory");
       const data = await res.json();
+      const hosts = data.hosts.map((host) => ({
+        ...host,
+        active: pollsGnmi(host),
+      }));
+      const key = hosts
+        .map(
+          (h) => `${h.name}:${h.connected}:${h.streaming}:${h.active}:${h.error || ""}`
+        )
+        .join("|");
+      if (key === inventoryKey) return;
+      inventoryKey = key;
       dom.nodeList.replaceChildren(
-        ...data.hosts.map((host) => {
+        ...hosts.map((host) => {
           const item = document.createElement("li");
           const dot = document.createElement("span");
           dot.className =
@@ -1983,18 +2025,22 @@
           const name = document.createElement("span");
           name.className = "node-name";
           name.textContent = host.name;
-          item.title = host.error
-            ? `${host.name}: ${host.error}`
-            : `${host.name} (${host.hostname}) - ${
-                host.streaming ? "streaming" : "connected, not subscribed"
-              }`;
+          let status;
+          if (host.getting) status = "gNMI Get in flight";
+          else if (host.error) status = host.error;
+          else if (host.active) status = "gNMI Get just completed";
+          else if (host.streaming) status = "streaming";
+          else status = "connected, not subscribed";
+          item.title = `${host.name} (${host.hostname}) - ${status}`;
           item.append(dot, name);
+          if (host.active) item.append(transferIcon());
           return item;
         })
       );
-      const up = data.hosts.filter((h) => h.connected).length;
-      dom.nodeSummary.textContent = `${up}/${data.hosts.length} up`;
+      const up = hosts.filter((h) => h.connected).length;
+      dom.nodeSummary.textContent = `${up}/${hosts.length} up`;
     } catch (_err) {
+      inventoryKey = "";
       dom.nodeSummary.textContent = "unavailable";
     }
   }
@@ -2131,5 +2177,7 @@
 
   loadReports();
   loadInventory();
-  setInterval(loadInventory, 10000);
+  // Fast enough for the transfer mark to track gNMI activity; inventory is
+  // served from memory, so this is cheap.
+  setInterval(loadInventory, 1000);
 })();

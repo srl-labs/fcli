@@ -2,6 +2,10 @@
 ![Demo](https://github.com/srl-labs/nornir-srl/blob/main/imgs/fcli_demo.gif)
 # nornir-srl
 
+[![ci](https://github.com/srl-labs/nornir-srl/actions/workflows/ci.yml/badge.svg)](https://github.com/srl-labs/nornir-srl/actions/workflows/ci.yml)
+[![SR Linux](https://img.shields.io/badge/SR%20Linux-25.3.2%20%7C%2025.10.3%20%7C%2026.3.1%20%7C%2026.7.1-blue)](#tested-sr-linux-releases)
+[![PyPI](https://img.shields.io/pypi/v/nornir-srl)](https://pypi.org/project/nornir-srl/)
+
 This module provides a [Nornir](https://nornir.readthedocs.io/en/latest/) connection [plugin](https://nornir.tech/nornir/plugins/) for Nokia SRLinux devices. It uses the gNMI management interface of SRLinux to fetch state and push configurations and the [PyGNMI](https://github.com/akarneliuk/pygnmi) Python module to interact with gNMI. 
 
 Rather than limiting the connection plugin to primitives like `open_connection`, `close_connection`, `get`, `set`, etc, this module provides also methods to get information from the device for common resources. Since the device model tends to change between releases, it was considered a better approach to provide this functionality as part of the connection plugin and hide complexity of model changes to the user or Nornir tasks. 
@@ -10,6 +14,38 @@ In addition to the connection plugin, there is a set of Nornir tasks that use th
 
 > **Note:** The current functionality is focused on a read-only _network-wide CLI_ to perform show commands across an entire set or subset for SRLinux nodes, as defined in the Nornir inventory and through command-line filter options. It shows output in a tabular format for easy reading.
 Following versions may focus on configuration management and command execution on the nodes.
+
+# Tested SR Linux releases
+
+The reports hard-code gNMI paths and the YANG structure they expect back, and both
+move between SR Linux releases. When they move, the failure is usually silent: a path
+that no longer carries a value leaves a column empty rather than raising anything.
+
+So CI does not mock the device. Every report is run once against a real, fully
+configured EVPN-VXLAN fabric per release, and the entire gNMI exchange - every `Get`
+and the payload or error the device answered with - is recorded. Each pull request
+replays those recordings through the production report code with no lab present:
+
+| SR Linux release | Nodes recorded | Reports replayed per node |
+|---|---|---|
+| 25.3.2 | leaf + spine | 32 |
+| 25.10.3 | leaf + spine | 32 |
+| 26.3.1 | leaf + spine | 32 |
+| 26.7.1 | leaf + spine | 32 |
+
+That is 522 test cases, the bulk of the suite. Each one asserts that the report does
+not raise, that it still produces the exact table the live device produced, and that
+the set of paths a release rejects is the documented one - so a path that newly breaks,
+or one that quietly started working, fails the build instead of emptying a column.
+
+All four releases produce **identical columns for every report**, despite 43-89 leaves
+being added and 3-28 removed under those paths between consecutive releases. The two
+`bgp-rib -a l3vpn-ipv4|l3vpn-ipv6` variants are rejected by all four, because the
+`bgp-rib` model only carries the l3vpn containers on a node configured for MPLS IP-VPN;
+those reports degrade to an empty table and the rejection is pinned as expected.
+
+The lab, the per-release datamodel changes and how to re-record are described in
+[`tests/fixtures/releases/MATRIX.md`](tests/fixtures/releases/MATRIX.md).
 
 # Quickstart
 

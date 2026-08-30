@@ -523,6 +523,52 @@ def test_a_hanging_get_counts_as_the_node_not_answering():
         stream.stop()
 
 
+def test_a_path_the_device_rejects_is_not_the_node_failing():
+    """A rejection is the node answering, so the Nodes pane must stay green.
+
+    Reports probe paths a release may not have - the l3vpn RIBs, the IPv6
+    route-table the services reports read - and every one of those flipped the
+    node red until some later Get happened to succeed.
+    """
+    class Rejecting(FakeDevice):
+        def get(self, paths, datatype="config", strip_mod=True):
+            raise ValueError(
+                "gNMI Get failed: Path not valid - unknown element 'l3vpn-ipv4-unicast'"
+            )
+
+    device = Rejecting({})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    try:
+        with pytest.raises(ValueError):
+            stream.direct_get("/network-instance[name=*]/bgp-rib", "state")
+        assert stream.failing_since is None
+        assert stream.last_error is None
+    finally:
+        stream.stop()
+
+
+def test_a_streamed_update_clears_an_earlier_get_failure(lldp_stream):
+    """Once every path streams, no Get runs again to clear the failure itself.
+
+    The node is demonstrably answering while its updates keep arriving, so one
+    Get that failed must not leave it red for the rest of the session.
+    """
+    stream, device = lldp_stream
+    assert wait_for(lambda: stream.status()["connected"])
+    device.down = True
+    with pytest.raises(Exception):
+        stream.direct_get("/system/information", "state")
+    assert stream.failing_since is not None
+
+    device.down = False
+    device.push(
+        "system/lldp/interface[name=ethernet-1/1]",
+        [("neighbor[id=1]/system-name", "spine9")],
+    )
+    assert wait_for(lambda: stream.failing_since is None)
+    assert stream.last_error is None
+
+
 def test_an_in_flight_get_is_not_reported_as_down_until_it_hangs():
     """A resync or bootstrap Get must not flash the Nodes pane red."""
     release = threading.Event()
@@ -545,6 +591,8 @@ def test_an_in_flight_get_is_not_reported_as_down_until_it_hangs():
         worker.start()
         assert wait_for(started.is_set)
         time.sleep(0.1)
+        assert stream.getting
+        assert stream.status()["getting"] is True
         assert stream.failing_since is None
     finally:
         release.set()

@@ -65,6 +65,8 @@ class FabricStore:
         self._last_state_change: float = time.time()
         self._lock = threading.RLock()
         self._stop = threading.Event()
+        self._shutdown_lock = threading.Lock()
+        self._stopped = False
         self._resync_thread: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------ #
@@ -231,38 +233,56 @@ class FabricStore:
             except Exception as exc:  # noqa: BLE001 - best effort
                 logger.debug("%s: resync failed: %s", stream.name, exc)
 
+    @property
+    def stopping(self) -> bool:
+        """True once shutdown has been requested."""
+        return self._stop.is_set()
+
     def stop(self) -> None:
+        """Tear down streams and gNMI connections. Safe to call more than once.
+
+        Does not use ``self._pool``: table renders may already occupy every
+        worker with an in-flight Get, and queuing teardown behind them would
+        deadlock. A private executor closes the RPCs so those Gets fail and the
+        SSE tasks uvicorn is waiting on can finish.
+        """
         self._stop.set()
-        with self._lock:
-            self._table_cache.clear()
-            # Handed over rather than read: a connect still queued on the pool
-            # would otherwise register a fresh stream behind our back, and
-            # nothing would be left to shut it down again.
-            streams = list(self._streams.values())
-            self._streams.clear()
-        if self._resync_thread is not None:
-            self._resync_thread.join(timeout=5)
+        with self._shutdown_lock:
+            if self._stopped:
+                return
+            self._stopped = True
+            with self._lock:
+                self._table_cache.clear()
+                streams = list(self._streams.values())
+                self._streams.clear()
+            if self._resync_thread is not None:
+                self._resync_thread.join(timeout=1)
 
-        hosts = list(self.nornir.inventory.hosts.items())
+            hosts = list(self.nornir.inventory.hosts.items())
 
-        def _close_host(item: Tuple[str, Any]) -> None:
-            name, host = item
-            try:
-                host.close_connections()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("%s: error closing connection: %s", name, exc)
+            def _close_host(item: Tuple[str, Any]) -> None:
+                name, host = item
+                try:
+                    host.close_connections()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("%s: error closing connection: %s", name, exc)
 
-        def _stop_stream(stream: Any) -> None:
-            try:
-                stream.stop()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug("%s: error stopping stream: %s", stream.name, exc)
+            def _stop_stream(stream: Any) -> None:
+                try:
+                    stream.stop(timeout=1.0)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug("%s: error stopping stream: %s", stream.name, exc)
 
-        # Streams first: stopping one cancels its Subscribe RPC, which is what
-        # actually releases the session on the node.
-        list(self._pool.map(_stop_stream, streams))
-        list(self._pool.map(_close_host, hosts))
-        self._pool.shutdown(wait=False, cancel_futures=True)
+            workers = min(16, max(len(streams), len(hosts), 1))
+            with ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="fcli-stop"
+            ) as closer:
+                # Streams first: stopping one cancels its Subscribe RPC, which is
+                # what actually releases the session on the node. Closing the
+                # channel next aborts any Get still in flight.
+                list(closer.map(_stop_stream, streams))
+                list(closer.map(_close_host, hosts))
+            self._pool.shutdown(wait=False, cancel_futures=True)
 
     # ------------------------------------------------------------------ #
     # inventory
@@ -296,6 +316,14 @@ class FabricStore:
                         and stream.stale_for is None
                     ),
                     "streaming": bool(stream and stream.connected),
+                    # A Get in flight, including ones still inside the hang grace
+                    # that have not yet flipped 'connected'. The Nodes pane shows
+                    # a transfer mark for this rather than treating the node as down.
+                    "getting": bool(stream and stream.getting),
+                    # Sampling 'getting' alone almost never catches a Get: they
+                    # finish in milliseconds. This counter is what tells the
+                    # Nodes pane that one happened between two polls.
+                    "gets": stream.gets if stream else 0,
                     "error": connect_errors.get(name)
                     or (stream.last_error if stream else None),
                     "last_update": stream.last_update if stream else None,
@@ -388,6 +416,18 @@ class FabricStore:
         inv_filter: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """Render *report* across the (filtered) inventory from streamed state."""
+        if self._stop.is_set():
+            return {
+                "report": report.name,
+                "title": report.title,
+                "columns": ["Node"],
+                "rows": [],
+                "errors": [],
+                "nodes": 0,
+                "generated": time.time(),
+                "render_ms": 0.0,
+                "oldest_update": None,
+            }
         names = self._targets(inv_filter)
         self._heal_connections(names)
         self.activate(report, names)
@@ -458,6 +498,8 @@ class FabricStore:
             activation_error = self._activation_errors.get((name, report.name))
         if activation_error:
             return name, [], [], activation_error[1]
+        if self._stop.is_set():
+            return name, [], [], None
         host = self.nornir.inventory.hosts.get(name)
         node = (host.hostname if host and host.hostname else name) or name
         try:

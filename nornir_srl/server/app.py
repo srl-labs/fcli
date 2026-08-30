@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import threading
 from pathlib import Path
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional
 
@@ -77,17 +78,21 @@ async def table_events(
     last_digest = ""
     last_sent = 0.0
     try:
-        while not await is_disconnected():
+        while not await is_disconnected() and not store.stopping:
             try:
                 table = await anyio.to_thread.run_sync(store.table, report, inv_filter)
             except (asyncio.CancelledError, GeneratorExit):
                 break
             except Exception as exc:  # noqa: BLE001 - surfaced in the browser
+                if store.stopping:
+                    return
                 logger.exception("rendering report '%s' failed", report.name)
                 payload = json.dumps({"error": str(exc)})
                 yield f"event: error\ndata: {payload}\n\n".encode()
                 await asyncio.sleep(interval)
                 continue
+            if store.stopping:
+                return
             digest = table_digest(table)
             now = loop.time()
             if digest != last_digest:
@@ -98,10 +103,17 @@ async def table_events(
             elif now - last_sent > SSE_HEARTBEAT:
                 last_sent = now
                 yield b": keep-alive\n\n"
-            try:
-                await asyncio.sleep(interval)
-            except (asyncio.CancelledError, GeneratorExit):
-                break
+            deadline = loop.time() + interval
+            while loop.time() < deadline:
+                if store.stopping or await is_disconnected():
+                    return
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                try:
+                    await asyncio.sleep(min(0.1, remaining))
+                except (asyncio.CancelledError, GeneratorExit):
+                    return
     except (asyncio.CancelledError, GeneratorExit):
         return
 
@@ -111,6 +123,7 @@ class SuppressCancelledErrorMiddleware:
 
     def __init__(self, app: Any) -> None:
         self.app = app
+        self.store = getattr(getattr(app, "state", None), "store", None)
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
         try:
@@ -220,7 +233,16 @@ def create_app(
 
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.store = store
-    return SuppressCancelledErrorMiddleware(app)
+    wrapped = SuppressCancelledErrorMiddleware(app)
+    wrapped.store = store
+    return wrapped
+
+
+class _QuietUvicornShutdown(logging.Filter):
+    """Drop uvicorn's timeout-on-Ctrl+C ERROR; we tear gNMI down ourselves."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "timeout graceful shutdown exceeded" not in record.getMessage()
 
 
 def serve(
@@ -248,6 +270,7 @@ def serve(
         idle_timeout=idle_timeout,
         topo_name=topo_name,
     )
+    store = app.store
     config = uvicorn.Config(
         app,
         host=host,
@@ -257,6 +280,18 @@ def serve(
         timeout_graceful_shutdown=5.0,
     )
     server = uvicorn.Server(config)
+    # Tear the store down as soon as SIGINT/SIGTERM arrives, not after uvicorn
+    # has already waited out timeout_graceful_shutdown. SSE streams sit in
+    # in-flight Gets; closing gNMI first lets those tasks finish so uvicorn
+    # never logs "Cancel N running task(s), timeout graceful shutdown exceeded".
+    original_exit = server.handle_exit
+
+    def handle_exit(sig: int, frame: Any) -> None:
+        threading.Thread(target=store.stop, name="fcli-shutdown", daemon=True).start()
+        original_exit(sig, frame)
+
+    server.handle_exit = handle_exit  # type: ignore[method-assign]
+    logging.getLogger("uvicorn.error").addFilter(_QuietUvicornShutdown())
     try:
         server.run()
     except (KeyboardInterrupt, SystemExit):

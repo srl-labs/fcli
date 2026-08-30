@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..connections.helpers import strip_modules
+from ..connections.routing import _gnmi_path_missing
 from ..reports import SubscriptionSpec
 from .tree import (
     delete,
@@ -63,14 +64,6 @@ def _suppress_pygnmi_client_logging():
                 for h in handlers:
                     log.addHandler(h)
 
-
-def _gnmi_path_missing(exc: BaseException) -> bool:
-    text = str(exc).lower()
-    if "path not valid" in text and (
-        "unknown element" in text or "l3vpn" in text or "unknown path" in text
-    ):
-        return True
-    return False
 
 # Counters used to derive interface rates from consecutive streamed samples.
 IFSTATS_COUNTERS: Tuple[str, ...] = (
@@ -571,6 +564,12 @@ class HostStream:
                 stats = get_node(self._tree, f"interface[name={itf}]/statistics")
                 if isinstance(stats, dict):
                     self.rates.observe(itf, materialize(stats), timestamp)
+            # State arriving is the node answering, which a Get that failed
+            # earlier no longer has anything to say about. Nothing else clears
+            # that: once every path of a report streams, renders stop issuing
+            # Gets, so one failure would have kept the node red indefinitely.
+            self._failing_since = None
+            self._get_error = None
         self.last_update = time.time()
         if self.on_update is not None:
             try:
@@ -720,6 +719,15 @@ class HostStream:
                 with _suppress_pygnmi_client_logging():
                     resp = self.device.get(paths=[path], datatype=datatype)
             except Exception as exc:
+                # A path the device does not have is not a node that stopped
+                # answering: it answered, with a rejection. Reports probe optional
+                # paths all the time - the l3vpn RIBs, the IPv6 route-table the
+                # services reports read - and counting those as failures is what
+                # left the Nodes pane flashing red on a healthy fabric.
+                if _gnmi_path_missing(exc):
+                    self._failing_since = None
+                    self._get_error = None
+                    raise
                 # How long the node has been failing decides whether waiting for
                 # it is still worthwhile or the connection itself has to go; see
                 # FabricStore._heal_connections.
@@ -740,6 +748,21 @@ class HostStream:
         that follows - but otherwise accounted for like any other Get.
         """
         return self._raw_get(path, datatype)
+
+    @property
+    def getting(self) -> bool:
+        """True while a gNMI Get is in flight against this node."""
+        return self._get_started is not None
+
+    @property
+    def gets(self) -> int:
+        """Gets issued to this node so far, counting the failed ones.
+
+        Monotonic on purpose: a caller sampling it periodically sees gNMI
+        activity it would otherwise miss, since a healthy Get is over long
+        before the next sample.
+        """
+        return self._gets
 
     @property
     def failing_since(self) -> Optional[float]:
@@ -829,7 +852,8 @@ class HostStream:
             # plus at most one in-flight Get.
             "sessions": (1 if self.connected else 0)
             + (1 if self._get_lock.locked() else 0),
-            "gets": self._gets,
+            "gets": self.gets,
+            "getting": self.getting,
             "failing_since": self.failing_since,
             "paths": paths,
         }

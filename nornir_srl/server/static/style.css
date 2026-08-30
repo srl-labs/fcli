@@ -190,9 +190,25 @@ body {
 }
 
 .node-list .node-name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.node-xfer {
+  flex: none;
+  width: 12px;
+  height: 12px;
+  color: var(--accent);
+  animation: node-xfer 0.9s ease-in-out infinite;
+}
+
+@keyframes node-xfer {
+  50% {
+    opacity: 0.35;
+  }
 }
 
 .side-foot {
