@@ -1,5 +1,11 @@
 name: ci
-on: [ pull_request ]
+on:
+  # The badge reports the latest run on the default branch, so main has to run
+  # on push as well. Scoped to main: an unscoped push trigger would run a second
+  # time for every pull request opened from a branch in this repository.
+  push:
+    branches: [ main ]
+  pull_request:
 jobs:
   tests:
     name: tests

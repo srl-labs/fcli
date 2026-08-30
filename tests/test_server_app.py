@@ -3,6 +3,7 @@
 import json
 import os
 import tempfile
+import threading
 import time
 
 import pytest
@@ -171,6 +172,10 @@ def test_store_stop_closes_host_connections(fabric):
     fabric_store.start()
     fabric_store.stop()
     assert fabric_store._stop.is_set()
+    fabric_store.stop()  # a second Ctrl+C / lifespan must not raise
+    table = fabric_store.table(get_report("lldp"))
+    assert table["rows"] == []
+    assert table["errors"] == []
 
 
 def test_table_renders_rows_for_all_nodes(store):
@@ -601,7 +606,53 @@ def test_inventory_endpoint(client):
     assert {h["name"] for h in hosts} == set(HOSTS)
     assert {h["labels"]["role"] for h in hosts} == {"leaf", "spine"}
     # the gNMI session is open, but nothing streams until a report is opened
-    assert all(h["connected"] and not h["streaming"] for h in hosts)
+    assert all(h["connected"] and not h["streaming"] and not h["getting"] for h in hosts)
+
+
+def test_inventory_counts_the_gets_a_node_was_asked_for(store):
+    """The Nodes pane watches this counter move: a Get is over in milliseconds.
+
+    Sampling 'a Get is in flight' would practically never catch one, so the
+    transfer mark keys off the count having changed between two polls.
+    """
+    fabric_store, _devices = store
+    fabric_store.table(get_report("lldp"))
+    before = {h["name"]: h["gets"] for h in fabric_store.inventory()}
+    assert all(count > 0 for count in before.values())
+
+    fabric_store._streams["leaf1"].direct_get(IFSTATE_PATH, "state")
+    after = {h["name"]: h["gets"] for h in fabric_store.inventory()}
+    assert after["leaf1"] > before["leaf1"]
+    assert after["spine1"] == before["spine1"]
+
+
+def test_inventory_marks_a_node_while_a_get_is_in_flight(store):
+    """The Nodes pane uses this to show a transfer mark without flipping the dot red."""
+    fabric_store, devices = store
+    release = threading.Event()
+    started = threading.Event()
+    orig = devices["leaf1"].get
+
+    def slow(paths, datatype="config", strip_mod=True):
+        started.set()
+        release.wait(timeout=10)
+        return orig(paths, datatype, strip_mod)
+
+    devices["leaf1"].get = slow
+    stream = fabric_store._streams["leaf1"]
+    worker = threading.Thread(
+        target=lambda: stream.direct_get(LLDP_PATH, "state"), daemon=True
+    )
+    try:
+        worker.start()
+        assert wait_for(started.is_set)
+        hosts = {h["name"]: h for h in fabric_store.inventory()}
+        assert hosts["leaf1"]["getting"] is True
+        assert hosts["leaf1"]["connected"] is True
+        assert hosts["spine1"]["getting"] is False
+    finally:
+        release.set()
+        worker.join(timeout=10)
 
 
 def test_inventory_reports_streaming_once_a_report_is_open(client):
@@ -699,6 +750,23 @@ async def test_stream_only_pushes_when_the_table_changed(store):
     events = await _collect(fabric_store, get_report("lldp"), stop_after=2)
     assert [kind for kind, _ in events] == ["table"]
     assert any(row["Nbr-System"] == "spine9" for row in events[0][1]["rows"])
+
+
+@pytest.mark.anyio
+async def test_stream_stops_when_the_store_is_stopping(store):
+    fabric_store, _devices = store
+    fabric_store.stop()
+
+    async def never_disconnects():
+        return False
+
+    chunks = [
+        chunk
+        async for chunk in table_events(
+            fabric_store, get_report("lldp"), None, 0.01, never_disconnects
+        )
+    ]
+    assert chunks == []
 
 
 @pytest.mark.anyio
