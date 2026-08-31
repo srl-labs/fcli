@@ -15,7 +15,7 @@ import anyio
 from nornir.core import Nornir
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
@@ -37,6 +37,25 @@ _SSE_HEADERS = {
     "Connection": "keep-alive",
     "X-Accel-Buffering": "no",
 }
+
+#: Placeholder in index.html for the cache key of the assets it pulls in.
+ASSET_TOKEN = "__ASSETS__"
+
+
+def asset_version() -> str:
+    """A token that changes whenever the bundled JS or CSS does.
+
+    The page itself is served ``no-cache`` so the browser revalidates it on
+    every load, and the assets it references are fingerprinted with this. Left
+    to itself a browser will happily keep serving a page it cached before a
+    feature existed, which shows up as a report whose panel is simply missing:
+    the report list comes from the API and lists it, the markup it needs does
+    not exist, and nothing in the console says why.
+    """
+    newest = max(
+        (STATIC_DIR / name).stat().st_mtime_ns for name in ("app.js", "style.css")
+    )
+    return f"{__version__}-{newest:x}"
 
 
 def parse_kv(values: Optional[str]) -> Optional[Dict[str, str]]:
@@ -165,7 +184,11 @@ def create_app(
             await anyio.to_thread.run_sync(store.stop)
 
     async def index(_request: Request) -> Response:
-        return FileResponse(STATIC_DIR / "index.html")
+        html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+        return HTMLResponse(
+            html.replace(ASSET_TOKEN, asset_version()),
+            headers={"Cache-Control": "no-cache"},
+        )
 
     async def reports(_request: Request) -> Response:
         return JSONResponse(
@@ -186,6 +209,10 @@ def create_app(
     async def overview(request: Request) -> Response:
         inv_filter = parse_kv(request.query_params.get("inv_filter"))
         return JSONResponse(await anyio.to_thread.run_sync(store.overview, inv_filter))
+
+    async def topology(request: Request) -> Response:
+        inv_filter = parse_kv(request.query_params.get("inv_filter"))
+        return JSONResponse(await anyio.to_thread.run_sync(store.topology, inv_filter))
 
     def streamable_report(name: str) -> ReportSpec:
         """The named report, provided the server is able to stream it."""
@@ -226,6 +253,7 @@ def create_app(
         Route("/api/inventory", inventory),
         Route("/api/status", status),
         Route("/api/overview", overview),
+        Route("/api/topology", topology),
         Route("/api/report/{name}", report_once),
         Route("/api/stream/{name}", report_stream),
         Mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static"),

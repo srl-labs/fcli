@@ -17,6 +17,7 @@ from ..reports import ReportSpec, SubscriptionSpec, get_report
 from ..rows import clean_columns, flatten
 from .devices import CachedDevice, RecordingDevice
 from .stream import HostStream
+from .topology import build_topology, node_facts
 
 logger = logging.getLogger(__name__)
 
@@ -582,9 +583,57 @@ class FabricStore:
             },
         }
 
+    def topology(self, inv_filter: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """The fabric graph: LLDP adjacencies, with a tier per node.
+
+        Nodes that are down or have not streamed anything yet are still part of
+        the answer, as unclassified ones - a topology missing the node that
+        failed would be the opposite of useful.
+        """
+        started = time.time()
+        names = self._targets(inv_filter)
+        self._heal_connections(names)
+        try:
+            self.activate(get_report("topology"), names)
+        except Exception as exc:  # noqa: BLE001 - the graph still renders
+            logger.warning("activating the topology report failed: %s", exc)
+
+        hosts = {h["name"]: h for h in self.inventory()}
+        with self._lock:
+            streams = {n: self._streams[n] for n in names if n in self._streams}
+
+        facts = []
+        for name in names:
+            host = self.nornir.inventory.hosts.get(name)
+            stream = streams.get(name)
+            status = hosts.get(name, {})
+            facts.append(
+                node_facts(
+                    name,
+                    hostname=(host.hostname if host else "") or name,
+                    labels=(host.data if host else None) or {},
+                    # Taken under this node's lock only, so summarizing the
+                    # fabric does not stall the renders running on the others.
+                    snapshot=stream.snapshot_roots(_TOPOLOGY_ROOTS) if stream else None,
+                    connected=bool(status.get("connected")),
+                    error=status.get("error"),
+                )
+            )
+
+        graph = build_topology(facts)
+        graph["generated"] = started
+        graph["render_ms"] = round((time.time() - started) * 1000, 1)
+        graph["oldest_update"] = _oldest_update(list(streams.values()))
+        return graph
+
 
 #: Tree roots the overview summarizes.
 _OVERVIEW_ROOTS: Tuple[str, ...] = ("interface", "network-instance")
+
+#: Tree roots the topology is inferred from: LLDP and the host-name under
+#: ``system``, the services under ``network-instance``, port states under
+#: ``interface``.
+_TOPOLOGY_ROOTS: Tuple[str, ...] = ("system", "network-instance", "interface")
 
 #: Cap on cached rendered tables, evicting the oldest beyond it.
 _MAX_CACHED_TABLES = 256

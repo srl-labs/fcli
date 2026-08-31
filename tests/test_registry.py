@@ -52,6 +52,33 @@ def test_every_getter_is_callable_with_only_a_device():
             ), f"{report.name} getter requires '{param.name}'"
 
 
+#: Single leaves SR Linux defines as config rather than state.
+CONFIG_LEAVES = frozenset(
+    {
+        "/interface[name=*]/admin-state",
+        "/interface[name=*]/description",
+        "/network-instance[name=*]/type",
+        "/system/name/host-name",
+    }
+)
+
+
+def test_config_leaves_are_not_subscribed_as_state():
+    """A 'state' Get on a config leaf answers nothing, and answers it silently.
+
+    The path is then never bootstrapped, so it stays pending forever and the
+    report reading it renders as though the node had no such data - which is how
+    the topology once put every node of a fabric on one tier.
+    """
+    for report in REPORTS:
+        for spec in report.subscribe:
+            if spec.path in CONFIG_LEAVES:
+                assert spec.datatype != "state", (
+                    f"{report.name} subscribes to the config leaf {spec.path} "
+                    "with datatype 'state', which returns nothing"
+                )
+
+
 def test_non_tabular_reports_are_not_streamed():
     """The browser only shows tables, so a report without columns cannot stream."""
     for report in REPORTS:

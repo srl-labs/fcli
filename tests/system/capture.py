@@ -39,9 +39,9 @@ DEFAULT_USERNAME = "admin"
 DEFAULT_PASSWORD = "NokiaSrl1!"
 DEFAULT_PORT = 57400
 
-#: ``overview`` is computed by the server from streamed state rather than by a
-#: getter, so there is no gNMI exchange of its own to record.
-SKIP = {"overview"}
+#: ``overview`` and ``topology`` are computed by the server from streamed state
+#: rather than by a getter, so there is no gNMI exchange of their own to record.
+SKIP = {"overview", "topology"}
 
 
 class RecordingDevice(SrLinux):

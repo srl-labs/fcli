@@ -1192,3 +1192,287 @@ button.pill-jump:focus-visible {
   animation: pulse-highlight 1.5s ease-in-out 2;
   border-color: var(--accent) !important;
 }
+
+/* ------------------------------------------------------------- Topology */
+
+:root {
+  --role-client: #be185d;
+  --role-segment: #9333ea;
+  --role-leaf: #0f766e;
+  --role-spine: #2563eb;
+  --role-dcgw: #b45309;
+  --role-core: #7c3aed;
+  --role-unknown: #667085;
+  --role-external: #94a3b8;
+}
+
+[data-theme="dark"] {
+  --role-client: #f472b6;
+  --role-segment: #c4b5fd;
+  --role-leaf: #2dd4bf;
+  --role-spine: #60a5fa;
+  --role-dcgw: #fbbf24;
+  --role-core: #c084fc;
+  --role-unknown: #8b95a3;
+  --role-external: #64748b;
+}
+
+.topo-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.topo-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 18px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  flex-wrap: wrap;
+}
+
+.topo-legend {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.topo-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.topo-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 3px;
+  background: currentColor;
+}
+
+.topo-chip.role-client .topo-swatch { color: var(--role-client); }
+.topo-chip.role-segment .topo-swatch { color: var(--role-segment); }
+.topo-chip.role-leaf .topo-swatch { color: var(--role-leaf); }
+.topo-chip.role-spine .topo-swatch { color: var(--role-spine); }
+.topo-chip.role-dcgw .topo-swatch { color: var(--role-dcgw); }
+.topo-chip.role-core .topo-swatch { color: var(--role-core); }
+.topo-chip.role-unknown .topo-swatch { color: var(--role-unknown); }
+.topo-chip.role-external .topo-swatch { color: var(--role-external); }
+
+.topo-ports {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.topo-bar .topo-ports + .muted,
+.topo-bar #topo-stats {
+  margin-left: auto;
+  font-size: 12px;
+}
+
+.topo-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.topo-canvas {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 18px;
+}
+
+.topo-svg {
+  max-width: 100%;
+  height: auto;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+.topo-band {
+  fill: var(--panel);
+  stroke: var(--border);
+  stroke-dasharray: 3 4;
+}
+
+.topo-band-label {
+  fill: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.topo-link {
+  stroke: var(--border);
+  stroke-width: 1.6;
+  cursor: pointer;
+}
+
+.topo-link.link-up {
+  stroke: var(--ok);
+}
+
+.topo-link.link-down {
+  stroke: var(--err);
+  stroke-dasharray: 5 4;
+}
+
+/* A cable to a client is thinner: the fabric is what the eye should follow. */
+.topo-link.is-access {
+  stroke-width: 1.1;
+  opacity: 0.75;
+}
+
+.topo-link-count,
+.topo-port {
+  fill: var(--muted);
+  font-size: 10px;
+  font-family: var(--mono);
+  pointer-events: none;
+}
+
+.topo-node {
+  cursor: pointer;
+}
+
+.topo-node rect {
+  fill: var(--panel);
+  stroke: var(--role-unknown);
+  stroke-width: 1.5;
+}
+
+.topo-node.role-client rect { stroke: var(--role-client); fill: var(--panel-2); }
+.topo-node.role-segment rect { stroke: var(--role-segment); fill: var(--panel-2); }
+.topo-node.role-leaf rect { stroke: var(--role-leaf); }
+.topo-node.role-spine rect { stroke: var(--role-spine); }
+.topo-node.role-dcgw rect { stroke: var(--role-dcgw); stroke-width: 2; }
+.topo-node.role-core rect { stroke: var(--role-core); }
+.topo-node.role-external rect { stroke: var(--role-external); stroke-dasharray: 4 3; }
+
+.topo-node.is-down rect {
+  stroke: var(--err);
+  stroke-dasharray: 4 3;
+}
+
+.topo-node-label {
+  fill: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.topo-node-sub {
+  fill: var(--muted);
+  font-size: 10px;
+  font-family: var(--mono);
+}
+
+/* Hovering or selecting a node pushes everything it is not cabled to back. */
+.topo-svg.is-focused .topo-node,
+.topo-svg.is-focused .topo-link {
+  opacity: 0.25;
+  transition: opacity 0.12s ease;
+}
+
+.topo-svg.is-focused .topo-node.is-hot,
+.topo-svg.is-focused .topo-link.is-hot {
+  opacity: 1;
+}
+
+.topo-link.is-hot {
+  stroke-width: 2.6;
+}
+
+.topo-node.is-hot rect {
+  filter: drop-shadow(0 1px 4px rgba(0, 0, 0, 0.25));
+}
+
+.topo-detail {
+  width: 290px;
+  flex: none;
+  border-left: 1px solid var(--border);
+  background: var(--panel);
+  padding: 14px 16px;
+  overflow: auto;
+}
+
+.topo-detail header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.topo-detail h2 {
+  margin: 0;
+  font-size: 15px;
+  font-family: var(--mono);
+}
+
+.topo-detail header .btn {
+  margin-left: auto;
+  padding: 2px 8px;
+}
+
+.topo-detail h3 {
+  margin: 16px 0 6px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+.topo-detail-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.topo-peer-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.topo-peer {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  padding: 4px 6px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.topo-peer:hover {
+  background: var(--panel-2);
+  border-color: var(--border);
+}
+
+.topo-peer .muted {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.topo-cable {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 3px 6px;
+}

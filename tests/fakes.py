@@ -158,6 +158,39 @@ LLDP_RESPONSE: List[Dict[str, Any]] = [
     }
 ]
 
+HOSTNAME_PATH = "/system/name/host-name"
+
+
+def hostname_response(name: str) -> List[Dict[str, Any]]:
+    """What a node answers when asked for the name it advertises over LLDP."""
+    return [{"system/name": {"host-name": name}}]
+
+
+ES_PATH = "/system/network-instance/protocols/evpn/ethernet-segments"
+
+
+def es_response(name: str, esi: str, interface: str) -> List[Dict[str, Any]]:
+    """One ethernet-segment, as the two nodes sharing it both report it."""
+    return [
+        {
+            "system/network-instance/protocols/evpn/ethernet-segments": {
+                "bgp-instance": [
+                    {
+                        "id": 1,
+                        "ethernet-segment": [
+                            {
+                                "name": name,
+                                "esi": esi,
+                                "interface": [{"ethernet-interface": interface}],
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    ]
+
+
 IFSTATS_PATH = "/interface[name=*]/statistics"
 IFSTATS_RESPONSE: List[Dict[str, Any]] = [
     {

@@ -35,6 +35,17 @@ class SubscriptionSpec:
     """One gNMI subscription entry."""
 
     path: str
+    #: ``state``, ``config`` or ``all``.
+    #:
+    #: A subscription on a single leaf that SR Linux defines as *config* -
+    #: ``network-instance/type``, ``interface/admin-state``,
+    #: ``system/name/host-name`` - has to ask for ``all``. A path is
+    #: bootstrapped with a gNMI ``Get`` before it can be streamed, and a ``Get``
+    #: with datatype ``state`` answers nothing at all for a config leaf: not an
+    #: error, an empty response. The path then stays pending forever and
+    #: whatever reads it renders as if the node had no such data. Subtrees are
+    #: not affected - ``/network-instance[name=*]`` returns the config leaves
+    #: inside it either way.
     datatype: str = "state"
     mode: str = "sample"  # sample | on_change | target_defined
     sample_interval: int = 10  # seconds
@@ -196,15 +207,64 @@ REPORTS: List[ReportSpec] = [
         surfaces=STREAMING,
         subscribe=(
             SubscriptionSpec("/interface[name=*]/statistics", sample_interval=10),
-            SubscriptionSpec("/interface[name=*]/admin-state", sample_interval=10),
+            # 'admin-state', 'description' and 'type' are config leaves: see
+            # SubscriptionSpec.
+            SubscriptionSpec("/interface[name=*]/admin-state", datatype="all", sample_interval=10),
             SubscriptionSpec("/interface[name=*]/oper-state", sample_interval=10),
             SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=10),
-            SubscriptionSpec("/interface[name=*]/description", sample_interval=10),
+            SubscriptionSpec("/interface[name=*]/description", datatype="all", sample_interval=10),
             SubscriptionSpec("/interface[name=*]/ethernet", datatype="all", sample_interval=10),
-            SubscriptionSpec("/network-instance[name=*]/type", sample_interval=10),
+            SubscriptionSpec("/network-instance[name=*]/type", datatype="all", sample_interval=10),
             SubscriptionSpec("/network-instance[name=*]/oper-state", sample_interval=10),
             SubscriptionSpec("/network-instance[name=*]/protocols/bgp/neighbor", datatype="all", sample_interval=10),
             SubscriptionSpec("/network-instance[name=*]/protocols/bgp-vpn", datatype="all", sample_interval=10),
+        ),
+    ),
+    ReportSpec(
+        name="topology",
+        resource="topology",
+        title="Topology",
+        description="Fabric graph from LLDP, with the tier of each node inferred from its services.",
+        # Computed by the store from the streamed trees below, not by a getter.
+        getter=lambda d: {},
+        category="Dashboard",
+        surfaces=STREAMING,
+        # Every path is read as 'all': 'host-name' and 'type' are config leaves,
+        # which a 'state' Get answers nothing for (see SubscriptionSpec), and the
+        # rest are narrow enough that asking for both costs nothing.
+        subscribe=(
+            # LLDP gives the cables; the host-name is what a neighbour is
+            # advertised under, and the only reliable way back to the inventory.
+            SubscriptionSpec(
+                "/system/lldp/interface[name=*]/neighbor",
+                datatype="all",
+                sample_interval=30,
+            ),
+            SubscriptionSpec("/system/name/host-name", datatype="all", sample_interval=30),
+            SubscriptionSpec("/interface[name=*]/oper-state", datatype="all", sample_interval=30),
+            # A node's tier follows from the services on it: mac-vrfs and
+            # ip-vrfs make it a leaf, two bgp-vpn instances make it a DCGW.
+            SubscriptionSpec("/network-instance[name=*]/type", datatype="all", sample_interval=30),
+            SubscriptionSpec(
+                "/network-instance[name=*]/protocols/bgp-vpn",
+                datatype="all",
+                sample_interval=30,
+            ),
+            # The client tier: which subinterfaces a service is configured
+            # towards, and the vlan and address each of them attaches on.
+            SubscriptionSpec(
+                "/network-instance[name=*]/interface",
+                datatype="all",
+                sample_interval=30,
+            ),
+            SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=30),
+            # The ESI a port is in, which is what says the lags of a multi-homed
+            # client on two leaves are one client rather than two.
+            SubscriptionSpec(
+                "/system/network-instance/protocols/evpn/ethernet-segments",
+                datatype="all",
+                sample_interval=30,
+            ),
         ),
     ),
     ReportSpec(
