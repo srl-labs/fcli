@@ -1305,6 +1305,50 @@ button.pill-jump:focus-visible {
   border-color: var(--accent);
 }
 
+.topo-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 8px 18px 0;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto;
+}
+
+.topo-tab {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  background: none;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: 6px 6px 0 0;
+  margin-bottom: -1px;
+  padding: 5px 12px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 13px;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.topo-tab:hover {
+  color: var(--text);
+  background: var(--panel-2);
+}
+
+.topo-tab.is-active {
+  color: var(--text);
+  background: var(--bg);
+  border-color: var(--border);
+  border-bottom: 1px solid var(--bg);
+  font-weight: 600;
+}
+
+.topo-tab .muted {
+  font-size: 11px;
+  font-family: var(--mono);
+}
+
 .topo-canvas {
   flex: 1;
   min-width: 0;

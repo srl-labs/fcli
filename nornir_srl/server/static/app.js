@@ -47,6 +47,7 @@
     topoCanvas: el("topo-canvas"),
     topoLegend: el("topo-legend"),
     topoStats: el("topo-stats"),
+    topoTabs: el("topo-tabs"),
     topoDetail: el("topo-detail"),
     topoPortLabels: el("topo-port-labels"),
     topoZoomIn: el("topo-zoom-in"),
@@ -117,6 +118,7 @@
     topoSize: null, // the drawing in its own units, before any zoom
     topoZoom: 1,
     topoFit: true,
+    topoFabric: null, // the fabric being drawn, or "all"
     collapsedCards: new Set(),
     collapsedNodes: new Set(),
     navStack: [],
@@ -464,7 +466,6 @@
       const res = await fetch("/api/topology" + (inv ? `?${params}` : ""));
       const graph = await res.json();
       setLive("live", "live");
-      dom.rowCount.textContent = `${graph.nodes.length} node(s), ${graph.links.length} link(s)`;
       dom.streamInfo.textContent = `LLDP topology, rendered in ${graph.render_ms} ms`;
       dom.updated.textContent = "updated " + new Date().toLocaleTimeString();
       // Re-drawing would drop the hover and lose the scroll position, and a
@@ -530,10 +531,15 @@
     };
   }
 
-  function renderTopology(graph) {
+  function renderTopology(whole) {
+    // Everything below draws one fabric; the whole graph stays in state, so a
+    // node of another one is still there to be looked up and walked to.
+    renderTopoTabs(whole);
+    const graph = topoFabricView(whole);
     dom.topoCanvas.replaceChildren();
     renderTopoLegend(graph);
     dom.topoStats.textContent = topoSummary(graph);
+    dom.rowCount.textContent = `${graph.nodes.length} node(s), ${graph.links.length} link(s)`;
     if (!graph.nodes.length) {
       const empty = document.createElement("p");
       empty.className = "empty";
@@ -596,9 +602,117 @@
     applyTopoSelection();
   }
 
+  /* ------------------------------------------------------- topology fabrics */
+
+  const topoFabrics = (graph) => (graph && graph.fabrics) || [];
+
+  /** The fabric a tab is on, falling back to the largest one it could be. */
+  function currentTopoFabric(graph) {
+    const fabrics = topoFabrics(graph);
+    if (fabrics.length < 2) return "all";
+    if (state.topoFabric === "all") return "all";
+    if (fabrics.some((fabric) => fabric.id === state.topoFabric)) return state.topoFabric;
+    return fabrics[0].id;
+  }
+
+  /** The graph reduced to the fabric on the tab, layers and legend with it. */
+  function topoFabricView(graph) {
+    const id = currentTopoFabric(graph);
+    if (id === "all") return graph;
+    const nodes = graph.nodes.filter((node) => (node.fabrics || []).includes(id));
+    const names = new Set(nodes.map((node) => node.name));
+    return {
+      ...graph,
+      nodes,
+      links: graph.links.filter((link) => names.has(link.a) && names.has(link.b)),
+      layers: graph.layers
+        .map((layer) => ({ ...layer, nodes: layer.nodes.filter((name) => names.has(name)) }))
+        .filter((layer) => layer.nodes.length),
+      roles: nodes.reduce((counts, node) => {
+        counts[node.role] = (counts[node.role] || 0) + 1;
+        return counts;
+      }, {}),
+      unresolved: graph.unresolved.filter((entry) => names.has(entry.peer)),
+    };
+  }
+
+  function renderTopoTabs(graph) {
+    const fabrics = topoFabrics(graph);
+    dom.topoTabs.replaceChildren();
+    // One fabric is the whole drawing; a tab strip of one says nothing.
+    dom.topoTabs.hidden = fabrics.length < 2;
+    if (fabrics.length < 2) return;
+    const current = currentTopoFabric(graph);
+    state.topoFabric = current;
+    const tabs = fabrics.map((fabric) => ({
+      id: fabric.id,
+      label: fabric.label,
+      // The nodes of the fabric rather than the boxes drawn for it: the clients
+      // are counted again on every other fabric they are plugged into.
+      count: `${fabric.devices} devices`,
+      title: topoFabricMembers(graph, fabric.id),
+    }));
+    tabs.push({
+      id: "all",
+      label: "All",
+      count: `${fabrics.length} fabrics`,
+      title: "Every fabric at once, side by side",
+    });
+    for (const tab of tabs) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "topo-tab" + (tab.id === current ? " is-active" : "");
+      button.title = tab.title;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", String(tab.id === current));
+      const label = document.createElement("span");
+      label.textContent = tab.label;
+      const count = document.createElement("span");
+      count.className = "muted";
+      count.textContent = tab.count;
+      button.append(label, count);
+      button.addEventListener("click", () => setTopoFabric(tab.id));
+      dom.topoTabs.append(button);
+    }
+  }
+
+  /** The nodes on a tab, for a tab whose name cannot say which fabric it is. */
+  function topoFabricMembers(graph, id) {
+    const names = graph.nodes
+      .filter((node) => !isTopoAttached(node) && (node.fabrics || []).includes(id))
+      .map((node) => node.label);
+    const shown = names.slice(0, 6).join(", ");
+    return names.length > 6 ? `${shown} and ${names.length - 6} more` : shown;
+  }
+
+  function setTopoFabric(id) {
+    if (id === state.topoFabric) return;
+    state.topoFabric = id;
+    try {
+      localStorage.setItem("fcli-topo-fabric", id);
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
+    dom.topoCanvas.scrollLeft = 0;
+    dom.topoCanvas.scrollTop = 0;
+    if (state.topology) renderTopology(state.topology);
+  }
+
+  /** The fabric holding *name*, when the one on the tab does not. */
+  function topoFabricElsewhere(name) {
+    if (!state.topology) return null;
+    const current = currentTopoFabric(state.topology);
+    if (current === "all") return null;
+    const node = (state.topology.nodes || []).find((entry) => entry.name === name);
+    const fabrics = (node && node.fabrics) || [];
+    if (!fabrics.length || fabrics.includes(current)) return null;
+    return fabrics[0];
+  }
+
   /* --------------------------------------------------------- topology zoom */
 
-  const clampZoom = (zoom) => Math.min(TOPO_ZOOM_MAX, Math.max(TOPO_ZOOM_MIN, zoom));
+  const clampZoom = (zoom) =>
+    Number.isFinite(zoom) ? Math.min(TOPO_ZOOM_MAX, Math.max(TOPO_ZOOM_MIN, zoom)) : 1;
 
   /** The zoom in force: the fitted one while fit mode is on, else the picked one. */
   const topoZoom = () => (state.topoFit ? topoFitZoom() : state.topoZoom);
@@ -656,7 +770,8 @@
 
   function fitTopoZoom() {
     state.topoFit = true;
-    dom.topoCanvas.scrollTo(0, 0);
+    dom.topoCanvas.scrollLeft = 0;
+    dom.topoCanvas.scrollTop = 0;
     applyTopoZoom();
     saveTopoZoom();
   }
@@ -687,6 +802,14 @@
     if (!zoom) return;
     state.topoFit = false;
     state.topoZoom = clampZoom(zoom);
+  }
+
+  function restoreTopoFabric() {
+    try {
+      state.topoFabric = localStorage.getItem("fcli-topo-fabric") || null;
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
   }
 
   function renderTopoLinks(graph, layout) {
@@ -914,6 +1037,15 @@
 
   function selectTopo(selection) {
     state.topoSelection = selection;
+    // Walking the peer list of a client can lead to a node of another fabric,
+    // which is drawn on its own tab; go there rather than nowhere.
+    if (selection && selection.kind === "node") {
+      const elsewhere = topoFabricElsewhere(selection.id);
+      if (elsewhere) {
+        setTopoFabric(elsewhere);
+        return;
+      }
+    }
     applyTopoSelection();
   }
 
@@ -3015,6 +3147,7 @@
     /* storage may be unavailable */
   }
   restoreTopoZoom();
+  restoreTopoFabric();
 
   loadReports();
   loadInventory();
