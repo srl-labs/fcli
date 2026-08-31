@@ -1283,16 +1283,44 @@ button.pill-jump:focus-visible {
   display: flex;
 }
 
+.topo-zoom {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.topo-zoom .btn {
+  padding: 3px 8px;
+  font-size: 12px;
+  min-width: 28px;
+}
+
+.topo-zoom #topo-zoom-level {
+  min-width: 54px;
+  font-family: var(--mono);
+}
+
+.topo-zoom .btn.is-active {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
 .topo-canvas {
   flex: 1;
   min-width: 0;
   overflow: auto;
   padding: 18px;
+  cursor: grab;
+}
+
+.topo-canvas.is-panning {
+  cursor: grabbing;
+  user-select: none;
 }
 
 .topo-svg {
-  max-width: 100%;
-  height: auto;
+  display: block;
+  margin: 0 auto;
   font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
 }
 

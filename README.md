@@ -606,6 +606,14 @@ coloured by the oper-state of the ports it lands on. Hovering a node pushes back
 everything it is not cabled to; clicking one opens its services and its per-port
 peer list, and clicking a peer from there walks the fabric.
 
+A fabric wide enough that its node names stop being readable is navigated rather
+than read whole: the drawing zooms with the `−` / `+` buttons, with `ctrl` and
+the wheel (a trackpad pinch does the same), and with `-`, `+` and `0` on the
+keyboard, and it pans by dragging it. **fit** scales the whole fabric down to the
+window and follows it as the window and the detail panel change size; the zoom
+you pick instead is remembered across reloads. Dragging pans without selecting
+what the drag started on, so a node is only opened by a click that stays put.
+
 Neighbours are matched back to the inventory through the name they advertise, so
 a containerlab node the inventory calls `clab-dc1-leaf1` is recognized when its
 neighbour reports it as `leaf1`. A neighbour that matches no node of the
