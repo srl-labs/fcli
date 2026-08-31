@@ -47,8 +47,13 @@
     topoCanvas: el("topo-canvas"),
     topoLegend: el("topo-legend"),
     topoStats: el("topo-stats"),
+    topoTabs: el("topo-tabs"),
     topoDetail: el("topo-detail"),
     topoPortLabels: el("topo-port-labels"),
+    topoZoomIn: el("topo-zoom-in"),
+    topoZoomOut: el("topo-zoom-out"),
+    topoZoomLevel: el("topo-zoom-level"),
+    topoZoomFit: el("topo-zoom-fit"),
     servicesTreeView: el("services-tree-view"),
     viewModeBtn: el("view-mode-btn"),
     headRow: el("head-row"),
@@ -110,6 +115,10 @@
     topology: null,
     topoSelection: null,
     topoKey: "",
+    topoSize: null, // the drawing in its own units, before any zoom
+    topoZoom: 1,
+    topoFit: true,
+    topoFabric: null, // the fabric being drawn, or "all"
     collapsedCards: new Set(),
     collapsedNodes: new Set(),
     navStack: [],
@@ -440,6 +449,12 @@
     padY: 24,
   };
 
+  // Low enough that a fabric wide enough to need panning at any readable size
+  // can still be taken in whole.
+  const TOPO_ZOOM_MIN = 0.05;
+  const TOPO_ZOOM_MAX = 4;
+  const TOPO_ZOOM_STEP = 1.25;
+
   const shortPort = (port) => String(port || "").replace(/^ethernet-/, "e");
 
   async function loadTopology() {
@@ -451,7 +466,6 @@
       const res = await fetch("/api/topology" + (inv ? `?${params}` : ""));
       const graph = await res.json();
       setLive("live", "live");
-      dom.rowCount.textContent = `${graph.nodes.length} node(s), ${graph.links.length} link(s)`;
       dom.streamInfo.textContent = `LLDP topology, rendered in ${graph.render_ms} ms`;
       dom.updated.textContent = "updated " + new Date().toLocaleTimeString();
       // Re-drawing would drop the hover and lose the scroll position, and a
@@ -517,24 +531,30 @@
     };
   }
 
-  function renderTopology(graph) {
+  function renderTopology(whole) {
+    // Everything below draws one fabric; the whole graph stays in state, so a
+    // node of another one is still there to be looked up and walked to.
+    renderTopoTabs(whole);
+    const graph = topoFabricView(whole);
     dom.topoCanvas.replaceChildren();
     renderTopoLegend(graph);
     dom.topoStats.textContent = topoSummary(graph);
+    dom.rowCount.textContent = `${graph.nodes.length} node(s), ${graph.links.length} link(s)`;
     if (!graph.nodes.length) {
       const empty = document.createElement("p");
       empty.className = "empty";
       empty.textContent = "No nodes are streaming LLDP yet.";
       dom.topoCanvas.append(empty);
+      state.topoSize = null;
+      applyTopoZoom();
       return;
     }
 
     const layout = layoutTopology(graph);
+    state.topoSize = { width: layout.width, height: layout.height };
     const svg = svgEl("svg", {
       class: "topo-svg",
       viewBox: `0 0 ${layout.width} ${layout.height}`,
-      width: layout.width,
-      height: layout.height,
       role: "img",
       "aria-label": "Fabric topology",
     });
@@ -564,6 +584,7 @@
     svg.append(renderTopoLinks(graph, layout));
     svg.append(renderTopoNodes(graph, layout));
     dom.topoCanvas.append(svg);
+    applyTopoZoom();
 
     svg.addEventListener("mouseover", (event) => {
       const target = event.target.closest("[data-node]");
@@ -579,6 +600,216 @@
     });
 
     applyTopoSelection();
+  }
+
+  /* ------------------------------------------------------- topology fabrics */
+
+  const topoFabrics = (graph) => (graph && graph.fabrics) || [];
+
+  /** The fabric a tab is on, falling back to the largest one it could be. */
+  function currentTopoFabric(graph) {
+    const fabrics = topoFabrics(graph);
+    if (fabrics.length < 2) return "all";
+    if (state.topoFabric === "all") return "all";
+    if (fabrics.some((fabric) => fabric.id === state.topoFabric)) return state.topoFabric;
+    return fabrics[0].id;
+  }
+
+  /** The graph reduced to the fabric on the tab, layers and legend with it. */
+  function topoFabricView(graph) {
+    const id = currentTopoFabric(graph);
+    if (id === "all") return graph;
+    const nodes = graph.nodes.filter((node) => (node.fabrics || []).includes(id));
+    const names = new Set(nodes.map((node) => node.name));
+    return {
+      ...graph,
+      nodes,
+      links: graph.links.filter((link) => names.has(link.a) && names.has(link.b)),
+      layers: graph.layers
+        .map((layer) => ({ ...layer, nodes: layer.nodes.filter((name) => names.has(name)) }))
+        .filter((layer) => layer.nodes.length),
+      roles: nodes.reduce((counts, node) => {
+        counts[node.role] = (counts[node.role] || 0) + 1;
+        return counts;
+      }, {}),
+      unresolved: graph.unresolved.filter((entry) => names.has(entry.peer)),
+    };
+  }
+
+  function renderTopoTabs(graph) {
+    const fabrics = topoFabrics(graph);
+    dom.topoTabs.replaceChildren();
+    // One fabric is the whole drawing; a tab strip of one says nothing.
+    dom.topoTabs.hidden = fabrics.length < 2;
+    if (fabrics.length < 2) return;
+    const current = currentTopoFabric(graph);
+    state.topoFabric = current;
+    const tabs = fabrics.map((fabric) => ({
+      id: fabric.id,
+      label: fabric.label,
+      // The nodes of the fabric rather than the boxes drawn for it: the clients
+      // are counted again on every other fabric they are plugged into.
+      count: `${fabric.devices} devices`,
+      title: topoFabricMembers(graph, fabric.id),
+    }));
+    tabs.push({
+      id: "all",
+      label: "All",
+      count: `${fabrics.length} fabrics`,
+      title: "Every fabric at once, side by side",
+    });
+    for (const tab of tabs) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "topo-tab" + (tab.id === current ? " is-active" : "");
+      button.title = tab.title;
+      button.setAttribute("role", "tab");
+      button.setAttribute("aria-selected", String(tab.id === current));
+      const label = document.createElement("span");
+      label.textContent = tab.label;
+      const count = document.createElement("span");
+      count.className = "muted";
+      count.textContent = tab.count;
+      button.append(label, count);
+      button.addEventListener("click", () => setTopoFabric(tab.id));
+      dom.topoTabs.append(button);
+    }
+  }
+
+  /** The nodes on a tab, for a tab whose name cannot say which fabric it is. */
+  function topoFabricMembers(graph, id) {
+    const names = graph.nodes
+      .filter((node) => !isTopoAttached(node) && (node.fabrics || []).includes(id))
+      .map((node) => node.label);
+    const shown = names.slice(0, 6).join(", ");
+    return names.length > 6 ? `${shown} and ${names.length - 6} more` : shown;
+  }
+
+  function setTopoFabric(id) {
+    if (id === state.topoFabric) return;
+    state.topoFabric = id;
+    try {
+      localStorage.setItem("fcli-topo-fabric", id);
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
+    dom.topoCanvas.scrollLeft = 0;
+    dom.topoCanvas.scrollTop = 0;
+    if (state.topology) renderTopology(state.topology);
+  }
+
+  /** The fabric holding *name*, when the one on the tab does not. */
+  function topoFabricElsewhere(name) {
+    if (!state.topology) return null;
+    const current = currentTopoFabric(state.topology);
+    if (current === "all") return null;
+    const node = (state.topology.nodes || []).find((entry) => entry.name === name);
+    const fabrics = (node && node.fabrics) || [];
+    if (!fabrics.length || fabrics.includes(current)) return null;
+    return fabrics[0];
+  }
+
+  /* --------------------------------------------------------- topology zoom */
+
+  const clampZoom = (zoom) =>
+    Number.isFinite(zoom) ? Math.min(TOPO_ZOOM_MAX, Math.max(TOPO_ZOOM_MIN, zoom)) : 1;
+
+  /** The zoom in force: the fitted one while fit mode is on, else the picked one. */
+  const topoZoom = () => (state.topoFit ? topoFitZoom() : state.topoZoom);
+
+  /** The zoom at which the whole drawing fits the canvas, never magnifying it. */
+  function topoFitZoom() {
+    const size = state.topoSize;
+    if (!size || !size.width || !size.height) return 1;
+    const style = getComputedStyle(dom.topoCanvas);
+    const padX = parseFloat(style.paddingLeft) + parseFloat(style.paddingRight);
+    const padY = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom);
+    const width = dom.topoCanvas.clientWidth - padX;
+    const height = dom.topoCanvas.clientHeight - padY;
+    if (width <= 0 || height <= 0) return 1;
+    return clampZoom(Math.min(1, width / size.width, height / size.height));
+  }
+
+  /** Size the drawing to the current zoom and put the buttons in step with it. */
+  function applyTopoZoom() {
+    const svg = dom.topoCanvas.querySelector(".topo-svg");
+    const zoom = topoZoom();
+    if (svg && state.topoSize) {
+      svg.style.width = `${Math.round(state.topoSize.width * zoom)}px`;
+      svg.style.height = `${Math.round(state.topoSize.height * zoom)}px`;
+    }
+    dom.topoZoomLevel.textContent = `${Math.round(zoom * 100)}%`;
+    dom.topoZoomFit.classList.toggle("is-active", state.topoFit);
+  }
+
+  /**
+   * Zoom to *zoom*, holding still whatever is under *anchor* (a viewport point,
+   * the pointer or the middle of the canvas), so the fabric does not slide out
+   * from under the part being read.
+   */
+  function setTopoZoom(zoom, anchor) {
+    const before = topoZoom();
+    const after = clampZoom(zoom);
+    state.topoFit = false;
+    state.topoZoom = after;
+    if (after === before) {
+      applyTopoZoom();
+      saveTopoZoom();
+      return;
+    }
+    const svg = dom.topoCanvas.querySelector(".topo-svg");
+    const rect = svg ? svg.getBoundingClientRect() : null;
+    const point = rect && { x: (anchor.x - rect.left) / before, y: (anchor.y - rect.top) / before };
+    applyTopoZoom();
+    if (point) {
+      dom.topoCanvas.scrollLeft += point.x * (after - before);
+      dom.topoCanvas.scrollTop += point.y * (after - before);
+    }
+    saveTopoZoom();
+  }
+
+  function fitTopoZoom() {
+    state.topoFit = true;
+    dom.topoCanvas.scrollLeft = 0;
+    dom.topoCanvas.scrollTop = 0;
+    applyTopoZoom();
+    saveTopoZoom();
+  }
+
+  /** The middle of the canvas, for zooming that did not start at a pointer. */
+  function topoCanvasCenter() {
+    const rect = dom.topoCanvas.getBoundingClientRect();
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  }
+
+  function saveTopoZoom() {
+    try {
+      localStorage.setItem("fcli-topo-zoom", state.topoFit ? "fit" : String(state.topoZoom));
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
+  }
+
+  function restoreTopoZoom() {
+    let stored = null;
+    try {
+      stored = localStorage.getItem("fcli-topo-zoom");
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
+    if (!stored || stored === "fit") return;
+    const zoom = parseFloat(stored);
+    if (!zoom) return;
+    state.topoFit = false;
+    state.topoZoom = clampZoom(zoom);
+  }
+
+  function restoreTopoFabric() {
+    try {
+      state.topoFabric = localStorage.getItem("fcli-topo-fabric") || null;
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
   }
 
   function renderTopoLinks(graph, layout) {
@@ -806,6 +1037,15 @@
 
   function selectTopo(selection) {
     state.topoSelection = selection;
+    // Walking the peer list of a client can lead to a node of another fabric,
+    // which is drawn on its own tab; go there rather than nowhere.
+    if (selection && selection.kind === "node") {
+      const elsewhere = topoFabricElsewhere(selection.id);
+      if (elsewhere) {
+        setTopoFabric(elsewhere);
+        return;
+      }
+    }
     applyTopoSelection();
   }
 
@@ -2775,6 +3015,98 @@
     if (state.topology) renderTopology(state.topology);
   });
 
+  dom.topoZoomIn.addEventListener("click", () =>
+    setTopoZoom(topoZoom() * TOPO_ZOOM_STEP, topoCanvasCenter())
+  );
+  dom.topoZoomOut.addEventListener("click", () =>
+    setTopoZoom(topoZoom() / TOPO_ZOOM_STEP, topoCanvasCenter())
+  );
+  dom.topoZoomLevel.addEventListener("click", () => setTopoZoom(1, topoCanvasCenter()));
+  dom.topoZoomFit.addEventListener("click", fitTopoZoom);
+
+  dom.topoCanvas.addEventListener(
+    "wheel",
+    (event) => {
+      // A bare wheel scrolls the canvas; ctrl (or a trackpad pinch, which
+      // arrives as one) zooms, as it does in a map.
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      setTopoZoom(topoZoom() * Math.exp(-event.deltaY * 0.002), {
+        x: event.clientX,
+        y: event.clientY,
+      });
+    },
+    { passive: false }
+  );
+
+  // Dragging the canvas pans it. A drag that moves is not a click, so the
+  // selection a node or a link would otherwise take is swallowed below.
+  let topoPan = null;
+  let topoPanned = false;
+  dom.topoCanvas.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0 && event.button !== 1) return;
+    topoPanned = false;
+    topoPan = {
+      x: event.clientX,
+      y: event.clientY,
+      left: dom.topoCanvas.scrollLeft,
+      top: dom.topoCanvas.scrollTop,
+      moved: false,
+    };
+  });
+  window.addEventListener("pointermove", (event) => {
+    if (!topoPan) return;
+    const dx = event.clientX - topoPan.x;
+    const dy = event.clientY - topoPan.y;
+    if (!topoPan.moved && Math.abs(dx) + Math.abs(dy) < 5) return;
+    topoPan.moved = true;
+    dom.topoCanvas.classList.add("is-panning");
+    dom.topoCanvas.scrollLeft = topoPan.left - dx;
+    dom.topoCanvas.scrollTop = topoPan.top - dy;
+  });
+  window.addEventListener("pointerup", () => {
+    if (!topoPan) return;
+    topoPanned = topoPan.moved;
+    topoPan = null;
+    dom.topoCanvas.classList.remove("is-panning");
+  });
+  dom.topoCanvas.addEventListener(
+    "click",
+    (event) => {
+      if (!topoPanned) return;
+      event.stopPropagation();
+    },
+    true
+  );
+
+  document.addEventListener("keydown", (event) => {
+    if (dom.topologyView.hidden || event.ctrlKey || event.metaKey || event.altKey) return;
+    const target = event.target;
+    if (target && target.closest && target.closest("input, textarea, select")) return;
+    if (event.key === "+" || event.key === "=") setTopoZoom(topoZoom() * TOPO_ZOOM_STEP, topoCanvasCenter());
+    else if (event.key === "-" || event.key === "_") setTopoZoom(topoZoom() / TOPO_ZOOM_STEP, topoCanvasCenter());
+    else if (event.key === "0") setTopoZoom(1, topoCanvasCenter());
+    else if (event.key === "f" || event.key === "F") fitTopoZoom();
+    else return;
+    event.preventDefault();
+  });
+
+  if (window.ResizeObserver) {
+    // A fitted drawing follows the canvas, which changes with the window but
+    // also when the detail panel opens beside it.
+    let fitted = 0;
+    const observer = new ResizeObserver(() => {
+      if (dom.topologyView.hidden || !state.topoFit) return;
+      const zoom = topoFitZoom();
+      // Resizing the drawing resizes the canvas back when a scrollbar comes or
+      // goes, so ignore what a redraw would not move.
+      if (Math.abs(zoom - fitted) < 0.005) return;
+      fitted = zoom;
+      applyTopoZoom();
+    });
+    observer.observe(dom.topoCanvas);
+  }
+
   dom.columnsBtn.addEventListener("click", () => {
     dom.columnsMenu.hidden = !dom.columnsMenu.hidden;
   });
@@ -2814,6 +3146,8 @@
   } catch (_err) {
     /* storage may be unavailable */
   }
+  restoreTopoZoom();
+  restoreTopoFabric();
 
   loadReports();
   loadInventory();

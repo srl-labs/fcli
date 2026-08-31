@@ -606,6 +606,30 @@ coloured by the oper-state of the ports it lands on. Hovering a node pushes back
 everything it is not cabled to; clicking one opens its services and its per-port
 peer list, and clicking a peer from there walks the fabric.
 
+A drawing is not always one fabric. Nodes that share no cable with each other
+are separate topologies, however many clients happen to be plugged into both of
+them: a server in two pods says nothing about a path between them, and drawing
+them as one claims a crossing that does not exist. So the split is made on the
+cables between nodes alone and each fabric gets a **tab** of its own, largest
+first, with **All** at the end for everything side by side. A client plugged
+into two fabrics is drawn on both tabs, and walking from it to a leaf on the
+other one switches tab with it. The tabs are named after whatever tells them
+apart — the site their nodes share, the name their nodes share (`frontend-leaf1`
+and `frontend-spine1` make a `frontend` tab), or their rank — and a naming that
+does not fit every fabric of the drawing is used for none of them, so no tab
+reads as a name beside another that reads as a placeholder. Nodes cabled to
+nothing at all, including one whose LLDP has not arrived yet, are gathered on an
+**Unattached** tab rather than getting one each, and while nothing has any
+cables the fabric stays whole.
+
+A fabric wide enough that its node names stop being readable is navigated rather
+than read whole: the drawing zooms with the `−` / `+` buttons, with `ctrl` and
+the wheel (a trackpad pinch does the same), and with `-`, `+` and `0` on the
+keyboard, and it pans by dragging it. **fit** scales the whole fabric down to the
+window and follows it as the window and the detail panel change size; the zoom
+you pick instead is remembered across reloads. Dragging pans without selecting
+what the drag started on, so a node is only opened by a click that stays put.
+
 Neighbours are matched back to the inventory through the name they advertise, so
 a containerlab node the inventory calls `clab-dc1-leaf1` is recognized when its
 neighbour reports it as `leaf1`. A neighbour that matches no node of the
@@ -720,7 +744,7 @@ The UI is a client of a small JSON API, which is just as usable from scripts:
 | `GET /api/reports` | The available reports and their metadata |
 | `GET /api/inventory` | Inventory nodes, labels and connection state |
 | `GET /api/status` | Per-node subscription state |
-| `GET /api/topology` | The fabric graph: nodes with their inferred tier, the clients hanging off them, and the links between them |
+| `GET /api/topology` | The fabric graph: nodes with their inferred tier and the fabric they are cabled into, the clients hanging off them, and the links between them |
 | `GET /api/report/{name}` | One rendered table as JSON |
 | `GET /api/stream/{name}` | The same table, pushed as server-sent events |
 

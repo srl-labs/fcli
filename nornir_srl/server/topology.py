@@ -28,7 +28,9 @@ object in its own right: it has a name, an ESI that every leaf on it agrees on,
 and it is where multi-homing goes wrong. So it is drawn as a tier of its own,
 and the client hangs off the bundle rather than off each leaf.
 
-The result is drawn one tier per layer, clients at the bottom and the WAN on top.
+The result is drawn one tier per layer, clients at the bottom and the WAN on top,
+and is split into **fabrics**: nodes that share no cable with each other are not
+one topology, however many clients happen to be plugged into both of them.
 """
 
 from __future__ import annotations
@@ -54,6 +56,10 @@ _SEGMENT_PREFIX = "es:"
 #: Roles that share the layer holding whatever we could not place: nodes that
 #: have told us nothing yet, and nodes we only know from someone's LLDP.
 _EDGE_ROLES = ("unknown", "external")
+
+#: Roles that are not a node of the fabric but something drawn from what a node
+#: is configured towards, and that therefore cannot join two fabrics into one.
+_ATTACHED_ROLES = ("client", "segment")
 
 _LAYER_OF = {role: layer for layer, role, _ in LAYERS}
 _LAYER_OF.update({role: _LAYER_OF["edge"] for role in _EDGE_ROLES})
@@ -261,13 +267,15 @@ def build_topology(facts: Iterable[NodeFacts]) -> Dict[str, Any]:
     payload.extend(clients)
     payload.sort(key=lambda n: (-n["layer"], n["site"], _row_order(n), n["label"]))
     layer_of = {node["name"]: node["layer"] for node in payload}
+    cables = [_link_payload(link, layer_of) for _key, link in sorted(links.items())]
 
     return {
         "nodes": payload,
-        "links": [_link_payload(link, layer_of) for _key, link in sorted(links.items())],
+        "links": cables,
         # Top of the drawing first, and only the tiers this fabric actually has.
         "layers": _layers(payload),
         "roles": _role_counts(payload),
+        "fabrics": _assign_fabrics(payload, cables),
         "sites": sorted({n["site"] for n in payload if n["site"]}),
         "unresolved": [
             {"peer": name, "seen_by": sorted(seen_by)} for name, seen_by in sorted(outside.items())
@@ -375,6 +383,141 @@ def _role_counts(nodes: List[Dict[str, Any]]) -> Dict[str, int]:
     for node in nodes:
         counts[node["role"]] = counts.get(node["role"], 0) + 1
     return counts
+
+
+# --------------------------------------------------------------------------- #
+# fabrics
+# --------------------------------------------------------------------------- #
+
+
+def _assign_fabrics(
+    nodes: List[Dict[str, Any]], links: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Split the drawing into the fabrics that share no cable between nodes.
+
+    Two nodes that meet only through a client are not one fabric. A server
+    plugged into two pods, or into a DC and the one beside it, says nothing
+    about the underlay of either, and drawing them as one topology claims a
+    path across that does not exist. So the split is made on the cables between
+    nodes alone, and a client is then drawn in every fabric it attaches to.
+
+    A node with no such cable at all - one whose LLDP has not arrived yet, or
+    one genuinely patched to nothing - is not a fabric of its own; those are
+    gathered into a single group. Unless there are no cables anywhere, in which
+    case they are the fabric rather than the leftovers of one, which is how a
+    freshly started server draws one topology instead of one per node.
+
+    Stamps ``fabrics`` on every node and returns the groups, largest first.
+    """
+    adjacency: Dict[str, Set[str]] = {
+        node["name"]: set() for node in nodes if node["role"] not in _ATTACHED_ROLES
+    }
+    for link in links:
+        if link["access"]:
+            continue
+        if link["a"] in adjacency and link["b"] in adjacency:
+            adjacency[link["a"]].add(link["b"])
+            adjacency[link["b"]].add(link["a"])
+
+    components = _components(adjacency)
+    cabled = sorted(
+        (members for members in components if len(members) > 1),
+        key=lambda members: (-len(members), members[0]),
+    )
+    loose = sorted(name for members in components if len(members) == 1 for name in members)
+    groups: List[Tuple[List[str], bool]] = [(members, False) for members in cabled]
+    if loose:
+        groups.append((loose, bool(cabled)))
+
+    fabric_of = {name: members[0] for members, _loose in groups for name in members}
+    rank_of = {members[0]: rank for rank, (members, _loose) in enumerate(groups)}
+    for node in nodes:
+        if node["role"] in _ATTACHED_ROLES:
+            found = {fabric_of[a["node"]] for a in node["attachments"] if a["node"] in fabric_of}
+        else:
+            found = {fabric_of[node["name"]]}
+        node["fabrics"] = sorted(found, key=lambda fabric: rank_of[fabric])
+
+    counts: Dict[str, int] = {}
+    for node in nodes:
+        for fabric in node["fabrics"]:
+            counts[fabric] = counts.get(fabric, 0) + 1
+    labels = _fabric_labels(groups, {node["name"]: node for node in nodes})
+    return [
+        {
+            "id": members[0],
+            "label": label,
+            "nodes": counts.get(members[0], 0),
+            "devices": len(members),
+        }
+        for (members, _loose), label in zip(groups, labels)
+    ]
+
+
+def _components(adjacency: Dict[str, Set[str]]) -> List[List[str]]:
+    """The connected components of *adjacency*, each sorted by name."""
+    seen: Set[str] = set()
+    result = []
+    for start in sorted(adjacency):
+        if start in seen:
+            continue
+        members: Set[str] = set()
+        stack = [start]
+        while stack:
+            name = stack.pop()
+            if name in members:
+                continue
+            members.add(name)
+            seen.add(name)
+            stack.extend(adjacency[name] - members)
+        result.append(sorted(members))
+    return result
+
+
+def _fabric_labels(
+    groups: List[Tuple[List[str], bool]], by_name: Dict[str, Dict[str, Any]]
+) -> List[str]:
+    """Name every fabric the same way, or none of them that way.
+
+    A fabric is best named after itself: the site its nodes are labelled with,
+    or the name they share, says what ``Fabric 2`` cannot. But a scheme that
+    fits one fabric and not the next reads as though the two were different
+    kinds of thing - ``frontend`` beside ``Fabric 1`` looks like a name beside a
+    placeholder - so a scheme is only used when it names every fabric of the
+    drawing, and distinctly. Failing that they are numbered, largest first.
+    """
+    cabled = [members for members, loose in groups if not loose]
+    for naming in (_fabric_site, _fabric_shared_name):
+        names = [naming(members, by_name) for members in cabled]
+        if all(names) and len(set(names)) == len(names):
+            found = iter(names)
+            return ["Unattached" if loose else next(found) for _members, loose in groups]
+    return [
+        "Unattached" if loose else f"Fabric {rank}"
+        for rank, (_members, loose) in enumerate(groups, start=1)
+    ]
+
+
+def _fabric_site(members: List[str], by_name: Dict[str, Dict[str, Any]]) -> str:
+    """The site every node of the fabric is labelled with, if they agree on one."""
+    sites = {by_name[name]["site"] for name in members}
+    return next(iter(sites)) if len(sites) == 1 else ""
+
+
+def _fabric_shared_name(members: List[str], by_name: Dict[str, Dict[str, Any]]) -> str:
+    """The dash-separated head every node shares: ``frontend-leaf1`` is ``frontend``.
+
+    Only a head shorter than the shortest name counts, so nodes that agree on
+    their whole name do not name the fabric after themselves.
+    """
+    parts = [by_name[name]["label"].split("-") for name in members]
+    shared: List[str] = []
+    for index in range(min(len(name) for name in parts) - 1):
+        segment = parts[0][index]
+        if any(name[index] != segment for name in parts):
+            break
+        shared.append(segment)
+    return "-".join(shared)
 
 
 # --------------------------------------------------------------------------- #

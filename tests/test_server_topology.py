@@ -1081,3 +1081,116 @@ def test_a_segment_takes_the_site_of_the_leaves_it_lands_on():
 def test_a_segment_is_counted_as_its_own_role():
     graph = build_topology([_multi_homed_leaf("leaf1"), _multi_homed_leaf("leaf2")])
     assert graph["roles"] == {"leaf": 2, "segment": 1, "client": 1}
+
+
+# --------------------------------------------------------------------------- #
+# fabrics
+# --------------------------------------------------------------------------- #
+
+
+def _pod(prefix: str, *, site: str = "", client: bool = False) -> List[Any]:
+    """A leaf and a spine cabled to each other and to nothing outside the pod.
+
+    With *client*, the leaf has its port in the ethernet-segment ``ESI`` instead
+    of running plain services, so that two pods can be given the one multi-homed
+    client between them.
+    """
+    services: Dict[str, Any] = {"instances": LEAF_SERVICES}
+    if client:
+        services = {
+            "instances": (_ni("mac-vrf-100", "mac-vrf", members=("lag1.100",)),),
+            "segments": (("mh-server1", ESI, "lag1"),),
+        }
+    return [
+        _facts(
+            f"{prefix}-leaf1",
+            host_name=f"{prefix}-leaf1",
+            site=site,
+            cables=(("ethernet-1/1", f"{prefix}-spine1", "ethernet-1/1"),),
+            **services,
+        ),
+        _facts(
+            f"{prefix}-spine1",
+            host_name=f"{prefix}-spine1",
+            site=site,
+            cables=(("ethernet-1/1", f"{prefix}-leaf1", "ethernet-1/1"),),
+            instances=NO_SERVICES,
+        ),
+    ]
+
+
+def _fabrics_of(graph: Dict[str, Any], name: str) -> List[str]:
+    return next(node for node in graph["nodes"] if node["name"] == name)["fabrics"]
+
+
+def test_a_fabric_that_is_all_one_piece_is_a_single_group():
+    graph = build_topology(_fabric())
+    assert [fabric["id"] for fabric in graph["fabrics"]] == ["clab-dc-dcgw1"]
+    assert all(node["fabrics"] == ["clab-dc-dcgw1"] for node in graph["nodes"])
+
+
+def test_nodes_that_share_no_cable_are_separate_fabrics():
+    graph = build_topology(_pod("frontend") + _pod("backend"))
+    assert [fabric["label"] for fabric in graph["fabrics"]] == ["backend", "frontend"]
+    assert _fabrics_of(graph, "clab-dc-backend-leaf1") == ["clab-dc-backend-leaf1"]
+    assert _fabrics_of(graph, "clab-dc-frontend-spine1") == ["clab-dc-frontend-leaf1"]
+
+
+def test_a_client_plugged_into_two_fabrics_does_not_join_them():
+    """A server in both pods says nothing about a path between them."""
+    graph = build_topology(_pod("frontend", client=True) + _pod("backend", client=True))
+    assert len(graph["fabrics"]) == 2
+    both = ["clab-dc-backend-leaf1", "clab-dc-frontend-leaf1"]
+    # The one client, and the bundle it reaches its two leaves over, are drawn
+    # on either tab rather than only on the one its first leaf happens to be on.
+    assert _fabrics_of(graph, ESI) == both
+    assert _fabrics_of(graph, f"es:{ESI}") == both
+
+
+def test_the_largest_fabric_comes_first():
+    graph = build_topology(_fabric() + _pod("frontend"))
+    assert [fabric["devices"] for fabric in graph["fabrics"]] == [8, 2]
+
+
+def test_the_fabrics_are_named_after_the_sites_their_nodes_share():
+    graph = build_topology(_pod("pod1", site="dc1") + _pod("pod2", site="dc2"))
+    assert [fabric["label"] for fabric in graph["fabrics"]] == ["dc1", "dc2"]
+
+
+def test_the_fabrics_are_named_after_the_names_their_nodes_share():
+    graph = build_topology(_pod("frontend") + _pod("backend"))
+    assert [fabric["label"] for fabric in graph["fabrics"]] == ["backend", "frontend"]
+
+
+def test_a_naming_that_does_not_fit_every_fabric_is_used_for_none_of_them():
+    """'frontend' beside 'Fabric 1' reads as a name beside a placeholder."""
+    graph = build_topology(_fabric() + _pod("frontend"))
+    assert [fabric["label"] for fabric in graph["fabrics"]] == ["Fabric 1", "Fabric 2"]
+
+
+def test_a_site_two_fabrics_share_names_neither_of_them():
+    """Two tabs reading 'dc1' say nothing about which is which."""
+    graph = build_topology(_pod("pod1", site="dc1") + _pod("pod2", site="dc1"))
+    assert [fabric["label"] for fabric in graph["fabrics"]] == ["pod1", "pod2"]
+
+
+def test_a_node_cabled_to_nothing_is_not_a_fabric_of_its_own():
+    """One tab per unreachable node would be a tab bar of nothing but noise."""
+    graph = build_topology(
+        _pod("frontend")
+        + [_facts("leaf9", host_name="leaf9"), _facts("leaf8", host_name="leaf8")]
+    )
+    assert [fabric["label"] for fabric in graph["fabrics"]] == ["frontend", "Unattached"]
+    assert graph["fabrics"][1]["devices"] == 2
+
+
+def test_a_fabric_that_has_streamed_no_lldp_yet_is_one_fabric():
+    """Every node is cabled to nothing at startup; that is not a tab each."""
+    graph = build_topology([_facts("leaf1", site="dc1"), _facts("leaf2", site="dc1")])
+    assert [fabric["label"] for fabric in graph["fabrics"]] == ["dc1"]
+
+
+def test_a_fabric_counts_the_clients_hanging_off_it():
+    graph = build_topology([_leaf_with_a_client()])
+    fabric = graph["fabrics"][0]
+    assert (fabric["devices"], fabric["nodes"]) == (2, 3)

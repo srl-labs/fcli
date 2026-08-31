@@ -185,8 +185,40 @@
               <input id="topo-port-labels" type="checkbox" />
               <span class="muted">port labels</span>
             </label>
+            <div class="topo-zoom" role="group" aria-label="Zoom">
+              <button
+                id="topo-zoom-out"
+                class="btn btn-ghost"
+                type="button"
+                title="Zoom out (-)"
+                aria-label="Zoom out"
+              >
+                −
+              </button>
+              <button
+                id="topo-zoom-level"
+                class="btn btn-ghost"
+                type="button"
+                title="Reset to 100% (0)"
+              >
+                100%
+              </button>
+              <button
+                id="topo-zoom-in"
+                class="btn btn-ghost"
+                type="button"
+                title="Zoom in (+)"
+                aria-label="Zoom in"
+              >
+                +
+              </button>
+              <button id="topo-zoom-fit" class="btn btn-ghost" type="button" title="Fit to window (f)">
+                ⤢ fit
+              </button>
+            </div>
             <span id="topo-stats" class="muted"></span>
           </div>
+          <div id="topo-tabs" class="topo-tabs" role="tablist" aria-label="Fabrics" hidden></div>
           <div class="topo-body">
             <div id="topo-canvas" class="topo-canvas"></div>
             <aside id="topo-detail" class="topo-detail" hidden></aside>
