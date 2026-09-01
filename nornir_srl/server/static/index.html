@@ -19,23 +19,34 @@
           <span id="topo-badge" class="topo-badge" hidden></span>
         </header>
 
-        <div class="side-block">
-          <input
-            id="report-search"
-            class="input"
-            type="search"
-            placeholder="Filter reports…"
-            autocomplete="off"
-          />
-          <nav id="report-list" class="report-list" aria-label="Reports"></nav>
-        </div>
-
-        <div class="side-block nodes-block">
-          <div class="side-title">
-            <span>Nodes</span>
-            <span id="node-summary" class="muted"></span>
+        <div id="side-split" class="side-split">
+          <div class="side-block reports-block">
+            <input
+              id="report-search"
+              class="input"
+              type="search"
+              placeholder="Filter reports…"
+              autocomplete="off"
+            />
+            <nav id="report-list" class="report-list" aria-label="Reports"></nav>
           </div>
-          <ul id="node-list" class="node-list"></ul>
+          <div
+            id="side-splitter"
+            class="side-splitter"
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize reports and nodes"
+            aria-valuemin="15"
+            aria-valuemax="85"
+            tabindex="0"
+          ></div>
+          <div id="nodes-block" class="side-block nodes-block">
+            <div class="side-title">
+              <span>Nodes</span>
+              <span id="node-summary" class="muted"></span>
+            </div>
+            <ul id="node-list" class="node-list"></ul>
+          </div>
         </div>
 
         <footer class="side-foot">
@@ -57,6 +68,9 @@
             <p id="report-desc" class="muted"></p>
           </div>
           <div class="topbar-state">
+            <button id="chat-open" class="btn" type="button" hidden title="Ask about this fabric">
+              Ask
+            </button>
             <span id="live-dot" class="dot" aria-hidden="true"></span>
             <span id="live-label" class="muted">idle</span>
           </div>
@@ -270,6 +284,40 @@
           <span id="updated" class="muted"></span>
         </footer>
       </main>
+      <aside id="chat-drawer" class="chat-drawer" hidden>
+        <div
+          id="chat-resizer"
+          class="chat-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="Resize the Ask drawer"
+          tabindex="0"
+        ></div>
+        <header class="chat-head">
+          <div>
+            <span class="chat-title">Ask the fabric</span>
+            <p class="muted chat-sub">Read-only. Reports first, then show/info on a node.</p>
+          </div>
+          <div class="chat-head-actions">
+            <select id="chat-provider" class="input chat-provider" hidden aria-label="LLM provider"></select>
+            <select id="chat-effort" class="input chat-provider" hidden aria-label="Reasoning effort"></select>
+            <button id="chat-close" class="btn btn-ghost" type="button" title="Close" aria-label="Close chat">
+              ✕
+            </button>
+          </div>
+        </header>
+        <div id="chat-log" class="chat-log" role="log" aria-live="polite"></div>
+        <form id="chat-form" class="chat-form">
+          <textarea
+            id="chat-input"
+            class="input"
+            rows="3"
+            placeholder="Why is BGP down on the leaves?"
+            autocomplete="off"
+          ></textarea>
+          <button id="chat-send" class="btn" type="submit">Send</button>
+        </form>
+      </aside>
     </div>
     <script src="/static/app.js?v=__ASSETS__"></script>
   </body>

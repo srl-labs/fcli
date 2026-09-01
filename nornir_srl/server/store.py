@@ -332,6 +332,28 @@ class FabricStore:
             )
         return result
 
+    def resolve_host(self, node: str) -> Tuple[str, Any]:
+        """Inventory name and host for *node*, matching name or hostname."""
+        hosts = self.nornir.inventory.hosts
+        if node in hosts:
+            return node, hosts[node]
+        for name, host in hosts.items():
+            if (host.hostname or name) == node:
+                return name, host
+        raise KeyError(f"unknown node '{node}'")
+
+    def node_get(
+        self, node: str, path: str, datatype: str = "state"
+    ) -> List[Dict[str, Any]]:
+        """A serialized gNMI Get on *node*, sharing the stream's Get lock."""
+        name, _host = self.resolve_host(node)
+        with self._lock:
+            stream = self._streams.get(name)
+            error = self._connect_errors.get(name)
+        if stream is None:
+            raise RuntimeError(error or f"node {name} is not connected")
+        return stream.direct_get(path, datatype)
+
     def _targets(self, inv_filter: Optional[Dict[str, str]]) -> List[str]:
         target = self.nornir.filter(**inv_filter) if inv_filter else self.nornir
         return list(target.inventory.hosts)

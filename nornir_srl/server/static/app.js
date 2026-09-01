@@ -21,6 +21,9 @@
   const dom = {
     reportSearch: el("report-search"),
     reportList: el("report-list"),
+    sideSplit: el("side-split"),
+    sideSplitter: el("side-splitter"),
+    nodesBlock: el("nodes-block"),
     nodeList: el("node-list"),
     nodeSummary: el("node-summary"),
     topoBadge: el("topo-badge"),
@@ -67,6 +70,16 @@
     streamInfo: el("stream-info"),
     updated: el("updated"),
     themeToggle: el("theme-toggle"),
+    chatOpen: el("chat-open"),
+    chatClose: el("chat-close"),
+    chatDrawer: el("chat-drawer"),
+    chatLog: el("chat-log"),
+    chatForm: el("chat-form"),
+    chatInput: el("chat-input"),
+    chatSend: el("chat-send"),
+    chatProvider: el("chat-provider"),
+    chatEffort: el("chat-effort"),
+    chatResizer: el("chat-resizer"),
     // KPI elements
     kpiCardNodes: el("kpi-card-nodes"),
     kpiCardBgp: el("kpi-card-bgp"),
@@ -126,6 +139,14 @@
     collapsedNodes: new Set(),
     navStack: [],
     navIndex: -1,
+    chatEnabled: false,
+    chatBusy: false,
+    chatMessages: [],
+    chatAbort: null,
+    chatProviders: [],
+    chatProvider: null,
+    chatEffort: null,
+    chatWidth: 360,
   };
 
   let overviewTimer = null;
@@ -255,6 +276,16 @@
       }
     } else if (dom.topoBadge) {
       dom.topoBadge.hidden = true;
+    }
+    if (data.chat && data.chat.enabled && dom.chatOpen) {
+      state.chatEnabled = true;
+      dom.chatOpen.hidden = false;
+      renderChatProviders((data.chat && data.chat.providers) || []);
+    } else if (dom.chatOpen) {
+      state.chatEnabled = false;
+      dom.chatOpen.hidden = true;
+      renderChatProviders([]);
+      closeChat();
     }
     renderReportList();
 
@@ -3095,6 +3126,95 @@
     }
   }
 
+  /* ------------------------------------------------------- sidebar split */
+
+  const SIDE_SPLIT_MIN = 72;
+  const SIDE_SPLIT_DEFAULT = 0.38;
+  let sideSplitFrac = SIDE_SPLIT_DEFAULT;
+
+  function loadSideSplitFrac() {
+    try {
+      const stored = parseFloat(localStorage.getItem("fcli-side-split"));
+      if (stored > 0 && stored < 1) return stored;
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
+    return SIDE_SPLIT_DEFAULT;
+  }
+
+  function saveSideSplitFrac(frac) {
+    sideSplitFrac = frac;
+    try {
+      localStorage.setItem("fcli-side-split", String(frac));
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
+  }
+
+  /** Size the nodes pane to *frac* of the split, leaving reports the rest. */
+  function applySideSplit(frac, persist) {
+    const split = dom.sideSplit;
+    const nodes = dom.nodesBlock;
+    const splitter = dom.sideSplitter;
+    if (!split || !nodes || !splitter) return;
+    const avail = split.clientHeight - splitter.offsetHeight;
+    if (avail <= 0) return;
+    const min = Math.min(SIDE_SPLIT_MIN, Math.floor(avail / 3));
+    const height = Math.round(Math.min(avail - min, Math.max(min, avail * frac)));
+    nodes.style.flexBasis = `${height}px`;
+    const used = height / avail;
+    sideSplitFrac = used;
+    splitter.setAttribute("aria-valuenow", String(Math.round(used * 100)));
+    if (persist) saveSideSplitFrac(used);
+  }
+
+  function initSideSplit() {
+    const splitter = dom.sideSplitter;
+    const split = dom.sideSplit;
+    if (!splitter || !split) return;
+    sideSplitFrac = loadSideSplitFrac();
+    applySideSplit(sideSplitFrac, false);
+
+    splitter.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      splitter.setPointerCapture(event.pointerId);
+      const sidebar = split.closest(".sidebar");
+      if (sidebar) sidebar.classList.add("is-resizing");
+      const box = split.getBoundingClientRect();
+      const onMove = (move) => {
+        const avail = box.height - splitter.offsetHeight;
+        if (avail <= 0) return;
+        applySideSplit((box.bottom - move.clientY - splitter.offsetHeight / 2) / avail, false);
+      };
+      const onUp = () => {
+        splitter.removeEventListener("pointermove", onMove);
+        splitter.removeEventListener("pointerup", onUp);
+        splitter.removeEventListener("pointercancel", onUp);
+        if (sidebar) sidebar.classList.remove("is-resizing");
+        applySideSplit(sideSplitFrac, true);
+      };
+      splitter.addEventListener("pointermove", onMove);
+      splitter.addEventListener("pointerup", onUp);
+      splitter.addEventListener("pointercancel", onUp);
+    });
+
+    splitter.addEventListener("keydown", (event) => {
+      let next = sideSplitFrac;
+      if (event.key === "ArrowUp") next -= 0.05;
+      else if (event.key === "ArrowDown") next += 0.05;
+      else if (event.key === "Home") next = 0.15;
+      else if (event.key === "End") next = 0.85;
+      else return;
+      event.preventDefault();
+      applySideSplit(next, true);
+    });
+
+    if (window.ResizeObserver) {
+      new ResizeObserver(() => applySideSplit(sideSplitFrac, false)).observe(split);
+    }
+  }
+
   /* ------------------------------------------------------------- wiring */
 
   if (dom.navBack) {
@@ -3344,6 +3464,715 @@
   restoreTopoZoom();
   restoreTopoFabric();
   restoreTopoMaxBw();
+  initSideSplit();
+
+  /* ---------------------------------------------------------- markdown */
+
+  /* A small CommonMark subset for what the models actually emit: headings,
+     lists, fenced code, pipe tables, blockquotes and inline emphasis. Nodes are
+     built with the DOM rather than innerHTML, so model output can never inject
+     markup. */
+
+  // Underscore emphasis needs a word boundary, or snake_case names the agent
+  // deals in all day (bgp_rib_evpn_2, mac_table) would come out italicised.
+  const MD_INLINE =
+    /(`+)([\s\S]+?)\1|\*\*([\s\S]+?)\*\*|(?<!\w)__([\s\S]+?)__(?!\w)|~~([\s\S]+?)~~|\*(\S[^*\n]*?)\*|(?<!\w)_(\S[^_\n]*?)_(?!\w)|\[([^\]\n]+)\]\(([^)\s]+)\)/;
+
+  /** Append *text* to *parent*, turning inline markdown into elements. */
+  function mdInline(text, parent) {
+    let rest = String(text);
+    while (rest) {
+      const match = MD_INLINE.exec(rest);
+      if (!match) break;
+      if (match.index > 0) parent.append(rest.slice(0, match.index));
+      const [full, , codeText, strong1, strong2, strike, em1, em2, linkText, href] =
+        match;
+      if (codeText !== undefined) {
+        const code = document.createElement("code");
+        code.textContent = codeText.trim();
+        parent.append(code);
+      } else if (strong1 !== undefined || strong2 !== undefined) {
+        const strong = document.createElement("strong");
+        mdInline(strong1 !== undefined ? strong1 : strong2, strong);
+        parent.append(strong);
+      } else if (strike !== undefined) {
+        const del = document.createElement("del");
+        mdInline(strike, del);
+        parent.append(del);
+      } else if (em1 !== undefined || em2 !== undefined) {
+        const em = document.createElement("em");
+        mdInline(em1 !== undefined ? em1 : em2, em);
+        parent.append(em);
+      } else if (linkText !== undefined) {
+        // Anything but a plain web link stays inert text.
+        if (/^(https?:|mailto:)/i.test(href)) {
+          const link = document.createElement("a");
+          link.href = href;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          mdInline(linkText, link);
+          parent.append(link);
+        } else {
+          parent.append(full);
+        }
+      }
+      rest = rest.slice(match.index + full.length);
+    }
+    if (rest) parent.append(rest);
+  }
+
+  function mdParagraph(lines) {
+    const p = document.createElement("p");
+    lines.forEach((line, index) => {
+      if (index) p.append(document.createElement("br"));
+      mdInline(line, p);
+    });
+    return p;
+  }
+
+  function mdIndent(line) {
+    const match = /^\s*/.exec(line);
+    return match[0].replace(/\t/g, "  ").length;
+  }
+
+  function mdListItem(line) {
+    const bullet = /^\s*[-*+]\s+(.*)$/.exec(line);
+    if (bullet) return { ordered: false, text: bullet[1] };
+    const ordered = /^\s*\d+[.)]\s+(.*)$/.exec(line);
+    if (ordered) return { ordered: true, text: ordered[1] };
+    return null;
+  }
+
+  function mdTableRow(line) {
+    const trimmed = line.trim().replace(/^\|/, "").replace(/\|$/, "");
+    return trimmed.split("|").map((cell) => cell.trim());
+  }
+
+  /** Parse *text* into an array of block-level DOM nodes. */
+  function mdBlocks(text) {
+    const lines = String(text).replace(/\r\n/g, "\n").split("\n");
+    const nodes = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (!line.trim()) {
+        i += 1;
+        continue;
+      }
+      const fence = /^\s*(```|~~~)(.*)$/.exec(line);
+      if (fence) {
+        const body = [];
+        i += 1;
+        while (i < lines.length && !lines[i].trim().startsWith(fence[1])) {
+          body.push(lines[i]);
+          i += 1;
+        }
+        i += 1;
+        const pre = document.createElement("pre");
+        const code = document.createElement("code");
+        const lang = fence[2].trim();
+        if (lang) code.className = "lang-" + lang.split(/\s+/)[0];
+        code.textContent = body.join("\n");
+        pre.append(code);
+        nodes.push(pre);
+        continue;
+      }
+      const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+      if (heading) {
+        const el = document.createElement("h" + Math.min(heading[1].length, 4));
+        mdInline(heading[2].replace(/\s+#+\s*$/, ""), el);
+        nodes.push(el);
+        i += 1;
+        continue;
+      }
+      if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) {
+        nodes.push(document.createElement("hr"));
+        i += 1;
+        continue;
+      }
+      if (/^\s*>\s?/.test(line)) {
+        const quoted = [];
+        while (i < lines.length && /^\s*>\s?/.test(lines[i])) {
+          quoted.push(lines[i].replace(/^\s*>\s?/, ""));
+          i += 1;
+        }
+        const quote = document.createElement("blockquote");
+        mdBlocks(quoted.join("\n")).forEach((node) => quote.append(node));
+        nodes.push(quote);
+        continue;
+      }
+      if (
+        line.includes("|") &&
+        i + 1 < lines.length &&
+        /^\s*\|?[\s:-]*-[\s|:-]*$/.test(lines[i + 1]) &&
+        lines[i + 1].includes("-")
+      ) {
+        const table = document.createElement("table");
+        const thead = document.createElement("thead");
+        const headRow = document.createElement("tr");
+        for (const cell of mdTableRow(line)) {
+          const th = document.createElement("th");
+          mdInline(cell, th);
+          headRow.append(th);
+        }
+        thead.append(headRow);
+        table.append(thead);
+        const tbody = document.createElement("tbody");
+        i += 2;
+        while (i < lines.length && lines[i].includes("|") && lines[i].trim()) {
+          const row = document.createElement("tr");
+          for (const cell of mdTableRow(lines[i])) {
+            const td = document.createElement("td");
+            mdInline(cell, td);
+            row.append(td);
+          }
+          tbody.append(row);
+          i += 1;
+        }
+        table.append(tbody);
+        nodes.push(table);
+        continue;
+      }
+      const item = mdListItem(line);
+      if (item) {
+        const block = [];
+        const baseIndent = mdIndent(line);
+        while (i < lines.length && (mdListItem(lines[i]) || lines[i].trim())) {
+          if (!mdListItem(lines[i]) && mdIndent(lines[i]) <= baseIndent) break;
+          block.push(lines[i]);
+          i += 1;
+        }
+        nodes.push(mdList(block, baseIndent));
+        continue;
+      }
+      const para = [];
+      while (
+        i < lines.length &&
+        lines[i].trim() &&
+        !mdListItem(lines[i]) &&
+        !/^(#{1,6})\s|^\s*(```|~~~|>)/.test(lines[i])
+      ) {
+        para.push(lines[i].trim());
+        i += 1;
+      }
+      nodes.push(mdParagraph(para));
+    }
+    return nodes;
+  }
+
+  /** Build one list from *lines*, recursing for anything indented deeper. */
+  function mdList(lines, baseIndent) {
+    const first = mdListItem(lines[0]) || { ordered: false };
+    const list = document.createElement(first.ordered ? "ol" : "ul");
+    let current = null;
+    let nested = [];
+    const flush = () => {
+      if (!current || !nested.length) {
+        nested = [];
+        return;
+      }
+      if (mdListItem(nested[0])) {
+        current.append(mdList(nested, mdIndent(nested[0])));
+      } else {
+        // An indented continuation: a paragraph or code block under the item.
+        for (const node of mdBlocks(nested.join("\n"))) current.append(node);
+      }
+      nested = [];
+    };
+    for (const line of lines) {
+      const item = mdListItem(line);
+      if (item && mdIndent(line) <= baseIndent) {
+        flush();
+        current = document.createElement("li");
+        mdInline(item.text, current);
+        list.append(current);
+      } else if (current) {
+        nested.push(line);
+      }
+    }
+    flush();
+    return list;
+  }
+
+  function renderMarkdown(text, container) {
+    container.textContent = "";
+    for (const node of mdBlocks(text)) container.append(node);
+  }
+
+  /* -------------------------------------------------------------- chat */
+
+  const CHAT_WIDTH_DEFAULT = 360;
+  const CHAT_WIDTH_MIN = 280;
+
+  /** Widen or narrow the drawer, within what the window can spare. */
+  function applyChatWidth(px, persist) {
+    const max = Math.max(CHAT_WIDTH_MIN, Math.round(window.innerWidth * 0.8));
+    const width = Math.round(Math.min(max, Math.max(CHAT_WIDTH_MIN, px)));
+    document.documentElement.style.setProperty("--chat-width", width + "px");
+    state.chatWidth = width;
+    if (dom.chatResizer) {
+      dom.chatResizer.setAttribute("aria-valuenow", String(width));
+    }
+    if (persist) {
+      try {
+        localStorage.setItem("fcli-chat-width", String(width));
+      } catch (_err) {
+        /* storage may be unavailable */
+      }
+    }
+  }
+
+  function initChatResize() {
+    let stored = NaN;
+    try {
+      stored = parseInt(localStorage.getItem("fcli-chat-width"), 10);
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
+    applyChatWidth(stored > 0 ? stored : CHAT_WIDTH_DEFAULT, false);
+    const resizer = dom.chatResizer;
+    if (!resizer) return;
+
+    resizer.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      resizer.setPointerCapture(event.pointerId);
+      dom.chatDrawer.classList.add("is-resizing");
+      const right = dom.chatDrawer.getBoundingClientRect().right;
+      const onMove = (move) => applyChatWidth(right - move.clientX, false);
+      const onUp = () => {
+        resizer.removeEventListener("pointermove", onMove);
+        resizer.removeEventListener("pointerup", onUp);
+        resizer.removeEventListener("pointercancel", onUp);
+        dom.chatDrawer.classList.remove("is-resizing");
+        applyChatWidth(state.chatWidth, true);
+      };
+      resizer.addEventListener("pointermove", onMove);
+      resizer.addEventListener("pointerup", onUp);
+      resizer.addEventListener("pointercancel", onUp);
+    });
+
+    resizer.addEventListener("dblclick", () =>
+      applyChatWidth(CHAT_WIDTH_DEFAULT, true)
+    );
+
+    resizer.addEventListener("keydown", (event) => {
+      let next = state.chatWidth;
+      if (event.key === "ArrowLeft") next += 40;
+      else if (event.key === "ArrowRight") next -= 40;
+      else if (event.key === "Home") next = CHAT_WIDTH_MIN;
+      else if (event.key === "End") next = window.innerWidth * 0.8;
+      else return;
+      event.preventDefault();
+      applyChatWidth(next, true);
+    });
+
+    window.addEventListener("resize", () => applyChatWidth(state.chatWidth, false));
+  }
+
+  function openChat() {
+    if (!state.chatEnabled || !dom.chatDrawer) return;
+    dom.chatDrawer.hidden = false;
+    if (dom.chatInput) dom.chatInput.focus();
+  }
+
+  function closeChat() {
+    if (state.chatAbort) {
+      state.chatAbort.abort();
+      state.chatAbort = null;
+    }
+    if (dom.chatDrawer) dom.chatDrawer.hidden = true;
+    setChatBusy(false);
+  }
+
+  function setChatBusy(busy) {
+    state.chatBusy = busy;
+    if (dom.chatSend) {
+      // Send doubles as Stop: a reasoning round can run for a while.
+      dom.chatSend.textContent = busy ? "Stop" : "Send";
+      dom.chatSend.classList.toggle("stop", busy);
+      dom.chatSend.title = busy ? "Stop this answer" : "";
+    }
+    if (dom.chatInput) dom.chatInput.disabled = busy;
+    if (dom.chatProvider) dom.chatProvider.disabled = busy;
+    if (dom.chatEffort) dom.chatEffort.disabled = busy;
+  }
+
+  function activeChatProvider() {
+    return state.chatProviders.find((p) => p.id === state.chatProvider) || null;
+  }
+
+  function renderChatEfforts() {
+    const select = dom.chatEffort;
+    if (!select) return;
+    const provider = activeChatProvider();
+    const efforts = (provider && provider.efforts) || [];
+    select.textContent = "";
+    if (!efforts.length) {
+      select.hidden = true;
+      state.chatEffort = null;
+      return;
+    }
+    const auto = document.createElement("option");
+    // "auto" leaves the effort out of the request, so the model's own default
+    // applies: medium on GPT-5.6, high on Claude and Grok.
+    auto.value = "auto";
+    auto.textContent = "auto";
+    select.append(auto);
+    for (const effort of efforts) {
+      const option = document.createElement("option");
+      option.value = effort;
+      option.textContent = effort;
+      select.append(option);
+    }
+    let saved = null;
+    try {
+      saved = localStorage.getItem("fcli-chat-effort-" + provider.id);
+    } catch (_err) {}
+    const chosen =
+      (saved && (saved === "auto" || efforts.includes(saved)) && saved) ||
+      provider.effort ||
+      "auto";
+    select.value = chosen;
+    state.chatEffort = chosen;
+    select.hidden = false;
+    select.title = "Reasoning effort";
+  }
+
+  function renderChatProviders(providers) {
+    state.chatProviders = Array.isArray(providers) ? providers : [];
+    const select = dom.chatProvider;
+    if (!select) return;
+    let saved = null;
+    try {
+      saved = localStorage.getItem("fcli-chat-provider");
+    } catch (_err) {}
+    const ids = state.chatProviders.map((p) => p.id);
+    const preset = state.chatProviders.find((p) => p.default);
+    const chosen =
+      (saved && ids.includes(saved) && saved) ||
+      (preset && preset.id) ||
+      ids[0] ||
+      null;
+    state.chatProvider = chosen;
+    select.textContent = "";
+    for (const provider of state.chatProviders) {
+      const option = document.createElement("option");
+      option.value = provider.id;
+      option.textContent = provider.label || provider.id;
+      if (provider.model) option.title = provider.model;
+      select.append(option);
+    }
+    if (chosen) select.value = chosen;
+    // With a single key configured there is nothing to pick.
+    select.hidden = state.chatProviders.length < 2;
+    const active = activeChatProvider();
+    select.title = active && active.model ? "Model: " + active.model : "";
+    renderChatEfforts();
+  }
+
+  function chatContext() {
+    const ctx = {};
+    if (state.report) ctx.report = state.report.name;
+    const inv = dom.invFilter.value.trim();
+    if (inv) ctx.inv_filter = inv;
+    if (state.topoSelection && state.topoSelection.kind === "node") {
+      ctx.topo_node = state.topoSelection.id;
+    }
+    return ctx;
+  }
+
+  function appendChat(role, text) {
+    const row = document.createElement("div");
+    row.className = "chat-msg " + role;
+    if (role === "assistant") {
+      const tools = document.createElement("div");
+      tools.className = "chat-tools";
+      const status = document.createElement("div");
+      status.className = "chat-status";
+      status.hidden = true;
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      const label = document.createElement("span");
+      label.className = "chat-status-text";
+      const clock = document.createElement("span");
+      clock.className = "chat-status-time";
+      status.append(dot, label, clock);
+      const body = document.createElement("div");
+      body.className = "chat-body";
+      if (text) renderMarkdown(text, body);
+      row.append(tools, status, body);
+      row._tools = tools;
+      row._status = status;
+      row._statusText = label;
+      row._statusTime = clock;
+      row._body = body;
+      row._chips = new Map();
+    } else {
+      row.textContent = text || "";
+    }
+    dom.chatLog.append(row);
+    scrollChatToEnd();
+    return row;
+  }
+
+  function scrollChatToEnd() {
+    if (dom.chatLog) dom.chatLog.scrollTop = dom.chatLog.scrollHeight;
+  }
+
+  /** Show what the agent is doing right now, with a clock since it started. */
+  function setChatStatus(row, text) {
+    if (!row || !row._status) return;
+    stopChatClock(row);
+    if (!text) {
+      row._status.hidden = true;
+      return;
+    }
+    row._status.hidden = false;
+    row._statusText.textContent = text;
+    row._statusTime.textContent = "";
+    const started = Date.now();
+    const tick = () => {
+      const seconds = Math.round((Date.now() - started) / 1000);
+      row._statusTime.textContent = seconds >= 1 ? seconds + "s" : "";
+    };
+    row._clock = setInterval(tick, 1000);
+    scrollChatToEnd();
+  }
+
+  function stopChatClock(row) {
+    if (row && row._clock) {
+      clearInterval(row._clock);
+      row._clock = null;
+    }
+  }
+
+  function chipLabel(name, args) {
+    if (!args) return name;
+    // Two details at most: which node, and what was asked of it.
+    const parts = [
+      args.node || args.inv_filter,
+      args.area || args.command || args.path,
+    ].filter(Boolean);
+    return parts.length ? `${name} ${parts.join(" ")}` : name;
+  }
+
+  function addChatChip(row, call) {
+    if (!row || !row._tools) return;
+    const chip = document.createElement("span");
+    chip.className = "chat-chip running";
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    const label = document.createElement("span");
+    label.textContent = chipLabel(call.name || "tool", call.args);
+    const meta = document.createElement("span");
+    meta.className = "chat-chip-meta";
+    chip.append(dot, label, meta);
+    chip._meta = meta;
+    row._tools.append(chip);
+    if (call.id) row._chips.set(call.id, chip);
+    scrollChatToEnd();
+    return chip;
+  }
+
+  function finishChatChip(row, result) {
+    if (!row || !row._chips) return;
+    const chip = row._chips.get(result.id);
+    if (!chip) return;
+    chip.classList.remove("running");
+    chip.classList.add(result.error ? "failed" : "ok");
+    const ms = Number(result.ms) || 0;
+    chip._meta.textContent = result.repeat
+      ? "repeat"
+      : ms >= 1000
+        ? (ms / 1000).toFixed(1) + "s"
+        : ms + "ms";
+    if (result.error) chip.title = result.error;
+    else if (result.repeat) chip.title = "identical call, reused";
+  }
+
+  /** A muted line in the bubble for things that are not the answer or an error. */
+  function addChatNote(row, text) {
+    if (!row || !row._body) return;
+    const note = document.createElement("div");
+    note.className = "chat-note";
+    note.textContent = text;
+    row.insertBefore(note, row._body);
+    scrollChatToEnd();
+  }
+
+  async function readChatSse(response, onEvent) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true }).replace(/\r\n/g, "\n");
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) >= 0) {
+        const raw = buf.slice(0, idx);
+        buf = buf.slice(idx + 2);
+        let event = "message";
+        const dataLines = [];
+        for (const line of raw.split("\n")) {
+          if (line.startsWith("event: ")) event = line.slice(7).trim();
+          else if (line.startsWith("data: ")) dataLines.push(line.slice(6));
+        }
+        if (!dataLines.length) continue;
+        let payload = {};
+        try {
+          payload = JSON.parse(dataLines.join("\n"));
+        } catch (_err) {
+          payload = { text: dataLines.join("\n") };
+        }
+        onEvent(event, payload);
+      }
+    }
+  }
+
+  async function sendChat(event) {
+    if (event) event.preventDefault();
+    if (!state.chatEnabled) return;
+    if (state.chatBusy) {
+      if (state.chatAbort) state.chatAbort.abort();
+      return;
+    }
+    const text = (dom.chatInput.value || "").trim();
+    if (!text) return;
+    dom.chatInput.value = "";
+    state.chatMessages.push({ role: "user", content: text });
+    appendChat("user", text);
+    const bubble = appendChat("assistant", "");
+    setChatStatus(bubble, "Thinking…");
+    setChatBusy(true);
+    const controller = new AbortController();
+    state.chatAbort = controller;
+    try {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
+        body: JSON.stringify({
+          messages: state.chatMessages,
+          context: chatContext(),
+          provider: state.chatProvider || undefined,
+          effort: state.chatEffort || undefined,
+        }),
+      });
+      if (!res.ok) {
+        let detail = res.statusText;
+        try {
+          const payload = await res.json();
+          if (payload && payload.error) detail = payload.error;
+        } catch (_err) {}
+        throw new Error(detail);
+      }
+      let reply = "";
+      await readChatSse(res, (kind, payload) => {
+        if (kind === "start") {
+          const where = [
+            payload.provider,
+            payload.model,
+            payload.effort && "effort " + payload.effort,
+          ]
+            .filter(Boolean)
+            .join(" · ");
+          bubble.title = where;
+          setChatStatus(bubble, "Thinking…");
+        } else if (kind === "token" && payload.text) {
+          // One event per round: keep rounds apart as paragraphs, or a
+          // preamble runs into the answer that follows it.
+          reply += (reply ? "\n\n" : "") + payload.text;
+          if (bubble._body) renderMarkdown(reply, bubble._body);
+          scrollChatToEnd();
+        } else if (kind === "tool") {
+          addChatChip(bubble, payload);
+          const round = payload.round
+            ? ` (round ${payload.round}/${payload.rounds})`
+            : "";
+          setChatStatus(
+            bubble,
+            "Running " +
+              chipLabel(payload.name || "tool", payload.args) +
+              "…" +
+              round
+          );
+        } else if (kind === "tool_result") {
+          finishChatChip(bubble, payload);
+          setChatStatus(bubble, "Thinking…");
+        } else if (kind === "notice") {
+          addChatNote(bubble, payload.text || "");
+        } else if (kind === "done") {
+          setChatStatus(bubble, "");
+        } else if (kind === "error") {
+          throw new Error(payload.error || "chat failed");
+        }
+      });
+      if (reply) state.chatMessages.push({ role: "assistant", content: reply });
+    } catch (err) {
+      const aborted = err && err.name === "AbortError";
+      const message = aborted ? "Stopped." : (err && err.message) || String(err);
+      if (!aborted) bubble.classList.add("error");
+      if (bubble._body) {
+        // Keep whatever the model already said and add the reason below it.
+        const note = document.createElement("p");
+        note.textContent = message;
+        bubble._body.append(note);
+      } else {
+        bubble.textContent = message;
+      }
+    } finally {
+      setChatStatus(bubble, "");
+      state.chatAbort = null;
+      setChatBusy(false);
+      if (dom.chatInput) dom.chatInput.focus();
+    }
+  }
+
+  initChatResize();
+
+  if (dom.chatOpen) dom.chatOpen.addEventListener("click", openChat);
+  if (dom.chatClose) dom.chatClose.addEventListener("click", closeChat);
+  if (dom.chatProvider) {
+    dom.chatProvider.addEventListener("change", () => {
+      state.chatProvider = dom.chatProvider.value || null;
+      const active = activeChatProvider();
+      dom.chatProvider.title = active && active.model ? "Model: " + active.model : "";
+      renderChatEfforts();
+      try {
+        if (state.chatProvider) {
+          localStorage.setItem("fcli-chat-provider", state.chatProvider);
+        }
+      } catch (_err) {}
+    });
+  }
+  if (dom.chatEffort) {
+    dom.chatEffort.addEventListener("change", () => {
+      state.chatEffort = dom.chatEffort.value || null;
+      try {
+        if (state.chatProvider && state.chatEffort) {
+          localStorage.setItem(
+            "fcli-chat-effort-" + state.chatProvider,
+            state.chatEffort
+          );
+        }
+      } catch (_err) {}
+    });
+  }
+  if (dom.chatForm) dom.chatForm.addEventListener("submit", sendChat);
+  if (dom.chatInput) {
+    dom.chatInput.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+        sendChat(event);
+      }
+    });
+  }
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && dom.chatDrawer && !dom.chatDrawer.hidden) {
+      closeChat();
+    }
+  });
 
   loadReports();
   loadInventory();

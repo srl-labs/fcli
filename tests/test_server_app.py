@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -15,6 +16,7 @@ from nornir_srl.reports import SERVER, get_report, reports_for
 from nornir_srl.rows import flatten, get_fields, is_scalar
 from nornir_srl.server.app import (
     ASSET_TOKEN,
+    STATIC_DIR,
     asset_version,
     create_app,
     parse_kv,
@@ -613,6 +615,21 @@ def test_the_page_is_never_cached_and_its_assets_are_fingerprinted(client):
     assert ASSET_TOKEN not in response.text
     assert f"/static/app.js?v={asset_version()}" in response.text
     assert f"/static/style.css?v={asset_version()}" in response.text
+
+
+def test_every_chat_bubble_field_is_assigned_somewhere():
+    """A read of a field nothing assigns is a silent no-op, not an error.
+
+    That is how a finished answer went missing: the body element was built and
+    appended, but the reference was never stored on the row, so every guarded
+    `if (bubble._body) render(...)` skipped quietly and the drawer stayed empty
+    while the tool chips looked healthy.
+    """
+    source = (STATIC_DIR / "app.js").read_text()
+    read = set(re.findall(r"(?:bubble|row)\.(_[A-Za-z]+)", source))
+    assigned = set(re.findall(r"(?:bubble|row)\.(_[A-Za-z]+)\s*=[^=]", source))
+    assert read, "expected the chat bubble to carry fields"
+    assert read - assigned == set()
 
 
 def test_the_asset_version_follows_the_assets(tmp_path, monkeypatch):

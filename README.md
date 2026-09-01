@@ -560,6 +560,40 @@ to a subset of the fabric (`-i`):
   subscriptions.
 * **Columns** hides columns you do not need, **CSV** downloads exactly what the
   table currently shows (filters, column selection and all).
+* **Ask** (top bar) opens a read-only troubleshooting chat as soon as one LLM
+  provider has a key on the server process. The agent uses the live report
+  tables, then JSON-RPC `show`/`info` on a node if needed. Keys never go to the
+  browser.
+
+  The drawer shows what the agent is doing while it works — thinking, or which
+  tool it is running, with how long each one took — and **Send** turns into
+  **Stop** for as long as a turn is running. Answers are rendered as markdown.
+  Drag the drawer's left edge to widen it (double-click the edge to reset).
+
+  | Provider | Key | Default model | API | Effort levels |
+  | --- | --- | --- | --- | --- |
+  | OpenAI | `OPENAI_API_KEY` | `gpt-5.6-sol` | Responses | `none` … `max` |
+  | Claude | `ANTHROPIC_API_KEY` | `claude-sonnet-5` | Messages | `low` … `max` |
+  | Grok | `XAI_API_KEY` | `grok-4.6` | Chat Completions | `low` … `xhigh` |
+
+  Each provider also honours its own `_MODEL` and `_BASE_URL` variable
+  (`OPENAI_MODEL`, `ANTHROPIC_BASE_URL`, `XAI_MODEL`, …).
+
+  Set several keys and the drawer gets a provider selector; the browser
+  remembers the last one you picked. `FCLI_LLM_PROVIDER=claude` sets which one
+  is offered first, otherwise it is OpenAI, Claude, Grok in that order.
+
+  All three are reasoning models, and the drawer has an effort selector next to
+  the provider. It defaults to `auto`, which leaves the choice to the model
+  (medium on GPT-5.6, high on Claude and Grok); `OPENAI_REASONING_EFFORT`,
+  `ANTHROPIC_EFFORT` and `XAI_REASONING_EFFORT` set the default per provider.
+  Lower effort answers faster and costs less, higher effort holds up better on
+  a fabric-wide "why is this broken" question.
+
+  OpenAI runs against the Responses API with `store=false`: fcli replays the
+  model's reasoning itself between tool rounds, and nothing about your fabric is
+  kept in OpenAI's response store. If you front OpenAI with a proxy that only
+  speaks Chat Completions, set `OPENAI_API=chat`.
 
 ## Topology
 
@@ -747,6 +781,7 @@ The UI is a client of a small JSON API, which is just as usable from scripts:
 | `GET /api/topology` | The fabric graph: nodes with their inferred tier and the fabric they are cabled into, the clients hanging off them, and the links between them |
 | `GET /api/report/{name}` | One rendered table as JSON |
 | `GET /api/stream/{name}` | The same table, pushed as server-sent events |
+| `POST /api/chat` | LLM troubleshooting turn (SSE: `start`, `token`, `tool`, `error`, `done`). Takes an optional `provider` (`openai`, `claude`, `grok`) and `effort`; 503 unless a provider key is set |
 
 Both report endpoints accept `inv_filter=key=value,key=value`; the stream
 endpoint also accepts `refresh=<seconds>`.
