@@ -35,6 +35,7 @@ from nornir import InitNornir
 from nornir.core import Nornir
 from nornir.core.task import Result, Task
 
+from . import clab
 from .connections.srlinux import CONNECTION_NAME
 from .connections.helpers import clean_structured_key
 from .reports import ReportSpec, get_report
@@ -42,23 +43,8 @@ from .rows import extract
 
 logger = logging.getLogger(__name__)
 
-SRL_DEFAULT_USERNAME = "admin"
-SRL_DEFAULT_PASSWORD = "NokiaSrl1!"
-SRL_DEFAULT_GNMI_PORT = 57400
-
-NORNIR_DEFAULT_CONFIG: Dict[str, Any] = {
-    "inventory": {
-        "plugin": "YAMLInventory",
-        "options": {
-            "host_file": "clab_hosts.yml",
-            "group_file": "clab_groups.yml",
-            "defaults_file": "clab_defaults.yml",
-        },
-    },
-    "runner": {"plugin": "threaded", "options": {"num_workers": 20}},
-    "user_defined": {"intent_dir": "intent"},
-    "logging": {"enabled": False},
-}
+SRL_DEFAULT_GNMI_PORT = clab.SRL_DEFAULT_GNMI_PORT
+NORNIR_DEFAULT_CONFIG = clab.NORNIR_DEFAULT_CONFIG
 
 
 # ---- Nornir initialization ----
@@ -90,67 +76,8 @@ def _init_nornir_from_topo(
     with open(topo_file, "r") as f:
         topo = yaml.safe_load(os.path.expandvars(f.read()))
 
-    lab_name = topo["name"]
-    if "prefix" not in topo:
-        prefix = f"clab-{lab_name}-"
-    else:
-        if topo["prefix"] == "__lab-name":
-            prefix = f"{lab_name}-"
-        elif topo["prefix"] == "":
-            prefix = ""
-        else:
-            prefix = f"{topo['prefix']}-{lab_name}-"
-
-    hosts: Dict[str, Dict[str, Any]] = {}
-    def_kind = topo["topology"].get("defaults", {}).get("kind")
-    def_image = (
-        topo["topology"].get("defaults", {}).get("image")
-        or topo["topology"]["kinds"].get(def_kind, {}).get("image")
-        if def_kind
-        else None
-    )
-    srlinux_def = False
-    if def_image and "srlinux" in def_image:
-        srlinux_def = True
-    if def_kind in {"srl", "nokia_srlinux"}:
-        srlinux_def = True
-
-    srl_kinds = [
-        k
-        for k, v in topo["topology"].get("kinds", {}).items()
-        if "/srlinux" in v.get("image", "")
-    ]
-    for extra in ("srl", "nokia_srlinux"):
-        if extra not in srl_kinds:
-            srl_kinds.append(extra)
-
-    clab_nodes: Dict[str, Dict] = topo["topology"]["nodes"]
-    for node, node_spec in clab_nodes.items():
-        node_kind = node_spec.get("kind")
-        if (node_kind is None and srlinux_def) or node_kind in srl_kinds:
-            hosts[f"{prefix}{node}"] = {
-                "hostname": f"{prefix}{node}",
-                "platform": "srlinux",
-                "groups": ["srl"],
-                "data": node_spec.get("labels", {}),
-            }
-
-    groups: Dict[str, Dict[str, Any]] = {
-        "srl": {
-            "connection_options": {
-                "srlinux": {
-                    "username": SRL_DEFAULT_USERNAME,
-                    "password": SRL_DEFAULT_PASSWORD,
-                    "port": gnmi_port,
-                    "extras": {},
-                }
-            }
-        }
-    }
-    if cert_file:
-        groups["srl"]["connection_options"]["srlinux"]["extras"][
-            "path_cert"
-        ] = cert_file
+    hosts = clab.srl_hosts(topo)
+    groups = clab.srl_groups(gnmi_port, cert_file)
 
     hosts_f = tempfile.NamedTemporaryFile("w+", suffix=".yml", delete=False)
     yaml.safe_dump(hosts, hosts_f)
