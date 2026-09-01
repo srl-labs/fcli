@@ -328,8 +328,15 @@ def test_opening_every_report_costs_one_session_per_node(store):
     fabric_store, devices = store
     for report in reports_for(SERVER):
         fabric_store.table(report)
+    # Per node rather than max_sessions_per_node: a maximum is already 1 once
+    # the first node is subscribed, so waiting on it lets a slower node be
+    # asserted on while it still sits between two Subscribe RPCs.
     assert wait_for(
-        lambda: fabric_store.status()["max_sessions_per_node"] == 1, timeout=10
+        lambda: all(
+            node["connected"] and node["sessions"] == 1
+            for node in fabric_store.status()["nodes"]
+        ),
+        timeout=10,
     )
     for device in devices.values():
         live = [s for s in device.subscribers if not s.closed]
