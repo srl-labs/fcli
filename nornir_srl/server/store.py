@@ -617,6 +617,7 @@ class FabricStore:
                     snapshot=stream.snapshot_roots(_TOPOLOGY_ROOTS) if stream else None,
                     connected=bool(status.get("connected")),
                     error=status.get("error"),
+                    egress=_interface_egress(stream),
                 )
             )
 
@@ -634,6 +635,17 @@ _OVERVIEW_ROOTS: Tuple[str, ...] = ("interface", "network-instance")
 #: ``system``, the services under ``network-instance``, port states under
 #: ``interface``.
 _TOPOLOGY_ROOTS: Tuple[str, ...] = ("system", "network-instance", "interface")
+
+
+def _interface_egress(stream: Optional[HostStream]) -> Dict[str, int]:
+    """Bits per second leaving each interface, from streamed counter samples."""
+    if stream is None:
+        return {}
+    result: Dict[str, int] = {}
+    for name, rates in stream.rates.all_rates().items():
+        if "out-octets" in rates:
+            result[name] = round(rates["out-octets"] * 8)
+    return result
 
 #: Cap on cached rendered tables, evicting the oldest beyond it.
 _MAX_CACHED_TABLES = 256

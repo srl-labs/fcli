@@ -9,6 +9,7 @@
   --accent-soft: #d7f0ec;
   --ok: #157f3d;
   --warn: #a35b00;
+  --heat: #ea580c;
   --err: #b42318;
   --flash: #fff3bf;
   --row-alt: #fafbfc;
@@ -26,6 +27,7 @@
   --accent-soft: #123b38;
   --ok: #4ade80;
   --warn: #fbbf24;
+  --heat: #fb923c;
   --err: #f87171;
   --flash: #3b3410;
   --row-alt: #131920;
@@ -1264,12 +1266,44 @@ button.pill-jump:focus-visible {
 .topo-chip.role-unknown .topo-swatch { color: var(--role-unknown); }
 .topo-chip.role-external .topo-swatch { color: var(--role-external); }
 
-.topo-ports {
+.topo-ports,
+.topo-link-bw {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   font-size: 12px;
 }
+
+.topo-max-bw-input {
+  width: 4.8em;
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
+.topo-max-bw-unit {
+  width: auto;
+  font-size: 12px;
+  padding: 3px 6px;
+}
+
+.topo-heat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.topo-heat-swatch {
+  width: 14px;
+  height: 4px;
+  border-radius: 2px;
+}
+
+.topo-heat-swatch.bw-green { background: var(--ok); }
+.topo-heat-swatch.bw-yellow { background: var(--warn); }
+.topo-heat-swatch.bw-orange { background: var(--heat); }
+.topo-heat-swatch.bw-red { background: var(--err); }
 
 .topo-bar .topo-ports + .muted,
 .topo-bar #topo-stats {
@@ -1382,10 +1416,13 @@ button.pill-jump:focus-visible {
   letter-spacing: 0.06em;
 }
 
+.topo-link-pair {
+  cursor: pointer;
+}
+
 .topo-link {
   stroke: var(--border);
   stroke-width: 1.6;
-  cursor: pointer;
 }
 
 .topo-link.link-up {
@@ -1397,10 +1434,18 @@ button.pill-jump:focus-visible {
   stroke-dasharray: 5 4;
 }
 
+.topo-link.bw-green { stroke: var(--ok); }
+.topo-link.bw-yellow { stroke: var(--warn); }
+.topo-link.bw-orange { stroke: var(--heat); }
+.topo-link.bw-red { stroke: var(--err); }
+
 /* A cable to a client is thinner: the fabric is what the eye should follow. */
-.topo-link.is-access {
-  stroke-width: 1.1;
+.topo-link-pair.is-access {
   opacity: 0.75;
+}
+
+.topo-link-pair.is-access .topo-link {
+  stroke-width: 1.1;
 }
 
 .topo-link-count,
@@ -1448,17 +1493,17 @@ button.pill-jump:focus-visible {
 
 /* Hovering or selecting a node pushes everything it is not cabled to back. */
 .topo-svg.is-focused .topo-node,
-.topo-svg.is-focused .topo-link {
+.topo-svg.is-focused .topo-link-pair {
   opacity: 0.25;
   transition: opacity 0.12s ease;
 }
 
 .topo-svg.is-focused .topo-node.is-hot,
-.topo-svg.is-focused .topo-link.is-hot {
+.topo-svg.is-focused .topo-link-pair.is-hot {
   opacity: 1;
 }
 
-.topo-link.is-hot {
+.topo-link-pair.is-hot .topo-link {
   stroke-width: 2.6;
 }
 

@@ -185,6 +185,32 @@
               <input id="topo-port-labels" type="checkbox" />
               <span class="muted">port labels</span>
             </label>
+            <label
+              class="field topo-link-bw"
+              title="Capacity of each link. Emulated nodes forward far less than the interface speed, so this is the scale for colouring, not the Ethernet rate."
+            >
+              <span class="muted">max link BW</span>
+              <input
+                id="topo-max-bw"
+                class="input topo-max-bw-input"
+                type="number"
+                min="0"
+                step="any"
+                value="10"
+              />
+              <select id="topo-max-bw-unit" class="input topo-max-bw-unit">
+                <option value="1000">Kbps</option>
+                <option value="1000000" selected>Mbps</option>
+                <option value="1000000000">Gbps</option>
+              </select>
+            </label>
+            <div id="topo-heat" class="topo-heat" aria-label="Link utilisation colours">
+              <span class="topo-heat-swatch bw-green" title="below 25% of max link BW"></span>
+              <span class="topo-heat-swatch bw-yellow" title="25–50% of max link BW"></span>
+              <span class="topo-heat-swatch bw-orange" title="50–75% of max link BW"></span>
+              <span class="topo-heat-swatch bw-red" title="75–100% of max link BW"></span>
+              <span id="topo-heat-scale" class="muted"></span>
+            </div>
             <div class="topo-zoom" role="group" aria-label="Zoom">
               <button
                 id="topo-zoom-out"

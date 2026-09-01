@@ -145,6 +145,8 @@ class NodeFacts:
     attachments: List[Attachment] = field(default_factory=list)
     #: The ethernet-segment on each port that is in one.
     segments: Dict[str, Segment] = field(default_factory=dict)
+    #: Egress of each interface, in bits per second, from streamed counters.
+    egress: Dict[str, int] = field(default_factory=dict)
 
     @property
     def label(self) -> str:
@@ -160,6 +162,7 @@ def node_facts(
     snapshot: Optional[Dict[str, Any]] = None,
     connected: bool = True,
     error: Optional[str] = None,
+    egress: Optional[Dict[str, int]] = None,
 ) -> NodeFacts:
     """Read one node's contribution out of its streamed state.
 
@@ -178,6 +181,7 @@ def node_facts(
         site=str(labels.get("site") or ""),
         connected=connected,
         error=error,
+        egress=dict(egress or {}),
     )
 
     instances = snapshot.get("network-instance")
@@ -267,7 +271,8 @@ def build_topology(facts: Iterable[NodeFacts]) -> Dict[str, Any]:
     payload.extend(clients)
     payload.sort(key=lambda n: (-n["layer"], n["site"], _row_order(n), n["label"]))
     layer_of = {node["name"]: node["layer"] for node in payload}
-    cables = [_link_payload(link, layer_of) for _key, link in sorted(links.items())]
+    egress = {node.name: node.egress for node in nodes}
+    cables = [_link_payload(link, layer_of, egress) for _key, link in sorted(links.items())]
 
     return {
         "nodes": payload,
@@ -777,7 +782,11 @@ def _record_bundle_link(
     link["states"].update(state for state in states if state)
 
 
-def _link_payload(link: Dict[str, Any], layer_of: Dict[str, int]) -> Dict[str, Any]:
+def _link_payload(
+    link: Dict[str, Any],
+    layer_of: Dict[str, int],
+    egress: Dict[str, Dict[str, int]],
+) -> Dict[str, Any]:
     states = link["states"]
     if any(state in _DOWN_STATES for state in states):
         state = "down"
@@ -785,8 +794,21 @@ def _link_payload(link: Dict[str, Any], layer_of: Dict[str, int]) -> Dict[str, A
         state = "up"
     else:
         state = "unknown"
-    ports = [link["ports"][pair] for pair in sorted(link["ports"])]
-    return {
+    a_rates: List[int] = []
+    b_rates: List[int] = []
+    ports = []
+    for pair in sorted(link["ports"]):
+        port = dict(link["ports"][pair])
+        a_bps = _port_rate(egress, link["a"], port.get("a_port") or "")
+        b_bps = _port_rate(egress, link["b"], port.get("b_port") or "")
+        if a_bps is not None:
+            port["a_out_bps"] = a_bps
+            a_rates.append(a_bps)
+        if b_bps is not None:
+            port["b_out_bps"] = b_bps
+            b_rates.append(b_bps)
+        ports.append(port)
+    payload = {
         "a": link["a"],
         "b": link["b"],
         "count": len(ports),
@@ -797,6 +819,20 @@ def _link_payload(link: Dict[str, Any], layer_of: Dict[str, int]) -> Dict[str, A
         # Set for a cable to a client rather than to another node of the fabric.
         "access": bool(link.get("access")),
     }
+    # Each end is coloured from the hottest interface on that side of the cable.
+    if a_rates:
+        payload["a_out_bps"] = max(a_rates)
+    if b_rates:
+        payload["b_out_bps"] = max(b_rates)
+    return payload
+
+
+def _port_rate(egress: Dict[str, Dict[str, int]], node: str, port: str) -> Optional[int]:
+    """The egress of *port* on *node*, if that interface has a derived rate."""
+    if not port:
+        return None
+    rates = egress.get(node) or {}
+    return rates[port] if port in rates else None
 
 
 # --------------------------------------------------------------------------- #

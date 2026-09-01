@@ -88,6 +88,7 @@ def _facts(
     interfaces: Tuple[Dict[str, Any], ...] = (),
     segments: Tuple[Tuple[str, str, str], ...] = (),
     connected: bool = True,
+    egress: Optional[Dict[str, int]] = None,
 ):
     system = _lldp(*cables)
     if host_name is not None:
@@ -105,6 +106,7 @@ def _facts(
         labels={"site": site} if site else {},
         snapshot=snapshot,
         connected=connected,
+        egress=egress,
     )
 
 
@@ -505,6 +507,74 @@ def test_link_state_follows_the_port_state_of_either_end():
 def test_a_link_whose_port_state_is_unknown_is_not_called_up():
     graph = build_topology(_fabric())
     assert _link(graph, "leaf1", "spine1")["state"] == "unknown"
+
+
+def test_a_link_carries_the_egress_of_each_end():
+    graph = build_topology(
+        [
+            _facts(
+                "leaf1",
+                host_name="leaf1",
+                cables=(("ethernet-1/1", "spine1", "ethernet-1/1"),),
+                instances=LEAF_SERVICES,
+                egress={"ethernet-1/1": 8_000_000},
+            ),
+            _facts(
+                "spine1",
+                host_name="spine1",
+                cables=(("ethernet-1/1", "leaf1", "ethernet-1/1"),),
+                instances=NO_SERVICES,
+                egress={"ethernet-1/1": 1_000_000},
+            ),
+        ]
+    )
+    link = graph["links"][0]
+    assert link["a"].endswith("leaf1")
+    assert (link["a_out_bps"], link["b_out_bps"]) == (8_000_000, 1_000_000)
+    assert link["ports"][0]["a_out_bps"] == 8_000_000
+    assert link["ports"][0]["b_out_bps"] == 1_000_000
+
+
+def test_parallel_cables_take_the_hottest_egress_of_each_end():
+    graph = build_topology(
+        [
+            _facts(
+                "leaf1",
+                host_name="leaf1",
+                cables=(
+                    ("ethernet-1/1", "spine1", "ethernet-1/1"),
+                    ("ethernet-1/3", "spine1", "ethernet-1/3"),
+                ),
+                instances=LEAF_SERVICES,
+                egress={"ethernet-1/1": 100, "ethernet-1/3": 900},
+            ),
+            _facts(
+                "spine1",
+                host_name="spine1",
+                cables=(
+                    ("ethernet-1/1", "leaf1", "ethernet-1/1"),
+                    ("ethernet-1/3", "leaf1", "ethernet-1/3"),
+                ),
+                instances=NO_SERVICES,
+                egress={"ethernet-1/1": 50, "ethernet-1/3": 20},
+            ),
+        ]
+    )
+    link = graph["links"][0]
+    assert (link["a_out_bps"], link["b_out_bps"]) == (900, 50)
+
+
+def test_a_link_without_rates_omits_them():
+    link = _link(build_topology(_fabric()), "leaf1", "spine1")
+    assert "a_out_bps" not in link
+    assert "b_out_bps" not in link
+
+
+def test_an_access_link_has_egress_only_on_the_fabric_end():
+    graph = build_topology([_leaf_with_a_client(egress={"ethernet-1/10": 5000})])
+    link = next(cable for cable in graph["links"] if cable["access"])
+    assert link["a_out_bps"] == 5000
+    assert "b_out_bps" not in link
 
 
 # --------------------------------------------------------------------------- #

@@ -805,6 +805,7 @@ def test_topology_subscribes_to_lldp_and_the_services(store):
     streamed = [s["path"] for s in devices["leaf1"].subscribe_requests[-1]["subscription"]]
     assert LLDP_PATH in streamed
     assert HOSTNAME_PATH in streamed
+    assert IFSTATS_PATH in streamed
     # The service paths are registered as well; this fake node answers nothing
     # for them, which leaves them pending rather than streaming.
     registered = {p["path"] for p in fabric_store._streams["leaf1"].status()["paths"]}
@@ -885,6 +886,20 @@ def test_topology_merges_a_multi_homed_client_by_its_ethernet_segment(store):
     assert segment["names"] == ["mh-1"]
     assert segment["peers"] == [ES_ESI, "leaf1", "spine1"]
     assert clients[0]["peers"] == [segment["name"]]
+
+
+def test_topology_attaches_egress_rates_to_each_end_of_a_link(store):
+    fabric_store, _devices = store
+    fabric_store.topology()
+    stream = fabric_store._streams["leaf1"]
+    stream.rates.observe("ethernet-1/1", {"out-octets": 0}, 1_000_000_000)
+    stream.rates.observe("ethernet-1/1", {"out-octets": 1_000_000}, 2_000_000_000)
+    graph = fabric_store.topology()
+    link = next(cable for cable in graph["links"] if {cable["a"], cable["b"]} == {"leaf1", "spine1"})
+    assert link["a"] == "leaf1"
+    # 1_000_000 octets in 1s is 8 Mbps leaving leaf1 toward spine1.
+    assert link["a_out_bps"] == 8_000_000
+    assert "b_out_bps" not in link
 
 
 def test_topology_keeps_a_node_that_has_streamed_nothing(store):

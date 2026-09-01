@@ -50,6 +50,9 @@
     topoTabs: el("topo-tabs"),
     topoDetail: el("topo-detail"),
     topoPortLabels: el("topo-port-labels"),
+    topoMaxBw: el("topo-max-bw"),
+    topoMaxBwUnit: el("topo-max-bw-unit"),
+    topoHeatScale: el("topo-heat-scale"),
     topoZoomIn: el("topo-zoom-in"),
     topoZoomOut: el("topo-zoom-out"),
     topoZoomLevel: el("topo-zoom-level"),
@@ -454,6 +457,13 @@
   const TOPO_ZOOM_MIN = 0.05;
   const TOPO_ZOOM_MAX = 4;
   const TOPO_ZOOM_STEP = 1.25;
+  // Fractions of the lab-wide per-link capacity. Emulated nodes share one
+  // forwarding budget, so every cable is coloured against the same max.
+  const TOPO_BW_TH1 = 0.25;
+  const TOPO_BW_TH2 = 0.5;
+  const TOPO_BW_TH3 = 0.75;
+  const TOPO_MAX_BW_DEFAULT = 10;
+  const TOPO_MAX_BW_UNIT_DEFAULT = "1000000";
 
   const shortPort = (port) => String(port || "").replace(/^ethernet-/, "e");
 
@@ -468,12 +478,18 @@
       setLive("live", "live");
       dom.streamInfo.textContent = `LLDP topology, rendered in ${graph.render_ms} ms`;
       dom.updated.textContent = "updated " + new Date().toLocaleTimeString();
-      // Re-drawing would drop the hover and lose the scroll position, and a
-      // fabric changes far less often than it is polled.
-      const key = JSON.stringify(graph.nodes) + JSON.stringify(graph.links);
-      if (key === state.topoKey) return;
-      state.topoKey = key;
+      // Re-drawing would drop the hover and lose the scroll position. Rates
+      // change every poll; the cables themselves do not, so colour in place.
       state.topology = graph;
+      const key = topoStructureKey(graph);
+      if (key === state.topoKey) {
+        recolorTopoLinks(graph);
+        if (state.topoSelection && state.topoSelection.kind === "link") {
+          renderTopoLinkDetail(state.topoSelection.id);
+        }
+        return;
+      }
+      state.topoKey = key;
       renderTopology(graph);
     } catch (_err) {
       setLive("error", "error");
@@ -538,6 +554,7 @@
     const graph = topoFabricView(whole);
     dom.topoCanvas.replaceChildren();
     renderTopoLegend(graph);
+    renderTopoHeatLegend();
     dom.topoStats.textContent = topoSummary(graph);
     dom.rowCount.textContent = `${graph.nodes.length} node(s), ${graph.links.length} link(s)`;
     if (!graph.nodes.length) {
@@ -819,33 +836,56 @@
       const b = layout.positions.get(link.b);
       if (!a || !b) continue;
       const id = `${link.a}\u0000${link.b}`;
-      const aIsTop = a.y <= b.y;
-      const [top, bottom] = aIsTop ? [a, b] : [b, a];
-      const shape = link.intra_layer
-        ? svgEl("path", {
-            // An arc under the tier, so a DCGW mesh or a spine pair does not
-            // draw a line straight through the nodes between its ends.
-            d: `M ${a.cx} ${a.y + a.h} Q ${(a.cx + b.cx) / 2} ${a.y + a.h + 46} ${b.cx} ${b.y + b.h}`,
-            fill: "none",
-          })
-        : svgEl("line", {
-            x1: top.cx,
-            y1: top.y + top.h,
-            x2: bottom.cx,
-            y2: bottom.y,
-          });
-      shape.setAttribute(
-        "class",
-        `topo-link link-${link.state}${link.access ? " is-access" : ""}`
-      );
-      shape.setAttribute("data-link", id);
-      shape.setAttribute("data-a", link.a);
-      shape.setAttribute("data-b", link.b);
-      const title = svgEl("title");
-      title.textContent = topoLinkTitle(link);
-      shape.append(title);
-      group.append(shape);
+      const pair = svgEl("g", {
+        class: `topo-link-pair${link.access ? " is-access" : ""}`,
+        "data-link": id,
+        "data-a": link.a,
+        "data-b": link.b,
+      });
+      const { aIsTop, aPt, bPt } = linkAnchors(a, b);
+      let aShape;
+      let bShape;
+      if (link.intra_layer) {
+        // An arc under the tier, so a DCGW mesh or a spine pair does not
+        // draw a line straight through the nodes between its ends. Split at
+        // the midpoint so each half takes the colour of that end's egress.
+        const p0 = { x: a.cx, y: a.y + a.h };
+        const p2 = { x: b.cx, y: b.y + b.h };
+        const p1 = { x: (a.cx + b.cx) / 2, y: a.y + a.h + 46 };
+        const { mid, c1, c2 } = splitQuad(p0, p1, p2);
+        aShape = svgEl("path", {
+          d: `M ${p0.x} ${p0.y} Q ${c1.x} ${c1.y} ${mid.x} ${mid.y}`,
+          fill: "none",
+          "data-end": "a",
+        });
+        bShape = svgEl("path", {
+          d: `M ${mid.x} ${mid.y} Q ${c2.x} ${c2.y} ${p2.x} ${p2.y}`,
+          fill: "none",
+          "data-end": "b",
+        });
+      } else {
+        const mid = midPoint(aPt, bPt);
+        aShape = svgEl("line", {
+          x1: aPt.x,
+          y1: aPt.y,
+          x2: mid.x,
+          y2: mid.y,
+          "data-end": "a",
+        });
+        bShape = svgEl("line", {
+          x1: mid.x,
+          y1: mid.y,
+          x2: bPt.x,
+          y2: bPt.y,
+          "data-end": "b",
+        });
+      }
+      aShape.append(svgEl("title"));
+      bShape.append(svgEl("title"));
+      pair.append(aShape, bShape);
+      paintTopoLink(pair, link);
 
+      const [top, bottom] = aIsTop ? [a, b] : [b, a];
       if (link.count > 1) {
         const badge = svgEl("text", {
           class: "topo-link-count",
@@ -854,19 +894,154 @@
           "text-anchor": "middle",
         });
         badge.textContent = `${link.count}\u00d7`;
-        group.append(badge);
+        pair.append(badge);
       }
       // Only a single cable can be labelled without the two ends colliding;
       // a bundle shows its size instead, and its ports in the detail panel.
       if (dom.topoPortLabels.checked && !link.intra_layer && link.count === 1) {
         const ports = link.ports[0];
-        group.append(
+        pair.append(
           portLabel(top, bottom, 0.18, shortPort(aIsTop ? ports.a_port : ports.b_port)),
           portLabel(top, bottom, 0.82, shortPort(aIsTop ? ports.b_port : ports.a_port))
         );
       }
+      group.append(pair);
     }
     return group;
+  }
+
+  /** Attachment points of a cable: bottom of the upper node, top of the lower. */
+  function linkAnchors(a, b) {
+    const aIsTop = a.y <= b.y;
+    return {
+      aIsTop,
+      aPt: { x: a.cx, y: aIsTop ? a.y + a.h : a.y },
+      bPt: { x: b.cx, y: aIsTop ? b.y : b.y + b.h },
+    };
+  }
+
+  const midPoint = (p, q) => ({ x: (p.x + q.x) / 2, y: (p.y + q.y) / 2 });
+
+  /** Split a quadratic bezier at t=0.5 so each half can take its own stroke. */
+  function splitQuad(p0, p1, p2) {
+    const c1 = midPoint(p0, p1);
+    const c2 = midPoint(p1, p2);
+    return { mid: midPoint(c1, c2), c1, c2 };
+  }
+
+  /** The lab-wide per-link capacity, in bits per second. */
+  function topoMaxLinkBps() {
+    const value = parseFloat(dom.topoMaxBw && dom.topoMaxBw.value);
+    const unit = parseFloat(dom.topoMaxBwUnit && dom.topoMaxBwUnit.value);
+    if (!(value > 0) || !(unit > 0)) return TOPO_MAX_BW_DEFAULT * Number(TOPO_MAX_BW_UNIT_DEFAULT);
+    return value * unit;
+  }
+
+  function topoBwClass(bps) {
+    if (bps == null || !Number.isFinite(Number(bps))) return "bw-none";
+    const max = topoMaxLinkBps();
+    if (!(max > 0)) return "bw-none";
+    const ratio = Number(bps) / max;
+    if (ratio < TOPO_BW_TH1) return "bw-green";
+    if (ratio < TOPO_BW_TH2) return "bw-yellow";
+    if (ratio < TOPO_BW_TH3) return "bw-orange";
+    return "bw-red";
+  }
+
+  function topoHalfClass(link, bps) {
+    const parts = ["topo-link"];
+    if (link.state === "down") {
+      parts.push("link-down");
+      return parts.join(" ");
+    }
+    parts.push(`link-${link.state}`);
+    parts.push(topoBwClass(bps));
+    return parts.join(" ");
+  }
+
+  function paintTopoLink(pair, link) {
+    const aHalf = pair.querySelector('[data-end="a"]');
+    const bHalf = pair.querySelector('[data-end="b"]');
+    if (aHalf) aHalf.setAttribute("class", topoHalfClass(link, link.a_out_bps));
+    if (bHalf) bHalf.setAttribute("class", topoHalfClass(link, link.b_out_bps));
+    const title = topoLinkTitle(link);
+    pair.querySelectorAll("title").forEach((node) => {
+      node.textContent = title;
+    });
+  }
+
+  function recolorTopoLinks(graph) {
+    const svg = dom.topoCanvas.querySelector(".topo-svg");
+    if (!svg) return;
+    renderTopoHeatLegend();
+    const byId = new Map((graph.links || []).map((link) => [`${link.a}\u0000${link.b}`, link]));
+    svg.querySelectorAll("[data-link]").forEach((pair) => {
+      const link = byId.get(pair.getAttribute("data-link"));
+      if (link) paintTopoLink(pair, link);
+    });
+  }
+
+  /** Identity of the drawing, ignoring rates that only recolour it. */
+  function topoStructureKey(graph) {
+    const links = (graph.links || []).map((link) => ({
+      a: link.a,
+      b: link.b,
+      count: link.count,
+      state: link.state,
+      intra_layer: link.intra_layer,
+      access: link.access,
+      ports: (link.ports || []).map((port) => ({ a_port: port.a_port, b_port: port.b_port })),
+    }));
+    return JSON.stringify(graph.nodes) + JSON.stringify(links);
+  }
+
+  function trimBw(text) {
+    return String(text).replace(/(\.\d*?)0+$/, "$1").replace(/\.$/, "");
+  }
+
+  function formatBps(bps) {
+    if (bps == null || !Number.isFinite(Number(bps))) return "—";
+    const n = Number(bps);
+    if (n >= 1e9) return `${trimBw((n / 1e9).toFixed(2))} Gbps`;
+    if (n >= 1e6) return `${trimBw((n / 1e6).toFixed(2))} Mbps`;
+    if (n >= 1e3) return `${trimBw((n / 1e3).toFixed(1))} Kbps`;
+    return `${Math.round(n)} bps`;
+  }
+
+  function renderTopoHeatLegend() {
+    if (!dom.topoHeatScale) return;
+    const unit = (dom.topoMaxBwUnit && dom.topoMaxBwUnit.selectedOptions[0]
+      ? dom.topoMaxBwUnit.selectedOptions[0].textContent
+      : "Mbps");
+    const value = trimBw(String(dom.topoMaxBw && dom.topoMaxBw.value ? dom.topoMaxBw.value : TOPO_MAX_BW_DEFAULT));
+    dom.topoHeatScale.textContent = `of ${value} ${unit}`;
+  }
+
+  function saveTopoMaxBw() {
+    try {
+      localStorage.setItem("fcli-topo-max-bw", dom.topoMaxBw.value);
+      localStorage.setItem("fcli-topo-max-bw-unit", dom.topoMaxBwUnit.value);
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
+  }
+
+  function restoreTopoMaxBw() {
+    try {
+      const value = localStorage.getItem("fcli-topo-max-bw");
+      const unit = localStorage.getItem("fcli-topo-max-bw-unit");
+      if (value && dom.topoMaxBw) dom.topoMaxBw.value = value;
+      if (unit && dom.topoMaxBwUnit) dom.topoMaxBwUnit.value = unit;
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
+    renderTopoHeatLegend();
+  }
+
+  function onTopoMaxBwChange() {
+    saveTopoMaxBw();
+    if (state.topology) recolorTopoLinks(state.topology);
+    else renderTopoHeatLegend();
   }
 
   /** A port name placed a fraction of the way down a link. */
@@ -973,7 +1148,12 @@
     const ports = link.ports
       .map((pair) => cableText(pair.a_port, pair.b_port, "↔"))
       .join(", ");
-    return `${link.a} ↔ ${link.b}${ports ? " (" + ports + ")" : ""}`;
+    const parts = [`${link.a} ↔ ${link.b}${ports ? " (" + ports + ")" : ""}`];
+    if (link.a_out_bps != null || link.b_out_bps != null) {
+      parts.push(`${link.a} out ${formatBps(link.a_out_bps)}`);
+      parts.push(`${link.b} out ${formatBps(link.b_out_bps)}`);
+    }
+    return parts.join(" · ");
   }
 
   /** Both ends of a cable, or the one end of it a client does not report. */
@@ -1230,12 +1410,19 @@
     const panel = topoDetailShell(`${label(a)} ↔ ${label(b)}`, "");
     panel.append(topoDetailRow("state", link.state));
     panel.append(topoDetailRow("cables", String(link.count)));
+    panel.append(topoDetailRow(`${label(a)} out`, formatBps(link.a_out_bps)));
+    panel.append(topoDetailRow(`${label(b)} out`, formatBps(link.b_out_bps)));
     const list = document.createElement("ul");
     list.className = "topo-peer-list";
     for (const pair of link.ports) {
       const item = document.createElement("li");
       item.className = "topo-cable";
-      item.textContent = cableText(pair.a_port, pair.b_port, "↔");
+      const cable = cableText(pair.a_port, pair.b_port, "↔");
+      if (pair.a_out_bps != null || pair.b_out_bps != null) {
+        item.textContent = `${cable} · ${formatBps(pair.a_out_bps)} out / ${formatBps(pair.b_out_bps)} out`;
+      } else {
+        item.textContent = cable;
+      }
       list.append(item);
     }
     panel.append(list);
@@ -3015,6 +3202,14 @@
     if (state.topology) renderTopology(state.topology);
   });
 
+  if (dom.topoMaxBw) {
+    dom.topoMaxBw.addEventListener("change", onTopoMaxBwChange);
+    dom.topoMaxBw.addEventListener("input", onTopoMaxBwChange);
+  }
+  if (dom.topoMaxBwUnit) {
+    dom.topoMaxBwUnit.addEventListener("change", onTopoMaxBwChange);
+  }
+
   dom.topoZoomIn.addEventListener("click", () =>
     setTopoZoom(topoZoom() * TOPO_ZOOM_STEP, topoCanvasCenter())
   );
@@ -3148,6 +3343,7 @@
   }
   restoreTopoZoom();
   restoreTopoFabric();
+  restoreTopoMaxBw();
 
   loadReports();
   loadInventory();
