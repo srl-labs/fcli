@@ -205,6 +205,124 @@ def test_labels_are_carried_over_as_host_data():
     assert hosts["clab-lab1-leaf1"]["data"] == {"role": "leaf", "site": "dc1"}
 
 
+def test_kind_inherited_from_a_group():
+    """'groups' sits between 'kinds' and the nodes in clab's chain.
+
+    A topology can hang the kind off a group and leave every node with only
+    'group:', which used to leave the inventory empty.
+    """
+    hosts = clab.srl_hosts(
+        topo(
+            """
+            name: lab1
+            topology:
+              groups:
+                leaf:
+                  kind: nokia_srlinux
+                  image: ghcr.io/nokia/srlinux:25.10.4
+                host:
+                  kind: linux
+                  image: ghcr.io/srl-labs/network-multitool
+              nodes:
+                leaf1:
+                  group: leaf
+                leaf2:
+                  group: leaf
+                host1:
+                  group: host
+            """
+        )
+    )
+    assert sorted(hosts) == ["clab-lab1-leaf1", "clab-lab1-leaf2"]
+
+
+def test_a_group_image_identifies_a_custom_kind_name():
+    hosts = clab.srl_hosts(
+        topo(
+            """
+            name: lab1
+            topology:
+              groups:
+                leaf:
+                  kind: my-srl
+                  image: ghcr.io/nokia/srlinux:25.10.4
+              nodes:
+                leaf1:
+                  group: leaf
+            """
+        )
+    )
+    assert sorted(hosts) == ["clab-lab1-leaf1"]
+
+
+def test_a_node_kind_overrides_the_group_it_is_in():
+    hosts = clab.srl_hosts(
+        topo(
+            """
+            name: lab1
+            topology:
+              groups:
+                edge:
+                  kind: linux
+                  image: quay.io/frrouting/frr:master
+              nodes:
+                leaf1:
+                  group: edge
+                  kind: nokia_srlinux
+                frr1:
+                  group: edge
+            """
+        )
+    )
+    assert sorted(hosts) == ["clab-lab1-leaf1"]
+
+
+def test_a_group_overrides_the_topology_defaults():
+    hosts = clab.srl_hosts(
+        topo(
+            """
+            name: lab1
+            topology:
+              defaults:
+                kind: nokia_srlinux
+                image: ghcr.io/nokia/srlinux:25.10.4
+              groups:
+                host:
+                  kind: linux
+                  image: ghcr.io/srl-labs/network-multitool
+              nodes:
+                leaf1:
+                host1:
+                  group: host
+            """
+        )
+    )
+    assert sorted(hosts) == ["clab-lab1-leaf1"]
+
+
+def test_group_labels_are_merged_under_the_node_labels():
+    hosts = clab.srl_hosts(
+        topo(
+            """
+            name: lab1
+            topology:
+              groups:
+                leaf:
+                  kind: nokia_srlinux
+                  labels:
+                    role: leaf
+                    site: dc1
+              nodes:
+                leaf1:
+                  group: leaf
+                  labels:
+                    site: dc2
+            """
+        )
+    )
+    assert hosts["clab-lab1-leaf1"]["data"] == {"role": "leaf", "site": "dc2"}
+
+
 def test_hosts_carry_the_prefixed_name_and_platform():
     hosts = clab.srl_hosts(
         topo(

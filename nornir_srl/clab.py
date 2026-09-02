@@ -5,7 +5,7 @@ of its nodes are SR Linux. Keeping that in one place is what stops the two from
 drifting apart.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 SRL_DEFAULT_USERNAME = "admin"
 SRL_DEFAULT_PASSWORD = "NokiaSrl1!"
@@ -56,54 +56,61 @@ def node_prefix(topo: Dict[str, Any]) -> str:
     return f"{prefix}-{lab_name}-"
 
 
-def srl_kinds(topology: Dict[str, Any]) -> List[str]:
-    """Every kind in *topology* that denotes an SR Linux node."""
-    kinds = _mapping(topology, "kinds")
-    found = [
-        kind
-        for kind in kinds
-        if "/srlinux" in (_mapping(kinds, kind).get("image") or "")
-    ]
-    for reserved in SRL_KINDS:
-        if reserved not in found:
-            found.append(reserved)
-    return found
+def _inherited(topology: Dict[str, Any], node_spec: Dict[str, Any], key: str) -> Any:
+    """The value of *key* for a node, down containerlab's inheritance chain.
+
+    A node's own setting wins, then the group it is in, then the topology
+    defaults. ``kinds`` is not a link in that chain: it is keyed by the kind
+    the chain settles on, so it can only be read once that kind is known.
+    """
+    group = _mapping(_mapping(topology, "groups"), node_spec.get("group"))
+    for source in (node_spec, group, _mapping(topology, "defaults")):
+        value = source.get(key)
+        if value:
+            return value
+    return None
 
 
-def _srlinux_by_default(topology: Dict[str, Any]) -> bool:
-    """Whether a node that names no kind of its own is an SR Linux node."""
-    defaults = _mapping(topology, "defaults")
-    default_kind = defaults.get("kind")
-    if default_kind in SRL_KINDS:
+def is_srl_node(topology: Dict[str, Any], node_spec: Dict[str, Any]) -> bool:
+    """Whether the node described by *node_spec* is an SR Linux node.
+
+    The kind the node inherits settles it, and for a kind whose name
+    containerlab does not reserve, the image behind that kind does.
+    """
+    kind = _inherited(topology, node_spec, "kind")
+    if kind in SRL_KINDS:
         return True
-    # A default image can be pinned directly or inherited from the default
-    # kind's entry under 'kinds', and either one settles it on its own.
-    default_image = defaults.get("image") or _mapping(
-        _mapping(topology, "kinds"), default_kind
-    ).get("image")
-    return bool(default_image and "srlinux" in default_image)
+    kind_image = _mapping(_mapping(topology, "kinds"), kind).get("image")
+    return "srlinux" in (kind_image or _inherited(topology, node_spec, "image") or "")
+
+
+def _labels(topology: Dict[str, Any], node_spec: Dict[str, Any]) -> Dict[str, Any]:
+    """A node's labels, with the ones it inherits merged in underneath."""
+    group = _mapping(_mapping(topology, "groups"), node_spec.get("group"))
+    labels = dict(_mapping(_mapping(topology, "defaults"), "labels"))
+    labels.update(_mapping(group, "labels"))
+    labels.update(_mapping(node_spec, "labels"))
+    return labels
 
 
 def srl_hosts(topo: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """The SR Linux nodes of *topo*, as a Nornir hosts inventory."""
     topology = _mapping(topo, "topology")
     prefix = node_prefix(topo)
-    kinds = srl_kinds(topology)
-    by_default = _srlinux_by_default(topology)
 
     nodes = _mapping(topology, "nodes")
     hosts: Dict[str, Dict[str, Any]] = {}
     for node in nodes:
         node_spec = _mapping(nodes, node)
-        node_kind = node_spec.get("kind")
-        if (node_kind is None and by_default) or node_kind in kinds:
-            name = f"{prefix}{node}"
-            hosts[name] = {
-                "hostname": name,
-                "platform": "srlinux",
-                "groups": ["srl"],
-                "data": _mapping(node_spec, "labels"),
-            }
+        if not is_srl_node(topology, node_spec):
+            continue
+        name = f"{prefix}{node}"
+        hosts[name] = {
+            "hostname": name,
+            "platform": "srlinux",
+            "groups": ["srl"],
+            "data": _labels(topology, node_spec),
+        }
     return hosts
 
 
