@@ -152,12 +152,35 @@ def _aggregated(resource, per_host, failed=()):
     return aggregated
 
 
-def test_extract_takes_columns_from_the_first_item():
+def test_extract_takes_columns_from_the_item_fields():
     results = _aggregated("ni", {"leaf1": [{"ni": "default", "oper-state": "up"}]})
     columns, per_node = extract("ni", results)
     assert columns == ["ni", "oper-state"]
     assert [r.values for r in per_node[0].rows] == [
         {"ni": "default", "oper-state": "up"}
+    ]
+
+
+def test_extract_unions_the_columns_of_every_host():
+    """A field the first host has no row for is still a column.
+
+    Nodes differ in what they carry - only some leaves have IPv6 routes, or a
+    leaked route - and the table has to hold the fields of all of them.
+    """
+    results = _aggregated(
+        "ip_rib",
+        {
+            "leaf1": [{"NI": "default", "Rib": None}],
+            "leaf2": [{"NI": "all-rails", "Rib": [{"Prefix": "fd00::/64"}]}],
+        },
+    )
+    columns, per_node = extract("ip_rib", results)
+    # 'Rib' names the list of routes on the host that has some, so it groups
+    # rows rather than being a column, even though leaf1 holds it as a null.
+    assert columns == ["NI", "Prefix"]
+    assert [r.values for node in per_node for r in node.rows] == [
+        {"NI": "default"},
+        {"NI": "all-rails", "Prefix": "fd00::/64"},
     ]
 
 

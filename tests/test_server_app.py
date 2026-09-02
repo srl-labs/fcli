@@ -163,6 +163,44 @@ def test_flatten_expands_nested_lists_into_rows():
     ]
 
 
+def test_get_fields_unions_the_fields_of_every_sub_item():
+    """A route carries ``orig-vrf`` only when it is leaked, so the first one
+    cannot be trusted to name the columns of the rest."""
+    item = {"NI": "default", "Rib": [{"Prefix": "10.0.0.0/8"}, {"orig-vrf": "blue"}]}
+    assert get_fields(item) == ["NI", "Prefix", "orig-vrf"]
+
+
+def test_flatten_takes_columns_from_every_item():
+    """An item whose nested list is empty must not decide the columns alone.
+
+    A node with an IPv6 route table only in one network-instance used to lose
+    every route column, because the first network-instance had no routes to
+    name them after. ``Rib`` names that list, so it groups the rows rather than
+    being a column of its own.
+    """
+    items = [
+        {"NI": "default", "Rib": None},
+        {"NI": "all-rails", "Rib": [{"Prefix": "fd00::/64", "type": "bgp"}]},
+    ]
+    columns, rows = flatten("leaf1", items)
+    assert columns == ["NI", "Prefix", "type"]
+    assert rows == [
+        {"Node": "leaf1", "NI": "default"},
+        {"Node": "leaf1", "NI": "all-rails", "Prefix": "fd00::/64", "type": "bgp"},
+    ]
+
+
+def test_flatten_keeps_a_sub_item_key_no_item_fills():
+    """With no routes anywhere, nothing shows that ``Rib`` holds a list.
+
+    The server drops it once another node reports routes; on its own a node
+    cannot tell this apart from a field it has no value for.
+    """
+    columns, rows = flatten("leaf1", [{"NI": "default", "Rib": None}])
+    assert columns == ["NI", "Rib"]
+    assert rows == [{"Node": "leaf1", "NI": "default"}]
+
+
 def test_flatten_handles_flat_items():
     columns, rows = flatten("leaf1", [{"type": "7220 IXR-D2L", "uptime": 10}])
     assert columns == ["type", "uptime"]

@@ -7,14 +7,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from nornir.core import Nornir
 
 from ..connections.srlinux import CONNECTION_NAME
 from ..connections.layer2 import stamp_underlay_sites
 from ..reports import ReportSpec, SubscriptionSpec, get_report
-from ..rows import clean_columns, flatten
+from ..rows import clean_columns, flatten, merge_fields, sub_item_keys
 from .devices import CachedDevice, RecordingDevice
 from .stream import HostStream
 from .topology import build_topology, node_facts
@@ -471,14 +471,18 @@ class FabricStore:
         columns: List[str] = []
         rows: List[Dict[str, Any]] = []
         errors: List[Dict[str, str]] = []
-        for name, cols, host_rows, error in results:
+        # A node with no routes at all cannot tell that 'Rib' groups rows rather
+        # than holding a value, so the fabric decides it together.
+        containers: Set[str] = set()
+        for name, cols, host_rows, error, host_containers in results:
             if error:
                 errors.append({"node": name, "error": error})
                 continue
-            if not columns and cols:
-                columns = cols
+            merge_fields(columns, cols)
+            containers |= host_containers
             rows.extend(host_rows)
 
+        columns = [c for c in columns if c not in containers]
         all_columns = ["Node"] + clean_columns(columns)
         clean_rows = [
             {c: _cell(row.get(raw)) for c, raw in zip(all_columns, ["Node"] + columns)}
@@ -513,26 +517,27 @@ class FabricStore:
 
     def _host_rows(
         self, report: ReportSpec, name: str
-    ) -> Tuple[str, List[str], List[Dict[str, Any]], Optional[str]]:
+    ) -> Tuple[str, List[str], List[Dict[str, Any]], Optional[str], Set[str]]:
         with self._lock:
             stream = self._streams.get(name)
             if stream is None:
-                return name, [], [], self._connect_errors.get(name, "not connected")
+                error = self._connect_errors.get(name, "not connected")
+                return name, [], [], error, set()
             activation_error = self._activation_errors.get((name, report.name))
         if activation_error:
-            return name, [], [], activation_error[1]
+            return name, [], [], activation_error[1], set()
         if self._stop.is_set():
-            return name, [], [], None
+            return name, [], [], None, set()
         host = self.nornir.inventory.hosts.get(name)
         node = (host.hostname if host and host.hostname else name) or name
         try:
             result = report.getter(CachedDevice(stream))
         except Exception as exc:  # noqa: BLE001 - reported per node in the UI
             logger.debug("%s: report '%s' failed: %s", name, report.name, exc)
-            return name, [], [], str(exc)
+            return name, [], [], str(exc), set()
         items = (result or {}).get(report.resource) or []
         columns, rows = flatten(node, items)
-        return name, columns, rows, None
+        return name, columns, rows, None, sub_item_keys(items)
 
     # ------------------------------------------------------------------ #
     # introspection
