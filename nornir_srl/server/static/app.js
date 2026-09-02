@@ -3900,7 +3900,8 @@
       status.append(dot, label, clock);
       const body = document.createElement("div");
       body.className = "chat-body";
-      if (text) renderMarkdown(text, body);
+      // An answer arrives token by token, so the stream fills this in through
+      // row._body; the bubble starts empty and *text* is for the user role.
       row.append(tools, status, body);
       row._tools = tools;
       row._status = status;
@@ -4043,7 +4044,7 @@
     dom.chatInput.value = "";
     state.chatMessages.push({ role: "user", content: text });
     appendChat("user", text);
-    const bubble = appendChat("assistant", "");
+    const bubble = appendChat("assistant");
     setChatStatus(bubble, "Thinking…");
     setChatBusy(true);
     const controller = new AbortController();
