@@ -1,6 +1,6 @@
 # fcli
 
-[![ci](https://github.com/srl-labs/nornir-srl/actions/workflows/ci.yml/badge.svg)](https://github.com/srl-labs/nornir-srl/actions/workflows/ci.yml)
+[![ci](https://github.com/srl-labs/fcli/actions/workflows/ci.yml/badge.svg)](https://github.com/srl-labs/fcli/actions/workflows/ci.yml)
 [![SR Linux](https://img.shields.io/badge/SR%20Linux-25.3.2%20%7C%2025.10.3%20%7C%2026.3.1%20%7C%2026.7.1-blue)](#tested-sr-linux-releases)
 [![PyPI](https://img.shields.io/pypi/v/nornir-srl)](https://pypi.org/project/nornir-srl/)
 
@@ -35,7 +35,7 @@ With a running containerlab topology that has SR Linux nodes:
 
 ```bash
 # install (once)
-uv tool install git+https://github.com/srl-labs/nornir-srl
+uv tool install git+https://github.com/srl-labs/fcli
 
 # live UI — open http://127.0.0.1:8080
 fcli -t topo.clab.yml server
@@ -59,7 +59,7 @@ Requires Python 3.10+.
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
-uv tool install git+https://github.com/srl-labs/nornir-srl
+uv tool install git+https://github.com/srl-labs/fcli
 ```
 
 This puts `fcli` and `fcli-mcp` on your `PATH` (typically `~/.local/bin`).
@@ -76,7 +76,7 @@ pip install -U nornir-srl
 
 ### Docker
 
-The image is [ghcr.io/srl-labs/nornir-srl](https://github.com/srl-labs/nornir-srl/pkgs/container/nornir-srl). Attach it to the containerlab management network, publish port 8080, and bind-mount the topology file:
+The image is [ghcr.io/srl-labs/fcli](https://github.com/srl-labs/fcli/pkgs/container/fcli). Attach it to the containerlab management network, publish port 8080, and bind-mount the topology file:
 
 ```bash
 CLAB_TOPO=topo.clab.yml
@@ -85,7 +85,7 @@ alias fcli="docker run -it --network $NET --rm \
   -p 8080:8080 \
   -v /etc/hosts:/etc/hosts:ro \
   -v ${PWD}/${CLAB_TOPO}:/topo.yml \
-  ghcr.io/srl-labs/nornir-srl:latest -t /topo.yml"
+  ghcr.io/srl-labs/fcli:latest -t /topo.yml"
 
 fcli server --listen 0.0.0.0
 fcli bgp-peers

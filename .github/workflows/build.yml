@@ -5,7 +5,7 @@ on:
     types: [published]
 
 env:
-  IMAGE_NAME: nornir-srl
+  IMAGE_NAME: fcli
 
 jobs:
   # Push image to GitHub Packages.
