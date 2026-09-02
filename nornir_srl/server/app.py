@@ -21,6 +21,7 @@ from starlette.staticfiles import StaticFiles
 
 from .. import __version__
 from ..reports import SERVER, ReportSpec, get_report, reports_for
+from .agent import NO_PROVIDER, ChatService
 from .store import FabricStore
 
 logger = logging.getLogger(__name__)
@@ -162,6 +163,8 @@ def create_app(
     restart_debounce: float = 1.0,
     connect_retry_interval: float = 30.0,
     topo_name: Optional[str] = None,
+    chat_client_factory: Optional[Callable[[], Any]] = None,
+    jsonrpc_call: Optional[Callable[..., Any]] = None,
 ) -> Starlette:
     """Build the fcli server application around an initialized Nornir inventory."""
     store = FabricStore(
@@ -174,6 +177,13 @@ def create_app(
         connect_retry_interval=connect_retry_interval,
         topo_name=topo_name,
     )
+    chat_kwargs: Dict[str, Any] = {}
+    if chat_client_factory is not None:
+        chat_kwargs["client_factory"] = chat_client_factory
+    if jsonrpc_call is not None:
+        chat_kwargs["jsonrpc_call"] = jsonrpc_call
+    chat = ChatService(store, **chat_kwargs)
+    chat_gate = asyncio.Semaphore(1)
 
     @contextlib.asynccontextmanager
     async def lifespan(_app: Starlette) -> AsyncIterator[None]:
@@ -196,6 +206,10 @@ def create_app(
                 "version": __version__,
                 "topo_name": store.topo_name,
                 "reports": [r.as_dict() for r in reports_for(SERVER)],
+                "chat": {
+                    "enabled": chat.enabled(),
+                    "providers": chat.providers(),
+                },
             }
         )
 
@@ -247,6 +261,47 @@ def create_app(
             headers=_SSE_HEADERS,
         )
 
+    async def chat_turn(request: Request) -> Response:
+        if not chat.enabled():
+            return JSONResponse({"error": NO_PROVIDER}, status_code=503)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - bad client body
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        if not isinstance(body, dict):
+            return JSONResponse({"error": "JSON object expected"}, status_code=400)
+        messages = body.get("messages")
+        if not isinstance(messages, list):
+            return JSONResponse({"error": "messages must be a list"}, status_code=400)
+        context = body.get("context")
+        if context is not None and not isinstance(context, dict):
+            return JSONResponse({"error": "context must be an object"}, status_code=400)
+        provider = body.get("provider")
+        if provider is not None and not isinstance(provider, str):
+            return JSONResponse({"error": "provider must be a string"}, status_code=400)
+        effort = body.get("effort")
+        if effort is not None and not isinstance(effort, str):
+            return JSONResponse({"error": "effort must be a string"}, status_code=400)
+        try:
+            await asyncio.wait_for(chat_gate.acquire(), timeout=0.05)
+        except asyncio.TimeoutError:
+            return JSONResponse(
+                {"error": "another chat is in progress"}, status_code=429
+            )
+
+        async def gated() -> AsyncIterator[bytes]:
+            try:
+                async for chunk in chat.events(messages, context, provider, effort):
+                    yield chunk
+            finally:
+                chat_gate.release()
+
+        return StreamingResponse(
+            gated(),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+
     routes = [
         Route("/", index),
         Route("/api/reports", reports),
@@ -256,11 +311,13 @@ def create_app(
         Route("/api/topology", topology),
         Route("/api/report/{name}", report_once),
         Route("/api/stream/{name}", report_stream),
+        Route("/api/chat", chat_turn, methods=["POST"]),
         Mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static"),
     ]
 
     app = Starlette(routes=routes, lifespan=lifespan)
     app.state.store = store
+    app.state.chat = chat
     wrapped = SuppressCancelledErrorMiddleware(app)
     wrapped.store = store
     return wrapped

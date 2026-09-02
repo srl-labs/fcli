@@ -91,12 +91,19 @@ counts jump between the first two releases.
 
 ## Coverage gaps
 
-Three reports are empty on every release, because this fabric has nothing for
+Four reports are empty on every release, because this fabric has nothing for
 them to show rather than because anything is wrong: `nd` (no IPv6 hosts),
-`static_routes` (the intent configures none) and `bgp_rib_ipv6` (no IPv6 BGP).
-Their paths are accepted, so a rejection would still be caught - but the shape of
-their payloads is not exercised. Adding IPv6 addressing and a static route to the
-intent would close that.
+`static_routes` (the intent configures none) and `bgp_rib_ipv6` and `ipv6_rib`
+(no IPv6 at all - their goldens are the bare `NI` column). Their paths are
+accepted, so a rejection would still be caught - but the shape of their payloads
+is not exercised. Adding IPv6 addressing and a static route to the intent would
+close that.
+
+That gap has cost us once: because no recorded node has an IPv6 route, the
+matrix could not catch the columns of a report being taken from its first item
+only, which emptied `ipv6-rib` on any fabric whose first network-instance or
+first node has no IPv6 routes. `ipv4_rib` has routes on both recorded nodes and
+looked fine throughout.
 
 `ifstats` rates and the `arp`/`nd` expiry countdowns are derived from the clock.
 Capture and replay both run under `tests/system/replay.deterministic_clock`, which

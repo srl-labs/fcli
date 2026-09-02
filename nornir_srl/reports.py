@@ -242,6 +242,10 @@ REPORTS: List[ReportSpec] = [
             ),
             SubscriptionSpec("/system/name/host-name", datatype="all", sample_interval=30),
             SubscriptionSpec("/interface[name=*]/oper-state", datatype="all", sample_interval=30),
+            # Egress of each interface, so each end of a cable can be coloured
+            # from the rate leaving that port. Sampled often enough that a lab
+            # generating traffic will move the graph with it.
+            SubscriptionSpec("/interface[name=*]/statistics", sample_interval=5),
             # A node's tier follows from the services on it: mac-vrfs and
             # ip-vrfs make it a leaf, two bgp-vpn instances make it a DCGW.
             SubscriptionSpec("/network-instance[name=*]/type", datatype="all", sample_interval=30),

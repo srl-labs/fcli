@@ -5,13 +5,18 @@ the ``mac_table`` MCP tool and the MAC Table in the browser all show the same
 columns in the same order. A report item may embed a list of sub-items (a
 network-instance with a list of routes, say); each sub-item becomes its own row,
 inheriting the parent's scalar fields.
+
+The columns are the union of the fields of every item of every node, because
+which fields an item carries depends on its state: a route table holds
+``orig-vrf`` only on a leaked route, and a node with no routes at all carries
+no route fields to name them after.
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 from .connections.helpers import clean_structured_key
 
@@ -28,7 +33,9 @@ __all__ = [
     "flatten",
     "get_fields",
     "is_scalar",
+    "merge_fields",
     "pass_filter",
+    "sub_item_keys",
 ]
 
 
@@ -52,11 +59,40 @@ def _sub_items(item: Dict[str, Any]) -> List[Tuple[str, List[Dict[str, Any]]]]:
     ]
 
 
+def merge_fields(columns: List[str], fields: Iterable[str]) -> List[str]:
+    """Append the fields of *fields* that *columns* does not have yet, in place."""
+    for name in fields:
+        if name not in columns:
+            columns.append(name)
+    return columns
+
+
+def sub_item_keys(items: Iterable[Any]) -> Set[str]:
+    """The keys of *items* that hold sub-items rather than a value.
+
+    ``Rib`` in a route table names the list of routes; it groups the rows, it is
+    never a cell. But an item for a network-instance with no routes holds it as
+    a null, indistinguishable from a field, so it takes an item that *has*
+    routes to know it is not one. The nodes of a fabric disagree about that -
+    only some have IPv6 routes - so a caller collects these over every node
+    before deciding which columns to keep.
+    """
+    return {
+        key for item in items if isinstance(item, dict) for key, _ in _sub_items(item)
+    }
+
+
 def get_fields(item: Any, depth: int = 0) -> List[str]:
-    """Derive the column names from the first item of a report result."""
+    """Derive the column names from one item of a report result.
+
+    Fields are unioned over every sub-item of a nested list, because a route or
+    neighbour only carries the fields that apply to it: the first entry of a
+    route table has no ``orig-vrf`` unless it happens to be a leaked route.
+    """
     fields: List[str] = []
-    if isinstance(item, list) and len(item) > 0:
-        fields.extend(get_fields(item[0], depth=depth + 1))
+    if isinstance(item, list):
+        for element in item:
+            merge_fields(fields, get_fields(element, depth=depth + 1))
     elif isinstance(item, dict):
         for key, value in item.items():
             if (
@@ -64,11 +100,16 @@ def get_fields(item: Any, depth: int = 0) -> List[str]:
                 and len(value) > 0
                 and isinstance(value[0], dict)
             ):
-                fields.extend(get_fields(value[0], depth=depth + 1))
+                # A set, because a route table runs to thousands of sub-items
+                # and the union is taken over every one of them.
+                nested: Set[str] = set()
+                for sub_item in value:
+                    nested.update(get_fields(sub_item, depth=depth + 1))
+                merge_fields(fields, sorted(nested))
             elif isinstance(value, dict):
-                fields.extend(get_fields(value, depth=depth + 1))
+                merge_fields(fields, get_fields(value, depth=depth + 1))
             else:
-                fields.append(key)
+                merge_fields(fields, (key,))
         if depth > 0:
             fields = sorted(fields)
     return fields
@@ -155,11 +196,14 @@ def extract(
 ) -> Tuple[List[str], List[NodeRows]]:
     """Flatten a Nornir ``AggregatedResult`` into ``(columns, rows per node)``.
 
-    Columns come from the first item seen, so every node lines up on the same
-    schema. Failed hosts are handed to *on_error*, which either returns the
-    fields to show for them or ``None`` to leave them out.
+    Columns are the union over every item of every node, so all nodes line up
+    on the same schema and a field is not lost because the node that happened
+    to be first has no row carrying it. Failed hosts are handed to *on_error*,
+    which either returns the fields to show for them or ``None`` to leave them
+    out.
     """
     columns: List[str] = []
+    containers: Set[str] = set()
     per_node: List[NodeRows] = []
 
     for host, host_result in results.items():
@@ -175,30 +219,33 @@ def extract(
         if not items:
             continue
         rows: List[Row] = []
+        containers |= sub_item_keys(items)
         for item in items:
             if not isinstance(item, dict):
                 continue
-            if not columns:
-                columns = get_fields(item)
+            merge_fields(columns, get_fields(item))
             rows.extend(_expand(item, field_filter))
         per_node.append(NodeRows(name, rows))
 
-    return columns, per_node
+    return [c for c in columns if c not in containers], per_node
 
 
 def flatten(node: str, items: List[Any]) -> Tuple[List[str], List[Dict[str, Any]]]:
     """Turn one node's report result into ``(columns, rows)``.
 
     Used by the streaming server, which already has the result for a single node
-    rather than an ``AggregatedResult``.
+    rather than an ``AggregatedResult``, and merges the columns of every node
+    itself. The sub-item keys this node cannot recognise as such are left in the
+    columns for the server to drop once it has heard from every node - see
+    :func:`sub_item_keys`.
     """
     columns: List[str] = []
     rows: List[Dict[str, Any]] = []
+    containers = sub_item_keys(items or [])
     for item in items or []:
         if not isinstance(item, dict):
             continue
-        if not columns:
-            columns = get_fields(item)
+        merge_fields(columns, get_fields(item))
         for row in _expand(item, None):
             rows.append({"Node": node, **row.values})
-    return columns, rows
+    return [c for c in columns if c not in containers], rows

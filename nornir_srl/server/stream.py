@@ -137,6 +137,10 @@ class RateTracker:
         # Copied: read by report renders while the subscription thread observes.
         return dict(self._rates.get(itf, {}))
 
+    def all_rates(self) -> Dict[str, Dict[str, float]]:
+        """Every interface that has a derived rate, each a copy of its counters."""
+        return {itf: dict(rates) for itf, rates in self._rates.items()}
+
     def forget(self, itf: str) -> None:
         """Drop the counters of an interface that no longer exists."""
         self._last.pop(itf, None)

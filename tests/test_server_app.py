@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -15,6 +16,7 @@ from nornir_srl.reports import SERVER, get_report, reports_for
 from nornir_srl.rows import flatten, get_fields, is_scalar
 from nornir_srl.server.app import (
     ASSET_TOKEN,
+    STATIC_DIR,
     asset_version,
     create_app,
     parse_kv,
@@ -159,6 +161,44 @@ def test_flatten_expands_nested_lists_into_rows():
         {"Node": "leaf1", "interface": "ethernet-1/1", "Nbr-System": "spine1"},
         {"Node": "leaf1", "interface": "ethernet-1/2", "Nbr-System": "spine2"},
     ]
+
+
+def test_get_fields_unions_the_fields_of_every_sub_item():
+    """A route carries ``orig-vrf`` only when it is leaked, so the first one
+    cannot be trusted to name the columns of the rest."""
+    item = {"NI": "default", "Rib": [{"Prefix": "10.0.0.0/8"}, {"orig-vrf": "blue"}]}
+    assert get_fields(item) == ["NI", "Prefix", "orig-vrf"]
+
+
+def test_flatten_takes_columns_from_every_item():
+    """An item whose nested list is empty must not decide the columns alone.
+
+    A node with an IPv6 route table only in one network-instance used to lose
+    every route column, because the first network-instance had no routes to
+    name them after. ``Rib`` names that list, so it groups the rows rather than
+    being a column of its own.
+    """
+    items = [
+        {"NI": "default", "Rib": None},
+        {"NI": "all-rails", "Rib": [{"Prefix": "fd00::/64", "type": "bgp"}]},
+    ]
+    columns, rows = flatten("leaf1", items)
+    assert columns == ["NI", "Prefix", "type"]
+    assert rows == [
+        {"Node": "leaf1", "NI": "default"},
+        {"Node": "leaf1", "NI": "all-rails", "Prefix": "fd00::/64", "type": "bgp"},
+    ]
+
+
+def test_flatten_keeps_a_sub_item_key_no_item_fills():
+    """With no routes anywhere, nothing shows that ``Rib`` holds a list.
+
+    The server drops it once another node reports routes; on its own a node
+    cannot tell this apart from a field it has no value for.
+    """
+    columns, rows = flatten("leaf1", [{"NI": "default", "Rib": None}])
+    assert columns == ["NI", "Rib"]
+    assert rows == [{"Node": "leaf1", "NI": "default"}]
 
 
 def test_flatten_handles_flat_items():
@@ -615,6 +655,21 @@ def test_the_page_is_never_cached_and_its_assets_are_fingerprinted(client):
     assert f"/static/style.css?v={asset_version()}" in response.text
 
 
+def test_every_chat_bubble_field_is_assigned_somewhere():
+    """A read of a field nothing assigns is a silent no-op, not an error.
+
+    That is how a finished answer went missing: the body element was built and
+    appended, but the reference was never stored on the row, so every guarded
+    `if (bubble._body) render(...)` skipped quietly and the drawer stayed empty
+    while the tool chips looked healthy.
+    """
+    source = (STATIC_DIR / "app.js").read_text()
+    read = set(re.findall(r"(?:bubble|row)\.(_[A-Za-z]+)", source))
+    assigned = set(re.findall(r"(?:bubble|row)\.(_[A-Za-z]+)\s*=[^=]", source))
+    assert read, "expected the chat bubble to carry fields"
+    assert read - assigned == set()
+
+
 def test_the_asset_version_follows_the_assets(tmp_path, monkeypatch):
     monkeypatch.setattr("nornir_srl.server.app.STATIC_DIR", tmp_path)
     (tmp_path / "app.js").write_text("//")
@@ -805,6 +860,7 @@ def test_topology_subscribes_to_lldp_and_the_services(store):
     streamed = [s["path"] for s in devices["leaf1"].subscribe_requests[-1]["subscription"]]
     assert LLDP_PATH in streamed
     assert HOSTNAME_PATH in streamed
+    assert IFSTATS_PATH in streamed
     # The service paths are registered as well; this fake node answers nothing
     # for them, which leaves them pending rather than streaming.
     registered = {p["path"] for p in fabric_store._streams["leaf1"].status()["paths"]}
@@ -885,6 +941,20 @@ def test_topology_merges_a_multi_homed_client_by_its_ethernet_segment(store):
     assert segment["names"] == ["mh-1"]
     assert segment["peers"] == [ES_ESI, "leaf1", "spine1"]
     assert clients[0]["peers"] == [segment["name"]]
+
+
+def test_topology_attaches_egress_rates_to_each_end_of_a_link(store):
+    fabric_store, _devices = store
+    fabric_store.topology()
+    stream = fabric_store._streams["leaf1"]
+    stream.rates.observe("ethernet-1/1", {"out-octets": 0}, 1_000_000_000)
+    stream.rates.observe("ethernet-1/1", {"out-octets": 1_000_000}, 2_000_000_000)
+    graph = fabric_store.topology()
+    link = next(cable for cable in graph["links"] if {cable["a"], cable["b"]} == {"leaf1", "spine1"})
+    assert link["a"] == "leaf1"
+    # 1_000_000 octets in 1s is 8 Mbps leaving leaf1 toward spine1.
+    assert link["a_out_bps"] == 8_000_000
+    assert "b_out_bps" not in link
 
 
 def test_topology_keeps_a_node_that_has_streamed_nothing(store):

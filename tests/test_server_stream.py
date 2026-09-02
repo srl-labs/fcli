@@ -643,6 +643,7 @@ def test_rate_tracker_computes_a_rate_between_two_samples():
     assert tracker.rates("e1") == {}
     tracker.observe("e1", {"in-octets": 2000}, 3_000_000_000)
     assert tracker.rates("e1")["in-octets"] == pytest.approx(500.0)
+    assert tracker.all_rates()["e1"]["in-octets"] == pytest.approx(500.0)
 
 
 def test_rate_tracker_ignores_counter_resets():
