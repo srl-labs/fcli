@@ -941,6 +941,73 @@ def test_get_bridge_domains_still_degrades_a_service_for_a_real_fault():
     )
 
 
+def _rib_device() -> "_FakeRouting":
+    """A node with three nested prefixes, answering from one fixed payload.
+
+    Like the caches the getter is really served from: the server materializes
+    the streamed state, and an unsubscribed path comes off a short-lived Get
+    cache, both of which hand out state somebody else still needs.
+    """
+    rib = [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "route-table": {
+                        "ipv4-unicast": {
+                            "route": [
+                                {"ipv4-prefix": "10.0.0.0/8", "active": True},
+                                {"ipv4-prefix": "10.1.0.0/16", "active": True},
+                                {"ipv4-prefix": "10.1.1.0/24", "active": True},
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+    ]
+    empty = [{"network-instance": []}]
+    return _FakeRouting(
+        {
+            "ipv4-unicast": rib,
+            "next-hop-group": empty,
+            "next-hop[index=": empty,
+        }
+    )
+
+
+def _prefixes(out: Dict[str, Any]) -> List[str]:
+    return [route["Prefix"] for route in out["ip_rib"][0]["Rib"]]
+
+
+def test_get_rib_narrows_to_the_prefix_an_address_falls_into():
+    """What ``fcli ipv4-rib -a`` shows: the route the node would forward on."""
+    assert _prefixes(_rib_device().get_rib(afi="ipv4-unicast")) == [
+        "10.0.0.0/8",
+        "10.1.0.0/16",
+        "10.1.1.0/24",
+    ]
+    narrowed = _rib_device().get_rib(afi="ipv4-unicast", lpm_address="10.1.1.55")
+    assert _prefixes(narrowed) == ["10.1.1.0/24"]
+
+
+def test_a_rib_lookup_leaves_the_whole_table_for_the_next_caller():
+    """Narrowing must not prune the payload it was handed.
+
+    The route lists are rewritten to narrow them, and the state behind them is
+    not the getter's to keep: the server renders the same report with and
+    without a lookup from state it streams once. Pruning it would empty the
+    table for whoever is watching all of it.
+    """
+    device = _rib_device()
+    device.get_rib(afi="ipv4-unicast", lpm_address="10.1.1.55")
+    assert _prefixes(device.get_rib(afi="ipv4-unicast")) == [
+        "10.0.0.0/8",
+        "10.1.0.0/16",
+        "10.1.1.0/24",
+    ]
+
+
 class _RecordingLayer2:
     """A Layer2 device that answers by path fragment and remembers what was asked."""
 

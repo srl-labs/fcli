@@ -377,6 +377,20 @@ body {
   outline-offset: -1px;
 }
 
+/* A value the report would not accept, left in place to be corrected rather
+   than sent and answered with an error. */
+.input.is-invalid {
+  border-color: var(--err);
+}
+
+/* The arguments the selected report declares, e.g. the RIB LPM address. */
+.report-params {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
 .grow {
   flex: 1 1 220px;
 }

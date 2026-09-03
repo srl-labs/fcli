@@ -20,7 +20,7 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from .. import __version__
-from ..reports import SERVER, ReportSpec, get_report, reports_for
+from ..reports import SERVER, ReportSpec, coerce_params, get_report, reports_for
 from .agent import NO_PROVIDER, ChatService
 from .store import FabricStore
 
@@ -88,6 +88,7 @@ async def table_events(
     inv_filter: Optional[Dict[str, str]],
     interval: float,
     is_disconnected: Callable[[], Awaitable[bool]],
+    params: Optional[Dict[str, Any]] = None,
 ) -> AsyncIterator[bytes]:
     """Yield server-sent events for *report* until the client goes away.
 
@@ -100,7 +101,9 @@ async def table_events(
     try:
         while not await is_disconnected() and not store.stopping:
             try:
-                table = await anyio.to_thread.run_sync(store.table, report, inv_filter)
+                table = await anyio.to_thread.run_sync(
+                    store.table, report, inv_filter, params
+                )
             except (asyncio.CancelledError, GeneratorExit):
                 break
             except Exception as exc:  # noqa: BLE001 - surfaced in the browser
@@ -241,7 +244,11 @@ def create_app(
         except KeyError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
         inv_filter = parse_kv(request.query_params.get("inv_filter"))
-        table = await anyio.to_thread.run_sync(store.table, report, inv_filter)
+        try:
+            params = coerce_params(report, request.query_params)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        table = await anyio.to_thread.run_sync(store.table, report, inv_filter, params)
         return JSONResponse(table)
 
     async def report_stream(request: Request) -> Response:
@@ -251,12 +258,23 @@ def create_app(
             return JSONResponse({"error": str(exc)}, status_code=404)
         inv_filter = parse_kv(request.query_params.get("inv_filter"))
         try:
+            params = coerce_params(report, request.query_params)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        try:
             interval = max(float(request.query_params.get("refresh", refresh)), 0.5)
         except ValueError:
             interval = refresh
 
         return StreamingResponse(
-            table_events(store, report, inv_filter, interval, request.is_disconnected),
+            table_events(
+                store,
+                report,
+                inv_filter,
+                interval,
+                request.is_disconnected,
+                params,
+            ),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )

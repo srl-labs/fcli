@@ -17,6 +17,7 @@ from nornir_srl.reports import (
     MCP,
     SERVER,
     REPORTS,
+    coerce_params,
     get_report,
     reports_for,
 )
@@ -50,6 +51,49 @@ def test_every_getter_is_callable_with_only_a_device():
             assert (
                 param.default is not inspect.Parameter.empty
             ), f"{report.name} getter requires '{param.name}'"
+
+
+def test_a_declared_parameter_is_one_the_getter_takes():
+    """Parameters are handed on as keywords, so a typo would fail every node."""
+    for report in REPORTS:
+        accepted = set(inspect.signature(report.getter).parameters)
+        for spec in report.params:
+            assert spec.name in accepted, (
+                f"{report.name} declares the parameter '{spec.name}', which its "
+                f"getter does not take"
+            )
+
+
+def test_coerce_params_takes_the_declared_ones_and_leaves_the_rest():
+    """The query string of a live table is not all the getter's business."""
+    params = coerce_params(
+        get_report("ipv4_rib"),
+        {"address": " 10.1.1.55 ", "refresh": "2", "inv_filter": "role=leaf"},
+    )
+    assert params == {"address": "10.1.1.55"}
+
+
+def test_coerce_params_reads_an_unset_parameter_as_absent():
+    """An empty box in the browser means the report in full, not a lookup."""
+    assert coerce_params(get_report("ipv4_rib"), {"address": "   "}) == {}
+    assert coerce_params(get_report("ipv4_rib"), {}) == {}
+
+
+def test_coerce_params_normalizes_an_address():
+    assert coerce_params(get_report("ipv6_rib"), {"address": "2001:0DB8:0000::1"}) == {
+        "address": "2001:db8::1"
+    }
+
+
+def test_coerce_params_rejects_what_is_not_an_address():
+    """Including a prefix: the RIB reports look up a host, as the CLI does."""
+    for value in ("no-such-thing", "10.0.0.0/8", "10.0.0.256"):
+        with pytest.raises(ValueError, match="not an IP address"):
+            coerce_params(get_report("ipv4_rib"), {"address": value})
+
+
+def test_a_report_that_declares_no_parameters_is_handed_none():
+    assert coerce_params(get_report("lldp"), {"address": "10.0.0.1"}) == {}
 
 
 #: Single leaves SR Linux defines as config rather than state.

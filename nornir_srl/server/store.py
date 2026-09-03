@@ -58,9 +58,14 @@ class FabricStore:
         self._specs: Dict[Tuple[str, str], List[SubscriptionSpec]] = {}
         #: Why a node could not serve a report, and when that was decided.
         self._activation_errors: Dict[Tuple[str, str], Tuple[float, str]] = {}
-        #: Centralized table cache per (report_name, inv_filter_tuple) -> (timestamp, table)
+        #: Centralized table cache per (report_name, inv_filter, report params)
+        #: -> (timestamp, table)
         self._table_cache: Dict[
-            Tuple[str, Optional[Tuple[Tuple[str, str], ...]]],
+            Tuple[
+                str,
+                Optional[Tuple[Tuple[str, str], ...]],
+                Optional[Tuple[Tuple[str, Any], ...]],
+            ],
             Tuple[float, Dict[str, Any]],
         ] = {}
         #: Timestamp of the most recent fabric state update or topology change.
@@ -470,8 +475,15 @@ class FabricStore:
         self,
         report: ReportSpec,
         inv_filter: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Render *report* across the (filtered) inventory from streamed state."""
+        """Render *report* across the (filtered) inventory from streamed state.
+
+        *params* are the report's own arguments, as declared by
+        :attr:`ReportSpec.params`. They only ever narrow what the getter makes
+        of the state already streamed, so they cost no gNMI and never change
+        which paths a node subscribes to.
+        """
         if self._stop.is_set():
             return {
                 "report": report.name,
@@ -489,7 +501,8 @@ class FabricStore:
         self.activate(report, names)
 
         inv_key = tuple(sorted(inv_filter.items())) if inv_filter else None
-        cache_key = (report.name, inv_key)
+        param_key = tuple(sorted((params or {}).items())) or None
+        cache_key = (report.name, inv_key, param_key)
         now = time.time()
         with self._lock:
             cached = self._table_cache.get(cache_key)
@@ -504,7 +517,9 @@ class FabricStore:
                     return cached_table
 
         started = time.time()
-        results = list(self._pool.map(lambda n: self._host_rows(report, n), names))
+        results = list(
+            self._pool.map(lambda n: self._host_rows(report, n, params), names)
+        )
 
         columns: List[str] = []
         rows: List[Dict[str, Any]] = []
@@ -542,8 +557,9 @@ class FabricStore:
             "oldest_update": _oldest_update(self._streams_for(names)),
         }
         with self._lock:
-            # The cache is keyed by inventory filter as well as report, and API
-            # clients pick the filter, so the key space has no natural bound.
+            # The cache is keyed by the inventory filter and the report's own
+            # parameters as well as its name, and an API client picks both, so
+            # the key space has no natural bound.
             if (
                 cache_key not in self._table_cache
                 and len(self._table_cache) >= _MAX_CACHED_TABLES
@@ -565,7 +581,10 @@ class FabricStore:
         return res_table
 
     def _host_rows(
-        self, report: ReportSpec, name: str
+        self,
+        report: ReportSpec,
+        name: str,
+        params: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, List[str], List[Dict[str, Any]], Optional[str], Set[str]]:
         with self._lock:
             stream = self._streams.get(name)
@@ -580,7 +599,7 @@ class FabricStore:
         host = self.nornir.inventory.hosts.get(name)
         node = (host.hostname if host and host.hostname else name) or name
         try:
-            result = report.getter(CachedDevice(stream))
+            result = report.getter(CachedDevice(stream), **(params or {}))
         except Exception as exc:  # noqa: BLE001 - reported per node in the UI
             logger.debug(
                 "%s: report '%s' failed: %s", name, report.name, exc, exc_info=exc

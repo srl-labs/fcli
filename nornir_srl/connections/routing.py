@@ -768,6 +768,12 @@ class RoutingMixin:
             paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
         )
         payload = first_payload(resp)
+        if lpm_address:
+            # Narrowing to the matched prefix rewrites the route lists in
+            # place, and what came back can be a payload a cache still holds
+            # on behalf of the renders that want the table in full - as it does
+            # on the server, where one report is rendered both ways at once.
+            payload = copy.deepcopy(payload)
         prefix_key = "ipv4-prefix" if afi == "ipv4-unicast" else "ipv6-prefix"
         for ni in as_list(payload.get("network-instance")):
             afi_table = ni.get("route-table", {}).get(afi) or {}

@@ -15,12 +15,19 @@ Getters are called as ``spec.getter(device, **params)``, where *params* are the
 arguments the surface collected (a CLI option, an MCP tool argument). Every
 parameter has a default, so a surface that has nothing to pass - the server -
 can always call ``spec.getter(device)``.
+
+An argument a *user* supplies, rather than one the surface chooses, is declared
+in :attr:`ReportSpec.params` as well: the CLI and MCP surfaces name their own
+options and tool arguments, but the browser has nothing to go on but the report
+registry, so a parameter it is meant to collect has to describe and validate
+itself.
 """
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
 
 CLI = "cli"
 MCP = "mcp"
@@ -58,6 +65,51 @@ class SubscriptionSpec:
 
 
 @dataclass(frozen=True)
+class ParamSpec:
+    """One argument a report takes from whoever is looking at it.
+
+    Enough for a surface to ask for it without knowing which report it belongs
+    to: what to call it, what a plausible value looks like, and what counts as
+    one.
+    """
+
+    #: The keyword the getter takes, and the query argument it arrives in.
+    name: str
+    label: str
+    placeholder: str = ""
+    help: str = ""
+    #: ``text``, or ``address`` for one that has to parse as an IP address.
+    kind: str = "text"
+
+    def as_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "label": self.label,
+            "placeholder": self.placeholder,
+            "help": self.help,
+            "kind": self.kind,
+        }
+
+    def coerce(self, value: Any) -> Optional[str]:
+        """*value* as the getter wants it, or ``None`` when it is not set.
+
+        Raises :class:`ValueError` with something worth showing to whoever
+        typed it.
+        """
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if self.kind == "address":
+            try:
+                return str(ipaddress.ip_address(text))
+            except ValueError:
+                raise ValueError(
+                    f"{self.label}: '{text}' is not an IP address"
+                ) from None
+        return text
+
+
+@dataclass(frozen=True)
 class ReportSpec:
     """One report, on every surface that offers it."""
 
@@ -80,6 +132,9 @@ class ReportSpec:
     subscribe: Tuple[SubscriptionSpec, ...] = ()
     #: False when the payload nests too deeply for a table to represent.
     tabular: bool = True
+    #: Arguments a user supplies, for the surfaces that can collect them.
+    #: Every one is optional, and a report renders in full without them.
+    params: Tuple[ParamSpec, ...] = ()
 
     @property
     def tool_name(self) -> str:
@@ -96,7 +151,23 @@ class ReportSpec:
             "description": self.description,
             "category": self.category,
             "sample_interval": self.sample_interval,
+            "params": [p.as_dict() for p in self.params],
         }
+
+
+def coerce_params(report: ReportSpec, raw: Mapping[str, Any]) -> Dict[str, Any]:
+    """The parameters *report* declares, out of a surface's raw input.
+
+    Anything it does not declare is ignored rather than handed on: the query
+    string of a live table also carries the refresh interval and the inventory
+    filter, which are the server's business and not the getter's.
+    """
+    params: Dict[str, Any] = {}
+    for spec in report.params:
+        value = spec.coerce(raw.get(spec.name, ""))
+        if value is not None:
+            params[spec.name] = value
+    return params
 
 
 def _bound_bgp_rib(
@@ -123,6 +194,22 @@ def _bgp_rib(
     if route_type is not None:
         kwargs["route_type"] = route_type
     return device.get_bgp_rib(**kwargs)
+
+
+def _lpm_param(example: str) -> ParamSpec:
+    """The address the RIB reports look up, as the CLI's ``-a`` does.
+
+    Left empty the report is the whole route table, which is what it is for.
+    Filled in, each route table keeps only the one prefix of it that the
+    address falls into - the route the node would actually forward on.
+    """
+    return ParamSpec(
+        name="address",
+        label="LPM",
+        placeholder=f"LPM lookup, e.g. {example}",
+        help="Longest prefix matching this address, per node and route table",
+        kind="address",
+    )
 
 
 #: Every service report reads the same two trees.
@@ -387,6 +474,7 @@ REPORTS: List[ReportSpec] = [
             afi="ipv4-unicast", lpm_address=address
         ),
         category="Routing",
+        params=(_lpm_param("10.0.0.1"),),
         subscribe=(
             SubscriptionSpec("/network-instance[name=*]/route-table/ipv4-unicast", datatype="state"),
         )
@@ -401,6 +489,7 @@ REPORTS: List[ReportSpec] = [
             afi="ipv6-unicast", lpm_address=address
         ),
         category="Routing",
+        params=(_lpm_param("2001:db8::1"),),
         subscribe=(
             SubscriptionSpec("/network-instance[name=*]/route-table/ipv6-unicast", datatype="state"),
         )

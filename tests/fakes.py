@@ -299,6 +299,86 @@ MAC_RESPONSE: List[Dict[str, Any]] = [
     }
 ]
 
+IPV4_RIB_PATH = "/network-instance[name=*]/route-table/ipv4-unicast"
+#: Three prefixes nested inside one another, so an address has a longest match
+#: to be found among them rather than just a match.
+IPV4_RIB_RESPONSE: List[Dict[str, Any]] = [
+    {
+        "network-instance": [
+            {
+                "name": "default",
+                "route-table": {
+                    "ipv4-unicast": {
+                        "route": [
+                            {
+                                "ipv4-prefix": "10.0.0.0/8",
+                                "route-type": "bgp",
+                                "active": True,
+                                "metric": 0,
+                                "preference": 170,
+                                "next-hop-group": 1,
+                            },
+                            {
+                                "ipv4-prefix": "10.1.0.0/16",
+                                "route-type": "bgp",
+                                "active": True,
+                                "metric": 0,
+                                "preference": 170,
+                                "next-hop-group": 1,
+                            },
+                            {
+                                "ipv4-prefix": "10.1.1.0/24",
+                                "route-type": "local",
+                                "active": True,
+                                "metric": 0,
+                                "preference": 0,
+                                "next-hop-group": 1,
+                            },
+                        ]
+                    }
+                },
+            }
+        ]
+    }
+]
+
+NHGROUP_PATH = "/network-instance[name=*]/route-table/next-hop-group[index=*]"
+NHGROUP_RESPONSE: List[Dict[str, Any]] = [
+    {
+        "network-instance": [
+            {
+                "name": "default",
+                "route-table": {
+                    "next-hop-group": [
+                        {"index": 1, "next-hop": [{"id": 0, "next-hop": 1}]}
+                    ]
+                },
+            }
+        ]
+    }
+]
+
+NH_PATH = "/network-instance[name=*]/route-table/next-hop[index=*]"
+NH_RESPONSE: List[Dict[str, Any]] = [
+    {
+        "network-instance": [
+            {
+                "name": "default",
+                "route-table": {
+                    "next-hop": [
+                        {
+                            "index": 1,
+                            "ip-address": "10.10.10.1",
+                            "type": "direct",
+                            "subinterface": "ethernet-1/1.0",
+                        }
+                    ]
+                },
+            }
+        ]
+    }
+]
+
 SYS_INFO_RESPONSES: Dict[str, List[Dict[str, Any]]] = {
     "/platform/chassis": [
         {

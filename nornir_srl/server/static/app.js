@@ -43,6 +43,7 @@
     liveLabel: el("live-label"),
     globalSearch: el("global-search"),
     invFilter: el("inv-filter"),
+    reportParams: el("report-params"),
     clearFiltersBtn: el("clear-filters-btn"),
     filterBadge: el("filter-badge"),
     refresh: el("refresh"),
@@ -127,6 +128,7 @@
     errors: [],
     hidden: new Set(),
     colFilters: new Map(),
+    reportParams: new Map(), // the selected report's own arguments, e.g. the RIB LPM address
     sort: { column: null, dir: 1 },
     windowSize: WINDOW_STEP,
     paused: false,
@@ -241,11 +243,67 @@
     }
   }
 
+  /* ---------------------------------------------------- report arguments */
+
+  // Beyond filtering rows, a report can take arguments of its own: the RIB
+  // reports look up an address and keep the longest prefix matching it, the
+  // way 'fcli ipv4-rib -a' does. The server applies them to the state it is
+  // already streaming, so a change reconnects the stream rather than
+  // re-rendering the rows in hand.
+  function renderReportParams() {
+    dom.reportParams.replaceChildren();
+    const specs = (state.report && state.report.params) || [];
+    dom.reportParams.hidden = !specs.length;
+    for (const spec of specs) {
+      const field = document.createElement("label");
+      field.className = "field";
+
+      const name = document.createElement("span");
+      name.className = "muted";
+      name.textContent = spec.label;
+
+      const input = document.createElement("input");
+      input.className = "input";
+      input.type = "search";
+      input.placeholder = spec.placeholder || "";
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      input.value = state.reportParams.get(spec.name) || "";
+      if (spec.help) input.title = spec.help;
+
+      input.addEventListener("change", () => {
+        const value = input.value.trim();
+        const valid = !value || paramIsValid(spec, value);
+        input.classList.toggle("is-invalid", !valid);
+        input.setAttribute("aria-invalid", valid ? "false" : "true");
+        if (!valid) return;
+        if (value) state.reportParams.set(spec.name, value);
+        else state.reportParams.delete(spec.name);
+        updateFilterUI();
+        connect();
+      });
+
+      field.append(name, input);
+      dom.reportParams.append(field);
+    }
+  }
+
+  // Enough to keep an obvious typo from being sent and answered with a stream
+  // that only ever errors. The server validates for real.
+  function paramIsValid(spec, value) {
+    if (spec.kind !== "address") return true;
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) {
+      return value.split(".").every((octet) => Number(octet) <= 255);
+    }
+    return value.includes(":") && /^[0-9a-f:.]+$/i.test(value);
+  }
+
   function updateFilterUI() {
     let count = 0;
     if (dom.globalSearch.value.trim()) count++;
     if (dom.invFilter.value.trim()) count++;
     count += state.colFilters.size;
+    count += state.reportParams.size;
     if (count > 0) {
       dom.clearFiltersBtn.hidden = false;
       dom.filterBadge.textContent = count;
@@ -259,6 +317,8 @@
     dom.globalSearch.value = "";
     dom.invFilter.value = "";
     state.colFilters.clear();
+    state.reportParams.clear();
+    renderReportParams();
     saveReportPreferences();
     updateFilterUI();
     renderHead();
@@ -1584,6 +1644,9 @@
     state.columns = [];
     state.rows = [];
     state.errors = [];
+    // Arguments belong to the report that declared them, and an LPM address
+    // carried into another report would silently empty it.
+    state.reportParams.clear();
     state.sort = { column: null, dir: 1 };
     state.previous.clear();
     state.identityColumn = null;
@@ -1612,6 +1675,7 @@
       applyPendingFilters();
     }
     updateFilterUI();
+    renderReportParams();
     renderReportList();
 
     if (isPanelReport(report.name)) {
@@ -1669,7 +1733,11 @@
       state.source = null;
     }
     if (!state.report || isPanelReport(state.report.name) || state.paused) return;
-    const params = new URLSearchParams({ refresh: dom.refresh.value });
+    const params = new URLSearchParams();
+    // The report's own arguments first: the two the server reads for itself
+    // are its to decide, whatever a report calls its parameters.
+    for (const [name, value] of state.reportParams) params.set(name, value);
+    params.set("refresh", dom.refresh.value);
     const inv = dom.invFilter.value.trim();
     if (inv) params.set("inv_filter", inv);
     const source = new EventSource(
