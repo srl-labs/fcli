@@ -3,6 +3,7 @@ import difflib
 import json
 import logging
 import re
+import time
 
 
 from pygnmi.client import gNMIclient
@@ -99,6 +100,17 @@ class SrLinux(
         # as permanently gone for far longer than it is actually down.
         if not any(name == "grpc.max_reconnect_backoff_ms" for name, _ in grpc_options):
             grpc_options.append(("grpc.max_reconnect_backoff_ms", 10_000))
+        # extras can carry credentials-adjacent settings, so only its keys.
+        logger.debug(
+            "%s: connecting as %s to gNMI port %s (platform=%s, extras=%s, grpc_options=%s)",
+            hostname,
+            username,
+            port,
+            platform,
+            sorted(extras),
+            grpc_options,
+        )
+        started = time.perf_counter()
         _connection = gNMIclient(
             target=target,
             username=username,
@@ -112,11 +124,22 @@ class SrLinux(
         self.connection = self
         self.hostname = hostname
         self.capabilities = self._connection.capabilities()
+        caps = self.capabilities if isinstance(self.capabilities, dict) else {}
+        logger.debug(
+            "%s: connected in %.3fs, gNMI %s, %d model(s), encodings %s",
+            hostname,
+            time.perf_counter() - started,
+            caps.get("gnmi_version", "?"),
+            len(caps.get("supported_models") or []),
+            sorted(set(caps.get("supported_encodings") or [])),
+        )
 
     def gnmi_get(self, **kw):
+        logger.debug("%s: raw Get %s", self.hostname, kw)
         return self._connection.get(**kw)
 
     def gnmi_set(self, **kw):
+        logger.debug("%s: raw Set %s", self.hostname, kw)
         return self._connection.set(**kw)
 
     def gnmi_subscribe(self, subscribe: Dict[str, Any]) -> GnmiSubscription:
@@ -128,12 +151,14 @@ class SrLinux(
         """
         if not self._connection:
             raise ConnectionException("no active connection")
+        logger.debug("%s: opening Subscribe RPC: %s", self.hostname, subscribe)
         return GnmiSubscription(
             self._connection, subscribe, name=self.hostname or "target"
         )
 
     def close(self) -> None:
         if getattr(self, "_connection", None) is not None:
+            logger.debug("%s: closing the gNMI connection", self.hostname)
             try:
                 self._connection.close()
             except Exception as exc:  # noqa: BLE001 - best effort teardown
@@ -151,10 +176,32 @@ class SrLinux(
     ) -> List[Dict[str, Any]]:
         if self._connection:
             clean_paths = [p.replace("[name=*]", "") if "[name=*]" in p else p for p in paths]
-            resp = normalize_gnmi_resp(
-                self._connection.get(
-                    path=clean_paths, datatype=datatype, encoding="json_ietf"  # type: ignore
+            logger.debug(
+                "%s: Get %s (datatype=%s)", self.hostname, clean_paths, datatype
+            )
+            started = time.perf_counter()
+            try:
+                resp = normalize_gnmi_resp(
+                    self._connection.get(
+                        path=clean_paths, datatype=datatype, encoding="json_ietf"  # type: ignore
+                    )
                 )
+            except Exception as exc:
+                logger.debug(
+                    "%s: Get %s failed after %.3fs: %s: %s",
+                    self.hostname,
+                    clean_paths,
+                    time.perf_counter() - started,
+                    type(exc).__name__,
+                    exc,
+                )
+                raise
+            logger.debug(
+                "%s: Get %s answered %d notification(s) in %.3fs",
+                self.hostname,
+                clean_paths,
+                len(resp),
+                time.perf_counter() - started,
             )
         else:
             raise ConnectionException("no active connection")
@@ -175,6 +222,13 @@ class SrLinux(
         for r in input:
             r_list += r.keys()
         #        r_list = [ list(r.keys())[0] for r in input ]
+        logger.debug(
+            "%s: %s%s on %s",
+            self.hostname,
+            "dry-run " if dry_run else "",
+            op,
+            r_list,
+        )
         device_cfg_before = self.get(paths=r_list, datatype="config")
 
         if not dry_run:

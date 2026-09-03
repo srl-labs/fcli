@@ -94,6 +94,10 @@ class FabricStore:
                     break
         connected = len(self._streams)
         logger.info("connected to %d/%d node(s)", connected, len(hosts))
+        with self._lock:
+            unreachable = sorted(self._connect_errors)
+        if unreachable:
+            logger.debug("not connected: %s", ", ".join(unreachable))
         if self.resync_interval > 0:
             self._resync_thread = threading.Thread(
                 target=self._resync_loop, name="fcli-resync", daemon=True
@@ -107,10 +111,12 @@ class FabricStore:
             return
         with self._lock:
             self._connect_attempts[name] = time.time()
+        logger.debug("%s: opening a gNMI connection", name)
         try:
             device = host.get_connection(CONNECTION_NAME, self.nornir.config)
         except Exception as exc:  # noqa: BLE001 - reported per node in the UI
             logger.warning("%s: connection failed: %s", name, exc)
+            logger.debug("%s: connection failed", name, exc_info=exc)
             with self._lock:
                 self._connect_errors[name] = str(exc)
                 self._last_state_change = time.time()
@@ -132,6 +138,11 @@ class FabricStore:
                     on_update=self._on_host_update,
                 )
                 self._last_state_change = time.time()
+                logger.debug(
+                    "%s: connected, streaming at a %ds sample interval",
+                    name,
+                    self.sample_interval or 15,
+                )
         if stopping:
             try:
                 host.close_connection(CONNECTION_NAME)
@@ -181,6 +192,8 @@ class FabricStore:
                 # once rather than once each.
                 self._connect_attempts[name] = now
                 due.append(name)
+        if due:
+            logger.debug("queued for reconnect: %s", ", ".join(due))
         for name in due:
             host = self.nornir.inventory.hosts.get(name)
             if host is not None:
@@ -393,18 +406,37 @@ class FabricStore:
                 # The reason is often temporary though - the node was rebooting
                 # - so the verdict expires instead of standing for good.
                 if time.time() - failed[0] < self.connect_retry_interval:
+                    logger.debug(
+                        "%s: skipping report '%s', it failed %.0fs ago: %s",
+                        name,
+                        report.name,
+                        time.time() - failed[0],
+                        failed[1],
+                    )
                     return
                 del self._activation_errors[key]
             specs = self._specs.get(key)
         try:
             if specs is None:
+                started = time.perf_counter()
                 specs = self._discover(report, stream)
+                logger.debug(
+                    "%s: report '%s' needs %d path(s), discovered in %.3fs: %s",
+                    name,
+                    report.name,
+                    len(specs),
+                    time.perf_counter() - started,
+                    ", ".join(s.path for s in specs) or "none",
+                )
                 with self._lock:
                     self._specs[key] = specs
             stream.ensure_paths(specs)
         except Exception as exc:  # noqa: BLE001 - reported per node in the UI
             logger.warning(
                 "%s: activating report '%s' failed: %s", name, report.name, exc
+            )
+            logger.debug(
+                "%s: activating report '%s' failed", name, report.name, exc_info=exc
             )
             with self._lock:
                 self._activation_errors[key] = (time.time(), str(exc))
@@ -463,6 +495,11 @@ class FabricStore:
             if cached is not None:
                 cached_at, cached_table = cached
                 if (cached_at >= self._last_state_change or (now - cached_at < 0.5)) and not cached_table.get("errors"):
+                    logger.debug(
+                        "report '%s': serving the table cached %.2fs ago",
+                        report.name,
+                        now - cached_at,
+                    )
                     return cached_table
 
         started = time.time()
@@ -513,6 +550,17 @@ class FabricStore:
                 oldest = min(self._table_cache, key=lambda k: self._table_cache[k][0])
                 del self._table_cache[oldest]
             self._table_cache[cache_key] = (started, res_table)
+        logger.debug(
+            "report '%s': rendered %d row(s) over %d column(s) from %d node(s) "
+            "in %.1fms, %d node(s) in error%s",
+            report.name,
+            len(clean_rows),
+            len(all_columns),
+            len(names),
+            res_table["render_ms"],
+            len(errors),
+            f" ({', '.join(e['node'] for e in errors)})" if errors else "",
+        )
         return res_table
 
     def _host_rows(
@@ -533,7 +581,9 @@ class FabricStore:
         try:
             result = report.getter(CachedDevice(stream))
         except Exception as exc:  # noqa: BLE001 - reported per node in the UI
-            logger.debug("%s: report '%s' failed: %s", name, report.name, exc)
+            logger.debug(
+                "%s: report '%s' failed: %s", name, report.name, exc, exc_info=exc
+            )
             return name, [], [], str(exc), set()
         items = (result or {}).get(report.resource) or []
         columns, rows = flatten(node, items)

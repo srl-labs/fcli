@@ -25,6 +25,8 @@ Inventory comes from a [containerlab](https://containerlab.dev/) topology file o
   - [gNMI sessions](#gnmi-sessions)
   - [HTTP API](#http-api)
 - [CLI reports](#cli-reports)
+  - [Examples](#examples)
+  - [Debug logging](#debug-logging)
 - [MCP server](#mcp-server)
 - [Reports](#reports)
 - [Tested SR Linux releases](#tested-sr-linux-releases)
@@ -344,6 +346,9 @@ Options:
   --cert-file PATH       CLAB certificate file
   -p, --gnmi-port        gNMI port [default: 57400]
   -o, --output           table | json | yaml | csv [default: table]
+  -l, --log-level        DEBUG | INFO | WARNING | ERROR | CRITICAL
+                         [default: ERROR]
+  -f, --log-file PATH    also write the log to this file
   --version              Show the version and exit.
   --help                 Show this message and exit.
 
@@ -432,6 +437,26 @@ Tunnel table with resolved egress interface, next-hop and pushed MPLS label-stac
 ```
 fcli tunnel-table -f type=ldp
 ```
+
+### Debug logging
+
+`-l DEBUG` traces what fcli does on the wire and why a report came out the way it
+did: the inventory it resolved and the filter it applied, every gNMI `Get` with
+its paths and round-trip time, the paths each report discovers, the `Subscribe`
+RPCs the server opens and the notifications they carry, cache hits, reconnects,
+and a traceback for every node that failed. Each line names the thread and call
+site, so the per-node threads stay readable when they interleave.
+
+```
+fcli -l DEBUG -f /tmp/fcli.log bgp-peers
+```
+
+It is deliberately chatty - on the live server, expect a line per notification
+per node - so `-f/--log-file` is usually easier to read than the terminal. The
+log goes to stderr, which leaves `-o json|csv` on stdout pipeable while a trace
+is running. Dependencies (gRPC, HTTP, the LLM clients) stay at INFO so their
+frame-level logs do not bury fcli's own; set `FCLI_DEBUG_ALL=1` to let those
+through as well.
 
 ## MCP server
 

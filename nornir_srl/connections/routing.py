@@ -11,6 +11,8 @@ import jmespath
 
 from .helpers import as_list, first_payload, lpm, model_version, version_bucket
 
+logger = logging.getLogger(__name__)
+
 # CLI / API aliases (e.g. ``-r l3vpn-v4``) → YANG ``afi-safi-name`` used in paths.
 BGP_RIB_ROUTE_FAM_ALIASES: Dict[str, str] = {
     "l3vpn-v4": "l3vpn-ipv4-unicast",
@@ -493,6 +495,12 @@ class RoutingMixin:
                 except BaseException as e:
                     # Leaves / platforms without IP-VPN have no l3vpn-* RIB path; skip instead of failing.
                     if _gnmi_path_missing(e):
+                        logger.debug(
+                            "%s: no %s RIB on this node, reporting it empty: %s",
+                            getattr(self, "hostname", "?"),
+                            route_fam,
+                            e,
+                        )
                         return {"bgp_rib": []}
                     raise
         else:
