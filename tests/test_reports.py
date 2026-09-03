@@ -591,7 +591,7 @@ def test_get_bridge_domains():
     assert bd["Oper State"] == "up"
     assert bd["Subnets"] == "10.1.100.0/24"
     assert bd["IRB Interface"] == "irb1.100 [up]: 10.1.100.1/24 (anycast-gw: true) -> ip-vrf-1"
-    assert bd["Sub-Interfaces"] == "ethernet-1/1.100 [up] (VLAN: 100), ethernet-1/2.100 [up] (VLAN: 100)"
+    assert bd["Sub-Interfaces"] == "ethernet-1/1.100 [up] (VLAN: 100); ethernet-1/2.100 [up] (VLAN: 100)"
     assert bd["VXLAN Interface"] == "vxlan1.100"
     assert bd["Gateway"] == ""
     assert bd["BGP Instance"] == ""
@@ -861,7 +861,7 @@ def test_get_bridge_domains_does_not_degrade_a_service_for_a_standby_segment():
 
     assert bd["Oper State"] == "up"
     assert bd["Sub-Interfaces"] == (
-        "lag1.101 [up] (VLAN: 101), lag2.101 [down/standby] (VLAN: 101)"
+        "lag1.101 [up] (VLAN: 101); lag2.101 [down/standby] (VLAN: 101)"
     )
 
 
@@ -937,8 +937,180 @@ def test_get_bridge_domains_still_degrades_a_service_for_a_real_fault():
     assert bd["Oper State"] == "degraded"
     # The reason shown is the port's, not the two that only point at it.
     assert bd["Sub-Interfaces"] == (
-        "lag1.101 [up] (VLAN: 101), lag2.101 [down: min-links-not-met] (VLAN: 101)"
+        "lag1.101 [up] (VLAN: 101); lag2.101 [down: min-links-not-met] (VLAN: 101)"
     )
+
+
+class _RecordingLayer2:
+    """A Layer2 device that answers by path fragment and remembers what was asked."""
+
+    def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+        self._responses = responses
+        self.requested: List[str] = []
+
+    def get(
+        self,
+        paths: List[str],
+        datatype: Optional[str] = "config",
+        strip_mod: Optional[bool] = True,
+    ) -> List[Dict[str, Any]]:
+        path = paths[0]
+        self.requested.append(path)
+        for key, resp in self._responses.items():
+            if key in path:
+                return resp
+        raise KeyError(f"no scripted response for path {path}")
+
+
+def _es_payload() -> List[Dict[str, Any]]:
+    """One segment on lag1, associated with two mac-vrfs that elect different DFs."""
+
+    def _candidates(*peers: Any) -> Dict[str, Any]:
+        return {
+            "bgp-instance": [
+                {
+                    "computed-designated-forwarder-candidates": {
+                        "designated-forwarder-candidate": [
+                            {"address": address, "designated-forwarder": is_df}
+                            for address, is_df in peers
+                        ]
+                    }
+                }
+            ]
+        }
+
+    return [
+        {
+            "system/network-instance/protocols/evpn/ethernet-segments": {
+                "bgp-instance": [
+                    {
+                        "id": 1,
+                        "ethernet-segment": [
+                            {
+                                "name": "ES-01",
+                                "esi": "00:01:01:00:00:00:66:00:01:01",
+                                "multi-homing-mode": "single-active",
+                                "oper-state": "up",
+                                "interface": [{"ethernet-interface": "lag1"}],
+                                "association": {
+                                    "network-instance": [
+                                        {
+                                            "name": "macvrf-101",
+                                            **_candidates(
+                                                ("10.0.0.1", False), ("10.0.0.2", True)
+                                            ),
+                                        },
+                                        {
+                                            "name": "macvrf-202",
+                                            **_candidates(
+                                                ("10.0.0.1", True), ("10.0.0.2", False)
+                                            ),
+                                        },
+                                    ]
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    ]
+
+
+def test_get_bridge_domains_names_the_segment_each_member_hangs_off():
+    """Each member carries its own segment, and its own DF election.
+
+    The segment goes on the member's line rather than in a list of its own,
+    because a bridge domain with several multi-homed members leaves the reader
+    pairing up two lists. The peers are the ones elected for this mac-vrf: the
+    DF is chosen per service, so the candidates of the other services on the
+    same segment would say the wrong thing about this one.
+    """
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(_RecordingLayer2, Layer2Mixin):
+        pass
+
+    network_instances = [
+        {
+            "network-instance": [
+                {
+                    "name": "macvrf-101",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [
+                        {"name": "lag1.101", "oper-state": "up"},
+                        {"name": "ethernet-1/3.101", "oper-state": "up"},
+                    ],
+                }
+            ]
+        }
+    ]
+    subinterfaces = [
+        {
+            "interface": [
+                {"name": "lag1", "subinterface": [{"index": 101, "oper-state": "up"}]},
+                {
+                    "name": "ethernet-1/3",
+                    "subinterface": [{"index": 101, "oper-state": "up"}],
+                },
+            ]
+        }
+    ]
+
+    dev = _FakeLayer2(
+        {
+            # Before 'network-instance', which is a fragment of the ES path too.
+            "ethernet-segments": _es_payload(),
+            "network-instance": network_instances,
+            "subinterface": subinterfaces,
+        }
+    )
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+
+    # The single-homed member is left as it was; the ESI loses its longest run
+    # of padding, the way an IPv6 address loses one to '::'.
+    assert bd["Sub-Interfaces"] == (
+        "lag1.101 [up] (VLAN: 101) -> ES: ID: 00:01:01:..:66:00:01:01, ES-01, "
+        "mode: single-active, oper: up, peers: 10.0.0.1 10.0.0.2(DF)"
+        "; ethernet-1/3.101 [up] (VLAN: 101)"
+    )
+
+
+def test_get_bridge_domains_does_not_ask_about_segments_without_access_members():
+    """A bridge domain of nothing but an IRB has no port to be multi-homed on."""
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(_RecordingLayer2, Layer2Mixin):
+        pass
+
+    network_instances = [
+        {
+            "network-instance": [
+                {
+                    "name": "macvrf-101",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [{"name": "irb0.101", "oper-state": "up"}],
+                }
+            ]
+        }
+    ]
+    subinterfaces = [
+        {"interface": [{"name": "irb0", "subinterface": [{"index": 101, "oper-state": "up"}]}]}
+    ]
+
+    dev = _FakeLayer2(
+        {
+            "ethernet-segments": _es_payload(),
+            "network-instance": network_instances,
+            "subinterface": subinterfaces,
+        }
+    )
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+
+    assert bd["Sub-Interfaces"] == "-"
+    assert not [p for p in dev.requested if "ethernet-segments" in p]
 
 
 def test_get_routers():

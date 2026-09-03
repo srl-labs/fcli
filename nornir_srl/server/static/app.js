@@ -2456,7 +2456,8 @@
             details.append(irbRowDiv);
           }
 
-          // 2. bridge sub-interfaces
+          // 2. bridge sub-interfaces, each with the ethernet-segment its
+          //    parent port sits on
           const subitfStr = row["Sub-Interfaces"] || "-";
           if (subitfStr !== "-") {
             const subRowDiv = document.createElement("div");
@@ -2467,16 +2468,40 @@
             label.textContent = "bridge sub-interfaces:";
             subRowDiv.append(label);
 
-            const pillGroup = document.createElement("div");
-            pillGroup.className = "pill-group";
-            subitfStr.split(",").forEach((s) => {
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
+            // A line each, so a member and its segment stay side by side:
+            // pairing them up across two lists is what made a bridge domain
+            // with several multi-homed members unreadable.
+            subitfStr.split(";").forEach((entry) => {
+              const [itfText, ...esText] = entry.split("->");
+
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
               const p = document.createElement("span");
               p.className = "pill";
-              applyPillState(p, s);
-              p.textContent = s.trim();
-              pillGroup.append(p);
+              applyPillState(p, itfText);
+              p.textContent = itfText.trim();
+              line.append(p);
+
+              const es = esText.join("->").trim();
+              if (es) {
+                const arrow = document.createElement("span");
+                arrow.className = "pill-arrow";
+                arrow.textContent = "→";
+
+                const esPill = document.createElement("span");
+                esPill.className = "pill pill-es";
+                const oper = /\boper:\s*(\S+)/.exec(es);
+                const kind = oper ? stateKind(oper[1]) : "";
+                if (kind && kind !== "up") esPill.classList.add(`pill-${kind}`);
+                esPill.textContent = es;
+                line.append(arrow, esPill);
+              }
+              lines.append(line);
             });
-            subRowDiv.append(pillGroup);
+            subRowDiv.append(lines);
             details.append(subRowDiv);
           }
 

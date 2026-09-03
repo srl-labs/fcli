@@ -132,6 +132,13 @@ _SERVICE_SUBSCRIPTIONS: Tuple[SubscriptionSpec, ...] = (
     # A member reported 'port-down' is explained by its parent port, and that
     # is what says whether a standby ethernet-segment or a fault put it there.
     SubscriptionSpec("/interface[name=*]/oper-down-reason", sample_interval=20),
+    # The segment a multi-homed service's members hang off, whose mode and DF
+    # say which leaf forwards for it.
+    SubscriptionSpec(
+        "/system/network-instance/protocols/evpn/ethernet-segments",
+        datatype="all",
+        sample_interval=20,
+    ),
     SubscriptionSpec(
         "/network-instance[name=default]/route-table/ipv4-unicast/route/ipv4-prefix",
         datatype="state",
@@ -448,7 +455,7 @@ REPORTS: List[ReportSpec] = [
         resource="bridge_domains",
         title="Bridge Domains",
         description="EVPN Bridge Domains (MAC-VRF) grouped by Route-Target with bound "
-        "access sub-interfaces and VXLAN overlays.",
+        "access sub-interfaces, their ethernet-segments and VXLAN overlays.",
         getter=lambda d: d.get_bridge_domains(),
         category="Services",
         surfaces=STREAMING,

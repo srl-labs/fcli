@@ -4,7 +4,7 @@ import ipaddress
 from typing import Any, Dict, List, Optional, Tuple
 import jmespath
 
-from .down_reason import STANDBY_STATE, ParentReasons
+from .down_reason import STANDBY_STATE, ParentReasons, parent_interface
 from .down_reason import clean_leaf as _clean_state
 from .helpers import as_list, first_payload
 from .routing import _gnmi_path_missing, _suppress_pygnmi_client_logging
@@ -109,6 +109,135 @@ def _service_oper_state(ni_oper: str, member_states: List[str]) -> str:
     if all(state in _MEMBER_DOWN_STATES for state in counted):
         return "down"
     return "degraded"
+
+
+#: Where a node's ethernet-segments live. Read by the ES report, and by the
+#: bridge-domain report for the segment a member's port sits on.
+_ES_PATH = "/system/network-instance/protocols/evpn/ethernet-segments"
+_ES_ENVELOPE = _ES_PATH.lstrip("/")
+
+
+def _df_peers(vrf: Dict[str, Any]) -> str:
+    """The designated-forwarder candidates of one network-instance on a segment.
+
+    The elected one is marked, because on a single-active segment it is the
+    answer to why the other leaf is holding its port in standby.
+    """
+    # Only the first bgp-instance elects a DF for the segment.
+    instances = as_list(vrf.get("bgp-instance"))
+    candidates = (instances[0] if instances else {}).get(
+        "computed-designated-forwarder-candidates", {}
+    )
+    return " ".join(
+        (
+            f"{peer.get('address')}(DF)"
+            if peer.get("designated-forwarder")
+            else str(peer.get("address"))
+        )
+        for peer in as_list(candidates.get("designated-forwarder-candidate"))
+    )
+
+
+def _compress_esi(esi: Any) -> str:
+    """An ESI with its longest run of zero bytes written as ``..``.
+
+    A 10-byte ESI is mostly padding: ``00:01:00:00:00:00:00:00:00:03`` says
+    nothing that ``00:01:..:03`` does not, and at full width it crowds out
+    everything else on the line.
+    """
+    text = str(esi or "")
+    parts = text.split(":")
+    runs: List[Tuple[int, int]] = []
+    index = 0
+    while index < len(parts):
+        if parts[index] != "00":
+            index += 1
+            continue
+        end = index
+        while end < len(parts) and parts[end] == "00":
+            end += 1
+        runs.append((index, end - index))
+        index = end
+    if not runs:
+        return text
+    # The longest run, and the leftmost of them if several tie - the same rule
+    # that decides where '::' goes in an IPv6 address.
+    start, length = max(runs, key=lambda run: run[1])
+    if length < 2:
+        return text
+    return ":".join(parts[:start] + [".."] + parts[start + length :])
+
+
+class _EthernetSegments:
+    """A node's ethernet-segments, indexed by the port each one is on.
+
+    Read on first use. A node with no bridge domains never asks, so a spine
+    does not spend a Get on a tree it has nothing in.
+    """
+
+    def __init__(self, get: Any) -> None:
+        self._get = get
+        self._by_port: Optional[Dict[str, Dict[str, Any]]] = None
+
+    def _load(self) -> Dict[str, Dict[str, Any]]:
+        by_port: Dict[str, Dict[str, Any]] = {}
+        with _suppress_pygnmi_client_logging():
+            try:
+                resp = self._get(paths=[_ES_PATH], datatype="all")
+            except BaseException as e:
+                if _gnmi_path_missing(e):
+                    return by_port
+                raise
+        segments = first_payload(resp).get(_ES_ENVELOPE) or {}
+        for instance in as_list(segments.get("bgp-instance")):
+            for es in as_list(instance.get("ethernet-segment")):
+                if not isinstance(es, dict):
+                    continue
+                association = es.get("association") or {}
+                segment = {
+                    "name": str(es.get("name") or ""),
+                    "esi": str(es.get("esi") or ""),
+                    "mh-mode": _clean_state(es.get("multi-homing-mode")),
+                    "oper": _clean_state(es.get("oper-state")),
+                    # The DF election runs per network-instance, so a bridge
+                    # domain only ever wants the candidates of its own.
+                    "peers": {
+                        str(vrf.get("name") or ""): _df_peers(vrf)
+                        for vrf in as_list(association.get("network-instance"))
+                        if isinstance(vrf, dict)
+                    },
+                }
+                for itf in as_list(es.get("interface")):
+                    port = itf.get("ethernet-interface") if isinstance(itf, dict) else None
+                    if port:
+                        by_port[str(port)] = segment
+        return by_port
+
+    def of(self, port: str) -> Optional[Dict[str, Any]]:
+        """The segment configured on *port*, if there is one."""
+        if self._by_port is None:
+            self._by_port = self._load()
+        return self._by_port.get(str(port))
+
+
+def _es_label(segment: Dict[str, Any], ni_name: str) -> str:
+    """One ethernet-segment as a bridge domain shows it.
+
+    The peers are those of the bridge domain's own network-instance: the DF is
+    elected per service, and the candidates of the other services on the same
+    segment say nothing about this one.
+    """
+    fields = [f"ID: {_compress_esi(segment.get('esi'))}"]
+    if segment.get("name"):
+        fields.append(str(segment["name"]))
+    if segment.get("mh-mode"):
+        fields.append(f"mode: {segment['mh-mode']}")
+    if segment.get("oper"):
+        fields.append(f"oper: {segment['oper']}")
+    peers = (segment.get("peers") or {}).get(ni_name, "")
+    if peers:
+        fields.append(f"peers: {peers}")
+    return ", ".join(fields)
 
 
 def _host_address(pfx: str) -> str:
@@ -557,15 +686,13 @@ class Layer2Mixin:
 
     def get_es(self) -> Dict[str, Any]:
         path_spec = {
-            "path": "/system/network-instance/protocols/evpn/ethernet-segments",
+            "path": _ES_PATH,
             "jmespath": '"system/network-instance/protocols/evpn/ethernet-segments"."bgp-instance"[]."ethernet-segment"[].{name:name, esi:esi, type:type, "mh-mode":"multi-homing-mode", oper:"oper-state", "itf/nh":"_itf_or_nh", "ni-peers":association."network-instance"[]."_ni_peers"|join(\', \',@) }',
             "datatype": "all",
         }
 
         def set_es_fields(resp: List[Dict[str, Any]]) -> None:
-            segments = first_payload(resp).get(
-                "system/network-instance/protocols/evpn/ethernet-segments", {}
-            )
+            segments = first_payload(resp).get(_ES_ENVELOPE, {})
             for bgp_inst in as_list(segments.get("bgp-instance")):
                 for es in as_list(bgp_inst.get("ethernet-segment")):
                     # compute interface or next-hop display field
@@ -584,22 +711,7 @@ class Layer2Mixin:
                     if "network-instance" not in es["association"]:
                         es["association"]["network-instance"] = []
                     for vrf in es["association"]["network-instance"]:
-                        # Only the first bgp-instance elects a DF for the segment.
-                        instances = as_list(vrf.get("bgp-instance"))
-                        candidates = (instances[0] if instances else {}).get(
-                            "computed-designated-forwarder-candidates", {}
-                        )
-                        es_peers = as_list(
-                            candidates.get("designated-forwarder-candidate")
-                        )
-                        vrf["_peers"] = " ".join(
-                            (
-                                f"{peer.get('address')}(DF)"
-                                if peer.get("designated-forwarder")
-                                else str(peer.get("address"))
-                            )
-                            for peer in es_peers
-                        )
+                        vrf["_peers"] = _df_peers(vrf)
                         vrf["_ni_peers"] = f"{vrf['name']}:[{vrf['_peers']}]"
 
         if not self._has_feature("evpn"):
@@ -848,6 +960,10 @@ class Layer2Mixin:
         # port; the parent's own reason is what does, and what tells a standby
         # ethernet-segment apart from a broken link.
         parents = ParentReasons(self.get)
+        # A multi-homed bridge domain is only half a story without the segment
+        # its members hang off: the mode and the DF decide which of the leaves
+        # forwards for it, and which one stands by.
+        segments = _EthernetSegments(self.get)
 
         # Build mapping of irb_subinterface -> associated ip-vrf / L3 network instances
         irb_to_ip_vrf: Dict[str, List[str]] = {}
@@ -966,7 +1082,14 @@ class Layer2Mixin:
                     else:
                         vlan_info = _extract_vlan_encap(name, i)
                         label = _subinterface_state_label(name, i, details, parents)
-                        bridge_subitfs.append(f"{name} [{label}] (VLAN: {vlan_info})")
+                        entry = f"{name} [{label}] (VLAN: {vlan_info})"
+                        # On the member's own entry rather than in a list of its
+                        # own: a bridge domain with several multi-homed members
+                        # is unreadable if the reader has to pair them up.
+                        es = segments.of(parent_interface(name))
+                        if es:
+                            entry += f" -> ES: {_es_label(es, ni_name)}"
+                        bridge_subitfs.append(entry)
 
             vxlan_itfs = [
                 v.get("name", "")
@@ -986,7 +1109,9 @@ class Layer2Mixin:
                         "Route Targets": rt_display,
                         "Subnets": ", ".join(all_subnets) if all_subnets else "",
                         "IRB Interface": ", ".join(irb_subitfs) if irb_subitfs else "-",
-                        "Sub-Interfaces": ", ".join(bridge_subitfs) if bridge_subitfs else "-",
+                        # Semicolons: an entry carrying a segment has commas of
+                        # its own.
+                        "Sub-Interfaces": "; ".join(bridge_subitfs) or "-",
                         "VXLAN Interface": ", ".join(vxlan_itfs) if vxlan_itfs else "-",
                         "Gateway": "Y" if group["gateway"] else "",
                         "BGP Instance": group["id"] if group["gateway"] else "",

@@ -1095,6 +1095,16 @@ th.filtered::after {
   align-items: center;
 }
 
+/* One pill-group per line, for entries that belong together: a bridge
+   sub-interface and the ethernet-segment its port sits on. */
+.pill-lines {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}
+
 .pill {
   background: var(--bg);
   color: var(--text);
@@ -1109,6 +1119,12 @@ th.filtered::after {
   background: rgba(56, 189, 248, 0.15);
   color: #38bdf8;
   border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+.pill-es {
+  background: rgba(167, 139, 250, 0.15);
+  color: #a78bfa;
+  border: 1px solid rgba(167, 139, 250, 0.3);
 }
 
 .pill-macvrf {

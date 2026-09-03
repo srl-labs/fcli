@@ -521,7 +521,7 @@ One registry drives all three surfaces, so a report cannot drift between CLI, MC
 | Tunnel Table | `tunnel-table` | yes | VXLAN, LDP, SR-ISIS, RSVP, … |
 | Routing Policies | `routing-pol` | | Nested policy JSON (`-o json\|yaml` only) |
 | Services | | yes | MAC-VRF and IP-VRF grouped by route-target |
-| Bridge Domains | | yes | MAC-VRFs with access ports and VXLAN overlays |
+| Bridge Domains | | yes | MAC-VRFs with access ports, ethernet-segments and VXLAN overlays |
 | Routers | | yes | IP-VRFs with bound MAC-VRFs and overlays |
 | MAC Table | `mac` | yes | Bridge-table MAC entries |
 | IRB Interfaces | `irb` | yes | IRB sub-interfaces and anycast gateways |
