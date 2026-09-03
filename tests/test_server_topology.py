@@ -509,6 +509,35 @@ def test_a_link_whose_port_state_is_unknown_is_not_called_up():
     assert _link(graph, "leaf1", "spine1")["state"] == "unknown"
 
 
+def test_a_cable_held_down_by_an_ethernet_segment_is_standby_not_down():
+    """Red on a standby port reads as a broken fabric; it is intent."""
+    graph = build_topology(
+        [
+            _facts(
+                "leaf1",
+                host_name="leaf1",
+                cables=(
+                    ("ethernet-1/1", "spine1", "ethernet-1/1"),
+                    ("ethernet-1/2", "spine2", "ethernet-1/1"),
+                ),
+                instances=LEAF_SERVICES,
+                interfaces=(
+                    {"name": "ethernet-1/1", "oper-state": "up"},
+                    {
+                        "name": "ethernet-1/2",
+                        "oper-state": "down",
+                        "oper-down-reason": "standby-signaling",
+                    },
+                ),
+            ),
+            _facts("spine1", host_name="spine1", instances=NO_SERVICES),
+            _facts("spine2", host_name="spine2", instances=NO_SERVICES),
+        ]
+    )
+    assert _link(graph, "leaf1", "spine1")["state"] == "up"
+    assert _link(graph, "leaf1", "spine2")["state"] == "down/standby"
+
+
 def test_a_link_carries_the_egress_of_each_end():
     graph = build_topology(
         [

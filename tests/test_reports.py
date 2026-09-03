@@ -70,6 +70,8 @@ class _FakeInterfaces(NetworkInstanceMixin):
 
     def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
         self._responses = responses
+        #: Every path asked for, so a test can assert one was *not* needed.
+        self.requested: List[str] = []
 
     def get(
         self,
@@ -78,6 +80,7 @@ class _FakeInterfaces(NetworkInstanceMixin):
         strip_mod: Optional[bool] = True,
     ) -> List[Dict[str, Any]]:
         path = paths[0]
+        self.requested.append(path)
         for key, resp in self._responses.items():
             if key in path:
                 return resp
@@ -772,6 +775,170 @@ def test_get_bridge_domains_reports_a_disabled_mac_vrf_from_its_own_view():
         == "irb0.0 [down: net-inst-down]: 172.16.20.254/24 (anycast-gw: true)"
     )
     assert bd["Sub-Interfaces"] == "ethernet-1/3.20 [down: net-inst-down] (VLAN: 20)"
+
+
+def test_get_bridge_domains_does_not_degrade_a_service_for_a_standby_segment():
+    """A standby ethernet-segment member is intent, so the service stays up.
+
+    This is the shape a live all-active-standby fabric produces: the mac-vrf
+    blames the member (``subif-down``), the member blames its port
+    (``port-down``), and only the port says what is really going on. Counting
+    that as down left every multi-homed service permanently degraded on
+    whichever leaf was not forwarding.
+    """
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    network_instances = [
+        {
+            "network-instance": [
+                {
+                    "name": "macvrf-101",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [
+                        {"name": "irb0.101", "oper-state": "up"},
+                        {"name": "lag1.101", "oper-state": "up"},
+                        {
+                            "name": "lag2.101",
+                            "oper-state": "down",
+                            "oper-down-reason": "subif-down",
+                        },
+                    ],
+                }
+            ]
+        }
+    ]
+    subinterfaces = [
+        {
+            "interface": [
+                {"name": "irb0", "subinterface": [{"index": 101, "oper-state": "up"}]},
+                {"name": "lag1", "subinterface": [{"index": 101, "oper-state": "up"}]},
+                {
+                    "name": "lag2",
+                    "subinterface": [
+                        {
+                            "index": 101,
+                            "oper-state": "down",
+                            "oper-down-reason": "port-down",
+                        }
+                    ],
+                },
+            ]
+        }
+    ]
+    parent_reasons = [
+        {
+            "interface": [
+                {"name": "lag2", "oper-down-reason": "standby-signaling"},
+            ]
+        }
+    ]
+
+    dev = _FakeLayer2(
+        {
+            "network-instance": network_instances,
+            "subinterface": subinterfaces,
+            "oper-down-reason": parent_reasons,
+        }
+    )
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+
+    assert bd["Oper State"] == "up"
+    assert bd["Sub-Interfaces"] == (
+        "lag1.101 [up] (VLAN: 101), lag2.101 [down/standby] (VLAN: 101)"
+    )
+
+
+def test_get_bridge_domains_still_degrades_a_service_for_a_real_fault():
+    """The same shape, but the port is down for a reason nobody asked for."""
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    network_instances = [
+        {
+            "network-instance": [
+                {
+                    "name": "macvrf-101",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [
+                        {"name": "lag1.101", "oper-state": "up"},
+                        {
+                            "name": "lag2.101",
+                            "oper-state": "down",
+                            "oper-down-reason": "subif-down",
+                        },
+                    ],
+                }
+            ]
+        }
+    ]
+    subinterfaces = [
+        {
+            "interface": [
+                {"name": "lag1", "subinterface": [{"index": 101, "oper-state": "up"}]},
+                {
+                    "name": "lag2",
+                    "subinterface": [
+                        {
+                            "index": 101,
+                            "oper-state": "down",
+                            "oper-down-reason": "port-down",
+                        }
+                    ],
+                },
+            ]
+        }
+    ]
+    parent_reasons = [
+        {"interface": [{"name": "lag2", "oper-down-reason": "min-links-not-met"}]}
+    ]
+
+    dev = _FakeLayer2(
+        {
+            "network-instance": network_instances,
+            "subinterface": subinterfaces,
+            "oper-down-reason": parent_reasons,
+        }
+    )
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+
+    assert bd["Oper State"] == "degraded"
+    # The reason shown is the port's, not the two that only point at it.
+    assert bd["Sub-Interfaces"] == (
+        "lag1.101 [up] (VLAN: 101), lag2.101 [down: min-links-not-met] (VLAN: 101)"
+    )
 
 
 def test_get_routers():
@@ -1512,6 +1679,87 @@ def test_get_sum_subitf_names_subinterfaces_and_lists_addresses():
 def test_get_sum_subitf_survives_an_empty_response():
     device = _FakeInterfaces({"subinterface": []})
     assert device.get_sum_subitf() == {"subinterface": []}
+
+
+def test_get_sum_subitf_does_not_ask_why_a_port_is_down_when_none_is():
+    """The parent-port reasons cost a Get, so a healthy node must not spend one."""
+    device = _FakeInterfaces({"subinterface": _SUBITF_RESPONSE})
+
+    device.get_sum_subitf()
+
+    assert "oper-down-reason" not in "".join(device.requested)
+
+
+def test_get_sum_subitf_calls_a_standby_subinterface_standby():
+    """``port-down`` is resolved against the port, and standby is not a fault.
+
+    An ethernet-segment holding ``lag2`` in standby leaves every subinterface on
+    it down with ``port-down``, which says nothing on its own.
+    """
+    subinterfaces = [
+        {
+            "interface": [
+                {
+                    "name": "lag2",
+                    "subinterface": [
+                        {
+                            "index": 101,
+                            "oper-state": "down",
+                            "oper-down-reason": "port-down",
+                        }
+                    ],
+                }
+            ]
+        }
+    ]
+    parent_reasons = [
+        {"interface": [{"name": "lag2", "oper-down-reason": "standby-signaling"}]}
+    ]
+    device = _FakeInterfaces(
+        {"subinterface": subinterfaces, "oper-down-reason": parent_reasons}
+    )
+
+    rows = device.get_sum_subitf()["subinterface"]
+    subitf = rows[0]["subitfs"][0]
+
+    assert subitf["Subitf"] == "lag2.101"
+    assert subitf["oper"] == "down/standby"
+    assert subitf["down-reason"] == "standby-signaling"
+
+
+def test_get_sum_subitf_reports_the_root_cause_of_a_real_fault():
+    """A port that is genuinely down still reads as down, with its own reason."""
+    subinterfaces = [
+        {
+            "interface": [
+                {
+                    "name": "ethernet-1/4",
+                    "subinterface": [
+                        {
+                            "index": 0,
+                            "oper-state": "down",
+                            "oper-down-reason": "port-down",
+                        }
+                    ],
+                }
+            ]
+        }
+    ]
+    parent_reasons = [
+        {
+            "interface": [
+                {"name": "ethernet-1/4", "oper-down-reason": "port-admin-disabled"}
+            ]
+        }
+    ]
+    device = _FakeInterfaces(
+        {"subinterface": subinterfaces, "oper-down-reason": parent_reasons}
+    )
+
+    subitf = device.get_sum_subitf()["subinterface"][0]["subitfs"][0]
+
+    assert subitf["oper"] == "down"
+    assert subitf["down-reason"] == "port-admin-disabled"
 
 
 def test_get_arp_and_nd_label_entries_with_the_network_instance():

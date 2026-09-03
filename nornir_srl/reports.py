@@ -129,6 +129,9 @@ def _bgp_rib(
 _SERVICE_SUBSCRIPTIONS: Tuple[SubscriptionSpec, ...] = (
     SubscriptionSpec("/network-instance[name=*]", datatype="all", sample_interval=20),
     SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=20),
+    # A member reported 'port-down' is explained by its parent port, and that
+    # is what says whether a standby ethernet-segment or a fault put it there.
+    SubscriptionSpec("/interface[name=*]/oper-down-reason", sample_interval=20),
     SubscriptionSpec(
         "/network-instance[name=default]/route-table/ipv4-unicast/route/ipv4-prefix",
         datatype="state",
@@ -211,6 +214,9 @@ REPORTS: List[ReportSpec] = [
             # SubscriptionSpec.
             SubscriptionSpec("/interface[name=*]/admin-state", datatype="all", sample_interval=10),
             SubscriptionSpec("/interface[name=*]/oper-state", sample_interval=10),
+            # A port an ethernet-segment holds in standby is down by design, and
+            # this is what keeps it out of the 'oper down' count.
+            SubscriptionSpec("/interface[name=*]/oper-down-reason", sample_interval=10),
             SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=10),
             SubscriptionSpec("/interface[name=*]/description", datatype="all", sample_interval=10),
             SubscriptionSpec("/interface[name=*]/ethernet", datatype="all", sample_interval=10),
@@ -242,6 +248,10 @@ REPORTS: List[ReportSpec] = [
             ),
             SubscriptionSpec("/system/name/host-name", datatype="all", sample_interval=30),
             SubscriptionSpec("/interface[name=*]/oper-state", datatype="all", sample_interval=30),
+            # Which of the down ports are only standing by, so the cable to a
+            # multi-homed client is not drawn from the leaf that is not
+            # forwarding.
+            SubscriptionSpec("/interface[name=*]/oper-down-reason", sample_interval=30),
             # Egress of each interface, so each end of a cable can be coloured
             # from the rate leaving that port. Sampled often enough that a lab
             # generating traffic will move the graph with it.
@@ -296,6 +306,7 @@ REPORTS: List[ReportSpec] = [
         subscribe=(
             SubscriptionSpec("/interface[name=*]/statistics", sample_interval=5),
             SubscriptionSpec("/interface[name=*]/oper-state", sample_interval=30),
+            SubscriptionSpec("/interface[name=*]/oper-down-reason", sample_interval=30),
         ),
     ),
     ReportSpec(
@@ -309,6 +320,7 @@ REPORTS: List[ReportSpec] = [
         sample_interval=20,
         subscribe=(
             SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=20),
+            SubscriptionSpec("/interface[name=*]/oper-down-reason", sample_interval=20),
         ),
     ),
     ReportSpec(

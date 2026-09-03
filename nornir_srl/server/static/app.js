@@ -3,9 +3,16 @@
   "use strict";
 
   const WINDOW_STEP = 250; // rows appended per scroll batch
+
+  // An interface an ethernet-segment holds down on purpose. It reports both
+  // halves of the truth - the port is down, and standby is why - so it is
+  // neither counted as a fault nor read as forwarding.
+  const STANDBY_STATE = "down/standby";
+
   const STATE_CLASSES = {
     up: "state-up",
     down: "state-down",
+    [STANDBY_STATE]: "state-standby",
     enable: "state-enable",
     disable: "state-disable",
     established: "state-established",
@@ -981,8 +988,14 @@
 
   function topoHalfClass(link, bps) {
     const parts = ["topo-link"];
-    if (link.state === "down") {
-      parts.push("link-down");
+    // A cable that carries nothing gets no bandwidth colour: a down one has
+    // nothing to forward, and a standby one is not forwarding on purpose -
+    // which is why standby is coloured apart from down rather than red.
+    // The class comes from the kind, because "down/standby" is not a name a
+    // CSS class can carry.
+    const kind = stateKind(link.state);
+    if (kind === "down" || kind === "standby") {
+      parts.push(`link-${kind}`);
       return parts.join(" ");
     }
     parts.push(`link-${link.state}`);
@@ -2025,9 +2038,12 @@
   // Anything that is neither plainly up nor plainly down counts as degraded -
   // notably the "degraded" a service gets when only some of its interfaces are
   // up, which red would put on a par with a service that is entirely gone.
+  // Standby is its own kind: an ethernet-segment holding a port down is intent,
+  // and neither red nor orange is the truth about it.
   function stateKind(state) {
     const st = String(state || "").toLowerCase().trim();
     if (!st) return "";
+    if (st === STANDBY_STATE) return "standby";
     if (UP_STATES.includes(st)) return "up";
     if (DOWN_STATES.includes(st)) return "down";
     return "degraded";
@@ -2053,12 +2069,13 @@
     if (!rows || !rows.length) {
       return { status: "unknown", className: "state-badge-down", badgeText: "UNKNOWN" };
     }
-    const counts = { up: 0, down: 0, degraded: 0 };
+    const counts = { up: 0, down: 0, degraded: 0, standby: 0 };
     for (const row of rows) {
       counts[stateKind(row["Oper State"]) || "degraded"] += 1;
     }
 
-    if (counts.up === rows.length) {
+    // A service standing by on one node is not a service in trouble.
+    if (counts.up + counts.standby === rows.length) {
       return { status: "up", className: "state-badge-up", badgeText: "UP" };
     }
     if (counts.down === rows.length) {

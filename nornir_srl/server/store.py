@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from nornir.core import Nornir
 
+from ..connections.down_reason import STANDBY_STATE, is_intent
 from ..connections.srlinux import CONNECTION_NAME
 from ..connections.layer2 import stamp_underlay_sites
 from ..reports import ReportSpec, SubscriptionSpec, get_report
@@ -794,7 +795,10 @@ def _tally_interfaces(health: _Health, itfs: Any) -> None:
         if not _is_configured(itf, oper_state):
             continue
         health.itf_total += 1
-        if oper_state == "down":
+        # A port an ethernet-segment holds in standby is down because it was
+        # told to be; counting it as a fault puts a permanent red number on a
+        # healthy multi-homed fabric.
+        if oper_state == "down" and not is_intent(itf.get("oper-down-reason")):
             health.itf_down += 1
         stats = itf.get("statistics", {})
         if not isinstance(stats, dict):
@@ -866,7 +870,10 @@ def _effective_state(ni: Dict[str, Any], oper_state: str, itf_states: Dict[str, 
             for itf in attached
             if isinstance(itf, dict) and itf.get("name")
         )
-        if state
+        # A member in standby is counted neither way: an ethernet-segment leaves
+        # the non-forwarding leaf's port down by design, and counting that as
+        # down would degrade every multi-homed service on that node.
+        if state and state != STANDBY_STATE
     ]
     if not states:
         return oper_state
@@ -886,6 +893,8 @@ def _tally_network_instances(health: _Health, nis: Any, itfs: Any) -> None:
         for itf in itfs:
             if isinstance(itf, dict) and itf.get("name"):
                 state = _leaf(itf.get("oper-state"))
+                if state == "down" and is_intent(itf.get("oper-down-reason")):
+                    state = STANDBY_STATE
                 if state:
                     itf_states[str(itf["name"])] = state
     for ni in nis:

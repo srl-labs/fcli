@@ -1071,3 +1071,29 @@ def test_overview_ignores_admin_disabled_interfaces(store):
     assert data["interfaces"]["down"] == 1
     assert data["interfaces"]["total"] == 3
 
+
+def test_overview_does_not_count_a_standby_port_as_down(store):
+    """An ethernet-segment holding a port in standby is intent, not a fault.
+
+    Counting it put a permanent red 'oper down' number on a healthy
+    multi-homed fabric.
+    """
+    fabric_store, _devices = store
+    stream = list(fabric_store._streams.values())[0]
+
+    def down_count(reason):
+        stream._tree["interface"] = [
+            {"name": "lag1", "admin-state": "enable", "oper-state": "up"},
+            {
+                "name": "lag2",
+                "admin-state": "enable",
+                "oper-state": "down",
+                "oper-down-reason": reason,
+            },
+        ]
+        return fabric_store.overview()["interfaces"]["down"]
+
+    # The same port, down for the same length of time; only the reason differs.
+    assert down_count("standby-signaling") == 0
+    assert down_count("min-links-not-met") == 1
+

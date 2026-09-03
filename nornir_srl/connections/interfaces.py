@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 import jmespath
 
+from .down_reason import ParentReasons
 from .helpers import as_list, first_payload
 
 
@@ -147,6 +148,10 @@ class NetworkInstanceMixin:
                                 v["name"] = k.split("[name=")[1].split("]")[0]
                         itf_list.append(v)
 
+        # A subinterface reports itself 'port-down' without saying what is wrong
+        # with the port, so the reason worth showing lives one level up.
+        parents = ParentReasons(self.get)
+
         results = []
         for itf in itf_list:
             itf_name = itf.get("name", "")
@@ -160,12 +165,21 @@ class NetworkInstanceMixin:
                 elif str(si_name).isdigit():
                     si_name = f"{itf_name}.{si_name}"
 
+                # A port held in standby by its ethernet-segment is down on
+                # purpose, so its subinterfaces are called what they are rather
+                # than counted as faults.
+                own_reason = si.get("oper-down-reason")
+                oper = parents.state(si.get("oper-state"), si_name, own_reason)
+
                 # Extract interesting fields
                 sub_data = {
                     "Subitf": si_name,
                     "type": si.get("type"),
                     "admin": si.get("admin-state"),
-                    "oper": si.get("oper-state"),
+                    "oper": oper,
+                    "down-reason": (
+                        "" if oper == "up" else parents.resolve(si_name, own_reason)
+                    ),
                     "ip-mtu": si.get("ip-mtu"),
                     "vlan": jmespath.search('vlan.encap."single-tagged"."vlan-id"', si),
                 }

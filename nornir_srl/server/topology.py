@@ -38,6 +38,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from ..connections.down_reason import STANDBY_STATE, is_intent, root_reason
+
 #: The tiers of a fabric, bottom up, as ``(layer, role, label)``.
 LAYERS: Tuple[Tuple[int, str, str], ...] = (
     (0, "client", "Clients"),
@@ -188,6 +190,7 @@ def node_facts(
     if isinstance(instances, list) and instances:
         facts.has_state = True
         details = _subinterface_details(snapshot)
+        port_reasons = _port_reasons(snapshot)
         for instance in instances:
             if not isinstance(instance, dict):
                 continue
@@ -200,7 +203,9 @@ def node_facts(
                 kind = "routed"
             else:
                 continue
-            facts.attachments.extend(_attachments(instance, kind, details))
+            facts.attachments.extend(
+                _attachments(instance, kind, details, port_reasons)
+            )
             if _is_stitched(instance):
                 facts.stitched += 1
 
@@ -787,11 +792,18 @@ def _link_payload(
     layer_of: Dict[str, int],
     egress: Dict[str, Dict[str, int]],
 ) -> Dict[str, Any]:
-    states = link["states"]
+    # A port an ethernet-segment holds in standby says nothing about the cable
+    # it is on: the bundle down to a multi-homed client is carried by whichever
+    # leaf is forwarding, so letting the standby leaf's port vote would draw
+    # that client as unreachable. A cable with nothing but standby on it is
+    # standby itself.
+    states = {state for state in link["states"] if state != STANDBY_STATE}
     if any(state in _DOWN_STATES for state in states):
         state = "down"
     elif states and all(state in _UP_STATES for state in states):
         state = "up"
+    elif not states and link["states"]:
+        state = STANDBY_STATE
     else:
         state = "unknown"
     a_rates: List[int] = []
@@ -927,7 +939,10 @@ def _segments(system: Dict[str, Any]) -> Dict[str, Segment]:
 
 
 def _attachments(
-    instance: Dict[str, Any], kind: str, details: Dict[str, Dict[str, Any]]
+    instance: Dict[str, Any],
+    kind: str,
+    details: Dict[str, Dict[str, Any]],
+    port_reasons: Optional[Dict[str, str]] = None,
 ) -> List[Attachment]:
     """The subinterfaces a service binds, minus the ones no client can be on."""
     service = str(instance.get("name", ""))
@@ -948,10 +963,31 @@ def _attachments(
                 ip=_first_prefix(detail),
                 # The service's own view of the subinterface first: a member of
                 # a disabled mac-vrf reads up under /interface and down here.
-                oper_state=_norm(member.get("oper-state")) or _norm(detail.get("oper-state")),
+                # A member whose port is only in standby is called that, so the
+                # cable to a multi-homed client is not drawn from the leaf that
+                # is not forwarding.
+                oper_state=_member_state(member, detail, port_reasons, port),
             )
         )
     return result
+
+
+def _member_state(
+    member: Dict[str, Any],
+    detail: Dict[str, Any],
+    port_reasons: Optional[Dict[str, str]],
+    port: str,
+) -> str:
+    """The state of a service member, with an intentional down called ``down/standby``."""
+    state = _norm(member.get("oper-state")) or _norm(detail.get("oper-state"))
+    if state != "down":
+        return state
+    reason = root_reason(
+        member.get("oper-down-reason"),
+        detail.get("oper-down-reason"),
+        (port_reasons or {}).get(port, ""),
+    )
+    return STANDBY_STATE if is_intent(reason) else state
 
 
 def _subinterface_details(snapshot: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
@@ -999,9 +1035,26 @@ def _interface_states(snapshot: Dict[str, Any]) -> Dict[str, str]:
         if not itf.get("name"):
             continue
         state = _norm(itf.get("oper-state"))
+        if state == "down" and is_intent(itf.get("oper-down-reason")):
+            state = STANDBY_STATE
         if state:
             states[str(itf["name"])] = state
     return states
+
+
+def _port_reasons(snapshot: Dict[str, Any]) -> Dict[str, str]:
+    """Map port name -> its own ``oper-down-reason``, for the ports that have one.
+
+    A subinterface only ever says ``port-down`` about its port; this is what
+    that resolves against.
+    """
+    reasons: Dict[str, str] = {}
+    for itf in _as_list(snapshot.get("interface")):
+        name = itf.get("name")
+        reason = _norm(itf.get("oper-down-reason"))
+        if name and reason:
+            reasons[str(name)] = reason
+    return reasons
 
 
 def _is_stitched(instance: Dict[str, Any]) -> bool:

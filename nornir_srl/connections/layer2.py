@@ -4,18 +4,35 @@ import ipaddress
 from typing import Any, Dict, List, Optional, Tuple
 import jmespath
 
+from .down_reason import STANDBY_STATE, ParentReasons
+from .down_reason import clean_leaf as _clean_state
 from .helpers import as_list, first_payload
 from .routing import _gnmi_path_missing, _suppress_pygnmi_client_logging
 
 
-def _clean_state(value: Any) -> str:
-    """A YANG state value as a bare lowercase word, without its module prefix."""
-    if not value:
-        return ""
-    return str(value).lower().split(":")[-1]
+def _subinterface_down_reason(
+    name: str,
+    itf: Dict[str, Any],
+    details: Dict[str, Any],
+    parents: ParentReasons,
+) -> str:
+    """Why a subinterface in a service is down, followed to its root cause.
+
+    The three views each defer to the next: the network-instance says
+    ``subif-down``, the subinterface says ``port-down``, and the parent port is
+    where the reason worth showing finally is.
+    """
+    return parents.resolve(
+        name, itf.get("oper-down-reason"), details.get("oper-down-reason")
+    )
 
 
-def _subinterface_state(itf: Dict[str, Any], details: Dict[str, Any]) -> str:
+def _subinterface_state(
+    name: str,
+    itf: Dict[str, Any],
+    details: Dict[str, Any],
+    parents: ParentReasons,
+) -> str:
     """The oper-state of a subinterface as its network-instance sees it.
 
     SR Linux answers this differently depending on where it is asked. An IRB in a
@@ -24,30 +41,74 @@ def _subinterface_state(itf: Dict[str, Any], details: Dict[str, Any]) -> str:
     ``net-inst-down``. In a service listing the latter is the truthful one, so the
     network-instance's own view wins and ``/interface`` only fills in what the
     network-instance does not carry.
+
+    A subinterface that is only down because an ethernet-segment holds its port
+    in standby comes back as ``down/standby``: the port really is down, but it
+    is doing what it was configured to do, and counting that as a fault is what
+    left multi-homed services permanently degraded on whichever leaf was not
+    forwarding.
     """
     state = _clean_state(itf.get("oper-state")) or _clean_state(details.get("oper-state"))
-    if state:
-        return state
-    admin = _clean_state(itf.get("admin-state")) or _clean_state(details.get("admin-state"))
-    if admin in ("disable", "disabled"):
-        return "down"
-    return "up"
+    if not state:
+        admin = _clean_state(itf.get("admin-state")) or _clean_state(
+            details.get("admin-state")
+        )
+        state = "down" if admin in ("disable", "disabled") else "up"
+    return parents.state(
+        state, name, itf.get("oper-down-reason"), details.get("oper-down-reason")
+    )
 
 
-def _subinterface_state_label(itf: Dict[str, Any], details: Dict[str, Any]) -> str:
+def _subinterface_state_label(
+    name: str,
+    itf: Dict[str, Any],
+    details: Dict[str, Any],
+    parents: ParentReasons,
+) -> str:
     """How to label a subinterface's state, with the reason when it is down.
 
     A bare ``[down]`` next to a service that is itself down invites the question
     this answers: ``[down: net-inst-down]`` says the subinterface is only down
-    because the service is.
+    because the service is. ``down/standby`` needs no such reason - the word is
+    the reason.
     """
-    state = _subinterface_state(itf, details)
+    state = _subinterface_state(name, itf, details, parents)
     if state != "down":
         return state
-    reason = _clean_state(itf.get("oper-down-reason")) or _clean_state(
-        details.get("oper-down-reason")
-    )
+    reason = _subinterface_down_reason(name, itf, details, parents)
     return f"{state}: {reason}" if reason else state
+
+
+#: Member states that count towards a service being up, and towards it being
+#: down. ``down/standby`` is deliberately in neither: see
+#: :func:`_service_oper_state`.
+_MEMBER_UP_STATES = frozenset({"up", "enable", "enabled", "active"})
+_MEMBER_DOWN_STATES = frozenset({"down", "disable", "disabled"})
+
+
+def _service_oper_state(ni_oper: str, member_states: List[str]) -> str:
+    """The state of a service, refined by the subinterfaces placed in it.
+
+    A network-instance reports itself up while some of its members are down,
+    which is what ``degraded`` is for: the service exists on the node but is not
+    carrying everything it was meant to.
+
+    Members in standby are counted neither way. An ethernet-segment leaves the
+    non-forwarding leaf's port in standby by design, so counting it as down
+    would mark every multi-homed service degraded on exactly the node where
+    nothing is wrong. A service whose members are all standby falls back to what
+    the network-instance says about itself, which is still reachable over VXLAN.
+    """
+    if ni_oper == "down":
+        return "down"
+    counted = [state for state in member_states if state != STANDBY_STATE]
+    if not counted:
+        return ni_oper or "up"
+    if all(state in _MEMBER_UP_STATES for state in counted):
+        return "up"
+    if all(state in _MEMBER_DOWN_STATES for state in counted):
+        return "down"
+    return "degraded"
 
 
 def _host_address(pfx: str) -> str:
@@ -783,6 +844,10 @@ class Layer2Mixin:
         subitf_details = self._subinterface_details()
         system_ipv4, system_ipv6 = _system0_addresses(subitf_details)
         underlay_hosts = self._default_underlay_hosts(ni_list)
+        # A member that says 'port-down' does not say what is wrong with the
+        # port; the parent's own reason is what does, and what tells a standby
+        # ethernet-segment apart from a broken link.
+        parents = ParentReasons(self.get)
 
         # Build mapping of irb_subinterface -> associated ip-vrf / L3 network instances
         irb_to_ip_vrf: Dict[str, List[str]] = {}
@@ -831,7 +896,7 @@ class Layer2Mixin:
 
         def _format_irb_item_and_subnets(itf_name: str, itf_dict: Dict[str, Any], assoc_vrfs: List[str]) -> Tuple[str, List[str], str]:
             si = subitf_details.get(itf_name, {})
-            st = _subinterface_state_label(itf_dict, si)
+            st = _subinterface_state_label(itf_name, itf_dict, si, parents)
             ips: List[str] = []
             is_anycast = False
 
@@ -890,7 +955,9 @@ class Layer2Mixin:
                     # The bare state feeds the service's aggregate oper-state
                     # below, which counts up against down; the label is only for
                     # display and can carry a reason with it.
-                    subitf_states.append(_subinterface_state(i, details))
+                    subitf_states.append(
+                        _subinterface_state(name, i, details, parents)
+                    )
                     if name.startswith("irb"):
                         assoc_vrfs = irb_to_ip_vrf.get(name, [])
                         irb_item_str, subnets, _st = _format_irb_item_and_subnets(name, i, assoc_vrfs)
@@ -898,7 +965,7 @@ class Layer2Mixin:
                         all_subnets.extend(subnets)
                     else:
                         vlan_info = _extract_vlan_encap(name, i)
-                        label = _subinterface_state_label(i, details)
+                        label = _subinterface_state_label(name, i, details, parents)
                         bridge_subitfs.append(f"{name} [{label}] (VLAN: {vlan_info})")
 
             vxlan_itfs = [
@@ -907,20 +974,7 @@ class Layer2Mixin:
                 if isinstance(v, dict) and v.get("name")
             ]
 
-            ni_oper = _clean_state(oper_state)
-            if ni_oper == "down":
-                effective_oper = "down"
-            elif subitf_states:
-                up_cnt = sum(1 for s in subitf_states if s in ("up", "enable", "enabled", "active"))
-                down_cnt = sum(1 for s in subitf_states if s in ("down", "disable", "disabled"))
-                if up_cnt == len(subitf_states):
-                    effective_oper = "up"
-                elif down_cnt == len(subitf_states):
-                    effective_oper = "down"
-                else:
-                    effective_oper = "degraded"
-            else:
-                effective_oper = ni_oper if ni_oper else "up"
+            effective_oper = _service_oper_state(_clean_state(oper_state), subitf_states)
 
             for group in _vpn_tile_groups(ni, f"mac-vrf:{ni_name}"):
                 rt_display = ", ".join(group["rts"]) if group["rts"] else f"mac-vrf:{ni_name}"
@@ -968,6 +1022,7 @@ class Layer2Mixin:
         subitf_details = self._subinterface_details()
         system_ipv4, system_ipv6 = _system0_addresses(subitf_details)
         underlay_hosts = self._default_underlay_hosts(ni_list)
+        parents = ParentReasons(self.get)
 
         # Build mapping of irb_subinterface -> mac-vrf network instance name
         irb_to_mac_vrf: Dict[str, str] = {}
@@ -1021,8 +1076,10 @@ class Layer2Mixin:
                 if isinstance(i, dict) and i.get("name"):
                     name = i["name"]
                     details = subitf_details.get(name, {})
-                    subitf_states.append(_subinterface_state(i, details))
-                    st = _subinterface_state_label(i, details)
+                    subitf_states.append(
+                        _subinterface_state(name, i, details, parents)
+                    )
+                    st = _subinterface_state_label(name, i, details, parents)
                     ips = _get_ip_addresses(name, i)
                     ip_str = ", ".join(ips) if ips else ""
 
@@ -1048,20 +1105,7 @@ class Layer2Mixin:
                 if isinstance(v, dict) and v.get("name")
             ]
 
-            ni_oper = _clean_state(oper_state)
-            if ni_oper == "down":
-                effective_oper = "down"
-            elif subitf_states:
-                up_cnt = sum(1 for s in subitf_states if s in ("up", "enable", "enabled", "active"))
-                down_cnt = sum(1 for s in subitf_states if s in ("down", "disable", "disabled"))
-                if up_cnt == len(subitf_states):
-                    effective_oper = "up"
-                elif down_cnt == len(subitf_states):
-                    effective_oper = "down"
-                else:
-                    effective_oper = "degraded"
-            else:
-                effective_oper = ni_oper if ni_oper else "up"
+            effective_oper = _service_oper_state(_clean_state(oper_state), subitf_states)
 
             for group in _vpn_tile_groups(ni, "none (isolated)"):
                 isolated = not group["rts"]
