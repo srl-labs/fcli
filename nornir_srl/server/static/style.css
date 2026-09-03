@@ -1141,6 +1141,15 @@ th.filtered::after {
   border: 1px solid rgba(167, 139, 250, 0.3);
 }
 
+.pill-es .vrf-link {
+  color: inherit;
+  text-underline-offset: 2px;
+}
+
+.pill-es .vrf-link:hover {
+  color: #ddd6fe;
+}
+
 .pill-macvrf {
   background: rgba(236, 72, 153, 0.15);
   color: #f472b6;

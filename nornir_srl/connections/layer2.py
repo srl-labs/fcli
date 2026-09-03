@@ -6,7 +6,7 @@ import jmespath
 
 from .down_reason import STANDBY_STATE, ParentReasons, parent_interface
 from .down_reason import clean_leaf as _clean_state
-from .helpers import as_list, first_payload
+from .helpers import as_list, bgp_evpn_evis, first_payload
 from .routing import _gnmi_path_missing, _suppress_pygnmi_client_logging
 
 
@@ -138,6 +138,73 @@ def _df_peers(vrf: Dict[str, Any]) -> str:
     )
 
 
+def _association_instances(vrf: Dict[str, Any]) -> List[str]:
+    """The bgp-instance ids a segment is associated with in one network-instance.
+
+    A gateway is shown as one tile per instance, and this is what keeps a
+    segment on the side of it that actually carries it.
+    """
+    ids: List[str] = []
+    for inst in as_list(vrf.get("bgp-instance")):
+        if not isinstance(inst, dict):
+            continue
+        iid = inst.get("instance", inst.get("id"))
+        if iid is None or str(iid) == "":
+            continue
+        if str(iid) not in ids:
+            ids.append(str(iid))
+    return ids
+
+
+def _evi_values(container: Any) -> List[str]:
+    """The ``evi`` list of a container, as strings.
+
+    SR Linux models the EVI range of an ethernet-segment next-hop as a list
+    keyed on ``start``, so the value is not under the list name itself.
+    """
+    if not isinstance(container, dict):
+        return []
+    values: List[str] = []
+    for item in as_list(container.get("evi")):
+        evi = item.get("start") if isinstance(item, dict) else item
+        if evi is None or str(evi) == "":
+            continue
+        if str(evi) not in values:
+            values.append(str(evi))
+    return values
+
+
+def _es_next_hops(es: Dict[str, Any]) -> List[Tuple[str, List[str]]]:
+    """The L3 next-hops of a virtual ethernet-segment, each with its EVIs.
+
+    A virtual ES has no port to hang off: it tracks a next-hop address, and
+    the EVI configured under that next-hop is the ip-vrf the segment serves.
+    """
+    pairs: List[Tuple[str, List[str]]] = []
+    for nh in as_list(es.get("next-hop")):
+        if not isinstance(nh, dict):
+            continue
+        address = str(nh.get("l3-next-hop") or "")
+        if address:
+            pairs.append((address, _evi_values(nh)))
+    return pairs
+
+
+def _es_evi_display(pairs: List[Tuple[str, List[str]]]) -> str:
+    """The EVIs of a virtual ES, paired with a next-hop only where that matters.
+
+    One next-hop, or several that are tied to the same EVIs, is just the EVI
+    list. A segment that tracks a different next-hop per EVI has to say which
+    of them is which, or the column cannot be matched to a router at all.
+    """
+    with_evis = [(nh, evis) for nh, evis in pairs if evis]
+    if not with_evis:
+        return ""
+    if len({tuple(evis) for _nh, evis in with_evis}) == 1:
+        return " ".join(with_evis[0][1])
+    return " ".join(f"{nh}:{','.join(evis)}" for nh, evis in with_evis)
+
+
 def _compress_esi(esi: Any) -> str:
     """An ESI with its longest run of zero bytes written as ``..``.
 
@@ -169,24 +236,31 @@ def _compress_esi(esi: Any) -> str:
 
 
 class _EthernetSegments:
-    """A node's ethernet-segments, indexed by the port each one is on.
+    """A node's ethernet-segments, indexed by port and by network-instance.
 
-    Read on first use. A node with no bridge domains never asks, so a spine
-    does not spend a Get on a tree it has nothing in.
+    A bridge domain finds its own by the port the segment is on. A virtual
+    segment has no port, and its association state names the network-instance
+    it serves outright, so a router finds its own by name.
+    Read on first use. A node with no bridge domains and no EVPN router never
+    asks, so a spine does not spend a Get on a tree it has nothing in.
     """
 
     def __init__(self, get: Any) -> None:
         self._get = get
-        self._by_port: Optional[Dict[str, Dict[str, Any]]] = None
+        self._loaded = False
+        self._by_port: Dict[str, Dict[str, Any]] = {}
+        self._by_ni: Dict[str, List[Dict[str, Any]]] = {}
 
-    def _load(self) -> Dict[str, Dict[str, Any]]:
-        by_port: Dict[str, Dict[str, Any]] = {}
+    def _load(self) -> None:
+        if self._loaded:
+            return
+        self._loaded = True
         with _suppress_pygnmi_client_logging():
             try:
                 resp = self._get(paths=[_ES_PATH], datatype="all")
             except BaseException as e:
                 if _gnmi_path_missing(e):
-                    return by_port
+                    return
                 raise
         segments = first_payload(resp).get(_ES_ENVELOPE) or {}
         for instance in as_list(segments.get("bgp-instance")):
@@ -210,26 +284,57 @@ class _EthernetSegments:
                 for itf in as_list(es.get("interface")):
                     port = itf.get("ethernet-interface") if isinstance(itf, dict) else None
                     if port:
-                        by_port[str(port)] = segment
-        return by_port
+                        self._by_port[str(port)] = segment
+                next_hops = [nh for nh, _evis in _es_next_hops(es)]
+                if not next_hops:
+                    continue
+                for vrf in as_list(association.get("network-instance")):
+                    if not isinstance(vrf, dict):
+                        continue
+                    name = str(vrf.get("name") or "")
+                    if name:
+                        self._by_ni.setdefault(name, []).append(
+                            {
+                                "segment": segment,
+                                "next-hop": " ".join(next_hops),
+                                "instances": _association_instances(vrf),
+                            }
+                        )
 
     def of(self, port: str) -> Optional[Dict[str, Any]]:
         """The segment configured on *port*, if there is one."""
-        if self._by_port is None:
-            self._by_port = self._load()
+        self._load()
         return self._by_port.get(str(port))
 
+    def for_ni(self, ni_name: str, instance: str = "") -> List[Dict[str, Any]]:
+        """The virtual segments *ni_name* is associated with, each with its next-hop.
 
-def _es_label(segment: Dict[str, Any], ni_name: str) -> str:
-    """One ethernet-segment as a bridge domain shows it.
+        *instance* narrows them to one bgp-instance of the network-instance,
+        for a gateway that is shown as a tile per instance.
+        """
+        self._load()
+        entries = self._by_ni.get(str(ni_name), [])
+        if not instance:
+            return entries
+        return [
+            e
+            for e in entries
+            if not e["instances"] or str(instance) in e["instances"]
+        ]
 
-    The peers are those of the bridge domain's own network-instance: the DF is
+
+def _es_label(segment: Dict[str, Any], ni_name: str, next_hop: str = "") -> str:
+    """One ethernet-segment as the service it serves shows it.
+
+    The peers are those of the service's own network-instance: the DF is
     elected per service, and the candidates of the other services on the same
     segment say nothing about this one.
     """
     fields = [f"ID: {_compress_esi(segment.get('esi'))}"]
     if segment.get("name"):
         fields.append(str(segment["name"]))
+    if next_hop:
+        fields.append(f"nh: {next_hop}")
     if segment.get("mh-mode"):
         fields.append(f"mode: {segment['mh-mode']}")
     if segment.get("oper"):
@@ -687,7 +792,7 @@ class Layer2Mixin:
     def get_es(self) -> Dict[str, Any]:
         path_spec = {
             "path": _ES_PATH,
-            "jmespath": '"system/network-instance/protocols/evpn/ethernet-segments"."bgp-instance"[]."ethernet-segment"[].{name:name, esi:esi, type:type, "mh-mode":"multi-homing-mode", oper:"oper-state", "itf/nh":"_itf_or_nh", "ni-peers":association."network-instance"[]."_ni_peers"|join(\', \',@) }',
+            "jmespath": '"system/network-instance/protocols/evpn/ethernet-segments"."bgp-instance"[]."ethernet-segment"[].{name:name, esi:esi, type:type, "mh-mode":"multi-homing-mode", oper:"oper-state", "itf/nh":"_itf_or_nh", evi:"_evi", "ni-peers":association."network-instance"[]."_ni_peers"|join(\', \',@) }',
             "datatype": "all",
         }
 
@@ -696,16 +801,18 @@ class Layer2Mixin:
             for bgp_inst in as_list(segments.get("bgp-instance")):
                 for es in as_list(bgp_inst.get("ethernet-segment")):
                     # compute interface or next-hop display field
+                    next_hops = _es_next_hops(es)
                     if "interface" in es:
                         es["_itf_or_nh"] = " ".join(
                             i["ethernet-interface"] for i in es["interface"]
                         )
-                    elif "next-hop" in es:
-                        es["_itf_or_nh"] = " ".join(
-                            nh["l3-next-hop"] for nh in es["next-hop"]
-                        )
+                    elif next_hops:
+                        es["_itf_or_nh"] = " ".join(nh for nh, _evis in next_hops)
                     else:
                         es["_itf_or_nh"] = ""
+                    # The EVI is what ties a virtual segment to an ip-vrf, and
+                    # the Routers report matches the two on it.
+                    es["_evi"] = _es_evi_display(next_hops)
                     if "association" not in es:
                         es["association"] = {}
                     if "network-instance" not in es["association"]:
@@ -1148,6 +1255,10 @@ class Layer2Mixin:
         system_ipv4, system_ipv6 = _system0_addresses(subitf_details)
         underlay_hosts = self._default_underlay_hosts(ni_list)
         parents = ParentReasons(self.get)
+        # A virtual ethernet-segment has no port to be listed under, so a
+        # router is the only place it can be shown: it names an EVI, and the
+        # ip-vrf advertising that EVI is the one it multi-homes.
+        segments = _EthernetSegments(self.get)
 
         # Build mapping of irb_subinterface -> mac-vrf network instance name
         irb_to_mac_vrf: Dict[str, str] = {}
@@ -1231,6 +1342,7 @@ class Layer2Mixin:
             ]
 
             effective_oper = _service_oper_state(_clean_state(oper_state), subitf_states)
+            ni_evis = bgp_evpn_evis(ni)
 
             for group in _vpn_tile_groups(ni, "none (isolated)"):
                 isolated = not group["rts"]
@@ -1238,14 +1350,36 @@ class Layer2Mixin:
                 primary = (
                     f"none (isolated) - {ni_name}" if isolated else group["primary"]
                 )
+                # A tile is one bgp-vpn instance of the ip-vrf, and the bgp-evpn
+                # instance of the same id is the one that carries its EVI. A
+                # single-instance ip-vrf has no id on its tile, and then every
+                # EVI the instance advertises belongs to it.
+                if group["id"] in ni_evis:
+                    evis = [ni_evis[group["id"]]]
+                elif group["id"]:
+                    evis = []
+                else:
+                    evis = list(ni_evis.values())
+                # Only an EVPN service can carry a virtual segment, so an
+                # ip-vrf that runs no bgp-evpn is not worth a Get.
+                ves_items = [
+                    _es_label(entry["segment"], ni_name, entry["next-hop"])
+                    for entry in (
+                        segments.for_ni(ni_name, group["id"]) if ni_evis else []
+                    )
+                ]
                 results.append(
                     {
                         "Router": primary,
                         "IP-VRF": ni_name,
                         "Oper State": effective_oper,
                         "Route Targets": rt_display,
+                        "EVI": ", ".join(evis),
                         "MAC-VRFs": ", ".join(mac_vrfs_items) if mac_vrfs_items else "-",
                         "Routed Interfaces": ", ".join(routed_itfs_items) if routed_itfs_items else "-",
+                        # Virtual segments only: a router has no access port for
+                        # a segment to be on, so there is nothing else here.
+                        "Virtual ES": "; ".join(ves_items) if ves_items else "-",
                         "VXLAN Interface": ", ".join(vxlan_itfs) if vxlan_itfs else "-",
                         "Subnets": ", ".join(irb_subnets) if irb_subnets else "",
                         "Gateway": "Y" if group["gateway"] else "",

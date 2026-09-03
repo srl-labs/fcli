@@ -99,6 +99,13 @@ accepted, so a rejection would still be caught - but the shape of their payloads
 is not exercised. Adding IPv6 addressing and a static route to the intent would
 close that.
 
+All five ethernet segments in this lab are LAGs to clients, so the `evi` column
+of `es` and the `Virtual ES` column of `routers` are empty on every release. Both
+read the `next-hop`/`evi` sub-tree of a *virtual* (layer-3) ethernet segment,
+which no recorded node has: that shape is covered by unit tests only. Adding a
+`type virtual` segment with a `next-hop` in `ipvrf-1` to the intent would close
+it.
+
 That gap has cost us once: because no recorded node has an IPv6 route, the
 matrix could not catch the columns of a report being taken from its first item
 only, which emptied `ipv6-rib` on any fabric whose first network-instance or

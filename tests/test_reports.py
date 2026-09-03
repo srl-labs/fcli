@@ -1180,6 +1180,255 @@ def test_get_bridge_domains_does_not_ask_about_segments_without_access_members()
     assert not [p for p in dev.requested if "ethernet-segments" in p]
 
 
+def _ves_payload() -> List[Dict[str, Any]]:
+    """A virtual segment tied to EVI 2, next to an ordinary port-based one."""
+    return [
+        {
+            "system/network-instance/protocols/evpn/ethernet-segments": {
+                "bgp-instance": [
+                    {
+                        "id": 1,
+                        "ethernet-segment": [
+                            {
+                                "name": "L3-ES-1",
+                                "type": "virtual",
+                                "esi": "01:01:00:00:00:00:00:00:00:00",
+                                "multi-homing-mode": "all-active",
+                                "oper-state": "up",
+                                "next-hop": [
+                                    {
+                                        "l3-next-hop": "10.1.100.254",
+                                        "evi": [{"start": 2}],
+                                    }
+                                ],
+                                "association": {
+                                    "network-instance": [
+                                        {
+                                            "name": "ip-vrf-1",
+                                            "bgp-instance": [{"instance": 1}],
+                                        }
+                                    ]
+                                },
+                            },
+                            {
+                                "name": "ES-01",
+                                "esi": "00:01:01:00:00:00:66:00:01:01",
+                                "multi-homing-mode": "all-active",
+                                "oper-state": "up",
+                                "interface": [{"ethernet-interface": "lag1"}],
+                            },
+                        ],
+                    }
+                ]
+            }
+        }
+    ]
+
+
+def _es_device(responses: Dict[str, List[Dict[str, Any]]]):
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(_RecordingLayer2, Layer2Mixin):
+        pass
+
+    return _FakeLayer2({"features": [{"system/features": ["evpn"]}], **responses})
+
+
+def test_get_es_reports_the_evi_a_virtual_segment_is_tied_to():
+    """A virtual ES has no port, and the EVI under its next-hop names its ip-vrf."""
+    dev = _es_device({"ethernet-segments": _ves_payload()})
+
+    rows = {r["name"]: r for r in dev.get_es()["es"]}
+
+    assert rows["L3-ES-1"]["itf/nh"] == "10.1.100.254"
+    assert rows["L3-ES-1"]["evi"] == "2"
+    # A port-based segment is not tied to a service by an EVI at all.
+    assert rows["ES-01"]["itf/nh"] == "lag1"
+    assert rows["ES-01"]["evi"] == ""
+
+
+def test_get_es_names_the_next_hop_of_each_evi_only_when_they_differ():
+    """Two next-hops tied to the same EVIs read as one EVI list; differing ones do not."""
+    payload = _ves_payload()
+    segment = payload[0][
+        "system/network-instance/protocols/evpn/ethernet-segments"
+    ]["bgp-instance"][0]["ethernet-segment"][0]
+    segment["next-hop"] = [
+        {"l3-next-hop": "10.1.100.254", "evi": [{"start": 2}]},
+        {"l3-next-hop": "10.1.200.254", "evi": [{"start": 2}]},
+    ]
+    dev = _es_device({"ethernet-segments": payload})
+    assert dev.get_es()["es"][0]["evi"] == "2"
+
+    segment["next-hop"][1]["evi"] = [{"start": 3}]
+    dev = _es_device({"ethernet-segments": payload})
+    assert (
+        dev.get_es()["es"][0]["evi"] == "10.1.100.254:2 10.1.200.254:3"
+    )
+
+
+def _routers_device(responses: Dict[str, List[Dict[str, Any]]]):
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, resp: Dict[str, List[Dict[str, Any]]]):
+            self._responses = resp
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    # Responses are matched by path fragment, so callers pass
+    # 'ethernet-segments' ahead of 'network-instance': the ethernet-segments
+    # path contains both.
+    return _FakeLayer2({**responses, "subinterface": [{}]})
+
+
+def _ip_vrf(name: str, evi: Any, rt: str) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "type": "ip-vrf",
+        "oper-state": "up",
+        "protocols": {
+            "bgp-evpn": {"bgp-instance": [{"id": 1, "evi": evi}]},
+            "bgp-vpn": {
+                "bgp-instance": [
+                    {
+                        "id": 1,
+                        "route-target": {
+                            "import-rt": [{"target": rt}],
+                            "export-rt": [{"target": rt}],
+                        },
+                    }
+                ]
+            },
+        },
+    }
+
+
+def test_get_routers_shows_the_virtual_segment_associated_with_it():
+    """A virtual ES belongs to the ip-vrf its association state names.
+
+    There is no port to list it under, so the router is where it has to appear,
+    with the next-hop it tracks: that address being active in this route table
+    is what makes the segment advertise at all.
+    """
+    data = [
+        {
+            "network-instance": [
+                _ip_vrf("ip-vrf-1", 2, "target:65000:2"),
+                _ip_vrf("ip-vrf-9", 9, "target:65000:9"),
+            ]
+        }
+    ]
+    dev = _routers_device(
+        {"ethernet-segments": _ves_payload(), "network-instance": data}
+    )
+
+    rows = {r["IP-VRF"]: r for r in dev.get_routers()["routers"]}
+
+    assert rows["ip-vrf-1"]["EVI"] == "2"
+    assert rows["ip-vrf-1"]["Virtual ES"] == (
+        "ID: 01:01:.., L3-ES-1, nh: 10.1.100.254, mode: all-active, oper: up"
+    )
+    # The segment's association does not name the other router.
+    assert rows["ip-vrf-9"]["EVI"] == "9"
+    assert rows["ip-vrf-9"]["Virtual ES"] == "-"
+
+
+def test_get_routers_takes_the_evi_of_each_gateway_tile_from_its_own_instance():
+    """A DCGW is two tiles, each with the EVI and the segments of its instance."""
+    payload = _ves_payload()
+    payload[0]["system/network-instance/protocols/evpn/ethernet-segments"][
+        "bgp-instance"
+    ][0]["ethernet-segment"][0]["association"]["network-instance"] = [
+        {"name": "ipvrf-l3dci", "bgp-instance": [{"instance": 1}]}
+    ]
+    data = [
+        {
+            "network-instance": [
+                {
+                    "name": "ipvrf-l3dci",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                    "protocols": {
+                        "bgp-evpn": {
+                            "bgp-instance": [
+                                {"id": 1, "evi": 2},
+                                {"id": 2, "evi": 3000},
+                            ]
+                        },
+                        "bgp-vpn": {
+                            "bgp-instance": [
+                                {
+                                    "id": 1,
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:65000:2"}],
+                                        "export-rt": [{"target": "target:65000:2"}],
+                                    },
+                                },
+                                {
+                                    "id": 2,
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:3000:3000"}],
+                                        "export-rt": [{"target": "target:3000:3000"}],
+                                    },
+                                },
+                            ]
+                        },
+                    },
+                }
+            ]
+        }
+    ]
+    dev = _routers_device({"ethernet-segments": payload, "network-instance": data})
+
+    rows = {r["BGP Instance"]: r for r in dev.get_routers()["routers"]}
+
+    assert rows["1"]["EVI"] == "2"
+    assert "L3-ES-1" in rows["1"]["Virtual ES"]
+    # The WAN side of the gateway advertises its own EVI and has no segment.
+    assert rows["2"]["EVI"] == "3000"
+    assert rows["2"]["Virtual ES"] == "-"
+
+
+def test_get_routers_does_not_ask_about_segments_without_bgp_evpn():
+    """An ip-vrf that runs no bgp-evpn cannot be carrying a virtual segment."""
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(_RecordingLayer2, Layer2Mixin):
+        pass
+
+    data = [
+        {
+            "network-instance": [
+                {"name": "ip-vrf-1", "type": "ip-vrf", "oper-state": "up"}
+            ]
+        }
+    ]
+    dev = _FakeLayer2(
+        {
+            "ethernet-segments": _ves_payload(),
+            "network-instance": data,
+            "subinterface": [{}],
+        }
+    )
+
+    row = dev.get_routers()["routers"][0]
+
+    assert row["EVI"] == ""
+    assert row["Virtual ES"] == "-"
+    assert not [p for p in dev.requested if "ethernet-segments" in p]
+
+
 def test_get_routers():
     from nornir_srl.connections.layer2 import Layer2Mixin
 
@@ -1784,6 +2033,47 @@ def test_get_nwi_itf_joins_subinterface_details_onto_network_instances():
     # An IRB carries an l2-mtu rather than an ip-mtu.
     assert by_name["irb1.100"]["mtu"] == 9000
     assert by_name["irb1.100"]["if-oper"] == "up"
+
+
+def test_get_nwi_itf_reports_the_bgp_evpn_evi_of_each_instance():
+    """The EVI is what a virtual ethernet-segment names to find its network-instance.
+
+    A DCGW runs two bgp-evpn instances with an EVI each, and both belong to the
+    one network-instance the row is about.
+    """
+    ni_response = [
+        {
+            "network-instance": [
+                {
+                    "name": "mac-vrf-100",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "protocols": {"bgp-evpn": {"bgp-instance": [{"id": 1, "evi": 100}]}},
+                },
+                {
+                    "name": "ipvrf-l3dci",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                    "protocols": {
+                        "bgp-evpn": {
+                            "bgp-instance": [{"id": 1, "evi": 2}, {"id": 2, "evi": 3000}]
+                        }
+                    },
+                },
+                {"name": "default", "type": "default", "oper-state": "up"},
+            ]
+        }
+    ]
+    device = _FakeInterfaces(
+        {"subinterface": _SUBITF_RESPONSE, "network-instance": ni_response}
+    )
+
+    rows = {r["NI"]: r for r in device.get_nwi_itf()["nwi_itfs"]}
+
+    assert rows["mac-vrf-100"]["evi"] == "100"
+    assert rows["ipvrf-l3dci"]["evi"] == "2, 3000"
+    # An instance that runs no EVPN has no EVI to show.
+    assert rows["default"]["evi"] == ""
 
 
 def test_get_nwi_itf_records_the_other_network_instance_an_irb_is_in():

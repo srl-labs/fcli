@@ -556,7 +556,7 @@ REPORTS: List[ReportSpec] = [
         resource="routers",
         title="Routers",
         description="EVPN Routers (IP-VRF) grouped by Route-Target with bound MAC-VRFs, "
-        "routed sub-interfaces and VXLAN overlays.",
+        "routed sub-interfaces, virtual ethernet-segments and VXLAN overlays.",
         getter=lambda d: d.get_routers(),
         category="Services",
         surfaces=STREAMING,

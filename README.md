@@ -513,7 +513,7 @@ One registry drives all three surfaces, so a report cannot drift between CLI, MC
 | Interface Stats | `ifstats` | yes | Per-interface rates and error/discard counters |
 | Sub-Interfaces | `subif` | yes | Type, addresses, oper-state |
 | LAGs | `lag` | yes | LAG members and LACP |
-| Network Instances | `ni` | yes | NIs and the interfaces bound to them |
+| Network Instances | `ni` | yes | NIs, their EVPN EVI and the interfaces bound to them |
 | BGP Peers | `bgp-peers` | yes | Session state and per-AF R/A/T |
 | BGP RIB | `bgp-rib -r …` | split per family / EVPN type | RIB-in-post with path attributes |
 | IPv4 / IPv6 RIB | `ipv4-rib`, `ipv6-rib` | yes | Route table with resolved next-hops; `-a` for LPM |
@@ -522,10 +522,10 @@ One registry drives all three surfaces, so a report cannot drift between CLI, MC
 | Routing Policies | `routing-pol` | | Nested policy JSON (`-o json\|yaml` only) |
 | Services | | yes | MAC-VRF and IP-VRF grouped by route-target |
 | Bridge Domains | | yes | MAC-VRFs with access ports, ethernet-segments and VXLAN overlays |
-| Routers | | yes | IP-VRFs with bound MAC-VRFs and overlays |
+| Routers | | yes | IP-VRFs with bound MAC-VRFs, virtual ethernet-segments and overlays |
 | MAC Table | `mac` | yes | Bridge-table MAC entries |
 | IRB Interfaces | `irb` | yes | IRB sub-interfaces and anycast gateways |
-| Ethernet Segments | `es` | yes | ESI, MH mode, DF state |
+| Ethernet Segments | `es` | yes | ESI, MH mode, DF state, EVI of a virtual ES |
 | L2-ES Destinations | `es-dest` | yes | ES destinations in the bridge table |
 | VXLAN Tunnels | `vxlan` | yes | VXLAN interfaces and unicast destinations |
 | LLDP Neighbors | `lldp` | yes | Neighbours per interface |

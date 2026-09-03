@@ -1976,12 +1976,24 @@
     return parts.length === 1 ? parts[0] : `(?:${parts.join("|")})`;
   }
 
-  function jumpToFilteredReport(reportName, niNames, nodeNames) {
+  /** A next-hop cell may be a bare address, a comma list, or `addr/len (indirect)`. */
+  function nextHopMatchPattern(ip) {
+    const text = String(ip || "").trim();
+    if (!text) return "";
+    const e = escapeRegex(text);
+    if (text.includes(":")) {
+      return `(?:^|[^0-9a-f:])${e}(?=$|[^0-9a-f:])`;
+    }
+    return `(?:^|[^0-9])${e}(?=$|[^0-9])`;
+  }
+
+  function jumpToFilteredReport(reportName, niNames, nodeNames, extraFilters) {
     const filters = {};
     const ni = tokenMatchPattern(niNames);
     const nodes = exactMatchPattern(nodeNames);
     if (ni) filters.NI = ni;
     if (nodes) filters.Node = nodes;
+    Object.assign(filters, extraFilters || {});
     state.pendingFilters = { report: reportName, filters };
 
     if (state.report && state.report.name === reportName) {
@@ -2013,6 +2025,57 @@
       jumpToFilteredReport(reportName, niNames, nodeNames);
     });
     return button;
+  }
+
+  function ribReportForAddress(ip) {
+    const text = String(ip || "").trim();
+    if (!text) return "";
+    if (text.includes(":")) return "ipv6_rib";
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) return "ipv4_rib";
+    return "";
+  }
+
+  function jumpToNextHopRib(ip, niName) {
+    const report = ribReportForAddress(ip);
+    const nh = nextHopMatchPattern(ip);
+    if (!report || !nh) return;
+    jumpToFilteredReport(report, niName ? [niName] : [], [], { "next-hop": nh });
+  }
+
+  // A virtual-ES label with its next-hop(s) turned into RIB jumps. The rest of
+  // the label stays text; only `nh: <ip>` is a control, because that address
+  // being active in this IP-VRF is what the segment tracks.
+  function fillVirtualEsLabel(esPill, es, niName) {
+    const match = /\bnh:\s*([^,]+)/.exec(es);
+    if (!match) {
+      esPill.textContent = es;
+      return;
+    }
+    const ips = match[1].trim().split(/\s+/).filter(Boolean);
+    esPill.append(document.createTextNode(es.slice(0, match.index) + "nh: "));
+    ips.forEach((ip, index) => {
+      if (index) esPill.append(document.createTextNode(" "));
+      const report = ribReportForAddress(ip);
+      if (!report) {
+        esPill.append(document.createTextNode(ip));
+        return;
+      }
+      const family = report === "ipv4_rib" ? "IPv4" : "IPv6";
+      const link = document.createElement("a");
+      link.className = "vrf-link";
+      link.href = "#";
+      link.textContent = ip;
+      link.title = niName
+        ? `Show ${family} routes in ${niName} with next-hop ${ip}`
+        : `Show ${family} routes with next-hop ${ip}`;
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        jumpToNextHopRib(ip, niName);
+      });
+      esPill.append(link);
+    });
+    esPill.append(document.createTextNode(es.slice(match.index + match[0].length)));
   }
 
   function reportJumpGroup(buttons) {
@@ -2856,6 +2919,12 @@
             instBadge.textContent = `bgp-instance ${row["BGP Instance"]}`;
             vrfTitle.append(instBadge);
           }
+          if (row["EVI"]) {
+            const eviBadge = document.createElement("span");
+            eviBadge.className = "bd-bgp-inst-badge";
+            eviBadge.textContent = `evi ${row["EVI"]}`;
+            vrfTitle.append(eviBadge);
+          }
 
           const stateSpan = document.createElement("span");
           const instanceAgg = aggregateServiceState([row]);
@@ -2925,7 +2994,11 @@
 
             const pillGroup = document.createElement("div");
             pillGroup.className = "pill-group";
-            routedStr.split(",").forEach((s) => {
+            // Split only where a new interface starts - the state label is what
+            // says one does. An interface addressed in both families lists its
+            // addresses with a comma between them, and splitting on those left
+            // the second address as a pill of its own, with no state to colour.
+            routedStr.split(/,\s*(?=[^\s,]+\s\[)/).forEach((s) => {
               const p = document.createElement("span");
               p.className = "pill";
               applyPillState(p, s);
@@ -2936,7 +3009,41 @@
             details.append(routedRowDiv);
           }
 
-          // 3. VXLAN-interface
+          // 3. Virtual ethernet-segments, matched to this router on its EVI
+          const vesStr = row["Virtual ES"] || "-";
+          if (vesStr !== "-") {
+            const vesRowDiv = document.createElement("div");
+            vesRowDiv.className = "bd-detail-row";
+
+            const label = document.createElement("strong");
+            label.className = "bd-detail-label";
+            label.textContent = "Virtual ES:";
+            vesRowDiv.append(label);
+
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
+            vesStr.split(";").forEach((entry) => {
+              const es = entry.trim();
+              if (!es) return;
+
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
+              const esPill = document.createElement("span");
+              esPill.className = "pill pill-es";
+              const oper = /\boper:\s*(\S+)/.exec(es);
+              const kind = oper ? stateKind(oper[1]) : "";
+              if (kind && kind !== "up") esPill.classList.add(`pill-${kind}`);
+              fillVirtualEsLabel(esPill, es, row["IP-VRF"]);
+
+              line.append(esPill);
+              lines.append(line);
+            });
+            vesRowDiv.append(lines);
+            details.append(vesRowDiv);
+          }
+
+          // 4. VXLAN-interface
           const vxlanStr = row["VXLAN Interface"] || "-";
           if (vxlanStr !== "-") {
             const vxRowDiv = document.createElement("div");

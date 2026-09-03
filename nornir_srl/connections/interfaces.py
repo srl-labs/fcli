@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 import jmespath
 
 from .down_reason import ParentReasons
-from .helpers import as_list, first_payload
+from .helpers import as_list, bgp_evpn_evis, first_payload
 
 
 class NetworkInstanceMixin:
@@ -26,7 +26,7 @@ class NetworkInstanceMixin:
             "path": f"/network-instance[name={nw_instance}]",
             "jmespath": '"network-instance"[].{NI:name,oper:"oper-state",type:type,"router-id":protocols.bgp."router-id",\
                     "vxlan-itf":"vxlan-interface"[].name || `[]` | join(\', \',@), \
-                    "In-RT":"In-RT", "Out-RT":"Out-RT",\
+                    evi:"_evi", "In-RT":"In-RT", "Out-RT":"Out-RT",\
                     itfs: interface[].{Subitf:name,"assoc-ni":"_other_ni","if-oper":"oper-state", "ip-prefix":*.address[]."ip-prefix",\
                         vlan:vlan.encap."single-tagged"."vlan-id", "mtu":"_mtu"}}',
             "datatype": "all",
@@ -89,6 +89,9 @@ class NetworkInstanceMixin:
                             out_rts.append(target.replace("target:", ""))
             ni["In-RT"] = ", ".join(sorted(list(set(in_rts))))
             ni["Out-RT"] = ", ".join(sorted(list(set(out_rts))))
+            # The EVI the service advertises with, which is also what a virtual
+            # ethernet-segment names to say which network-instance it serves.
+            ni["_evi"] = ", ".join(bgp_evpn_evis(ni).values())
 
             for ni_itf in ni.get("interface", []):
                 ni_itf.update(subitf.get(ni_itf["name"], {}))
