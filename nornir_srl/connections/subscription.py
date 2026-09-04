@@ -57,6 +57,9 @@ class GnmiSubscription:
         self._updates: "queue.Queue[Any]" = queue.Queue()
         self._closing = threading.Event()
         self.error: Optional[BaseException] = None
+        self._name = name or "target"
+        #: Notifications received, logged on close to date a silent stream.
+        self._received = 0
 
         self._call = gNMIStub(channel).Subscribe(iter((request,)), metadata=metadata)
         self._reader = threading.Thread(
@@ -69,13 +72,28 @@ class GnmiSubscription:
     def _drain(self) -> None:
         try:
             for message in self._call:
+                self._received += 1
+                if self._received == 1:
+                    logger.debug("%s: first notification received", self._name)
                 self._updates.put(message)
         except grpc.RpcError as exc:
             if not self._closing.is_set():
                 self.error = exc
+            logger.debug(
+                "%s: subscription stream ended after %d notification(s): %s",
+                self._name,
+                self._received,
+                exc,
+            )
             return
         except Exception as exc:  # noqa: BLE001 - surfaced through .error
             self.error = exc
+            logger.debug(
+                "%s: subscription reader failed after %d notification(s): %s",
+                self._name,
+                self._received,
+                exc,
+            )
             return
         if not self._closing.is_set():
             # A stream subscription is not supposed to end on its own; treat it
@@ -100,6 +118,11 @@ class GnmiSubscription:
     def close(self) -> None:
         """Cancel the RPC, freeing the session on the target."""
         self._closing.set()
+        logger.debug(
+            "%s: cancelling subscription after %d notification(s)",
+            self._name,
+            self._received,
+        )
         try:
             self._call.cancel()
         except Exception as exc:  # noqa: BLE001 - best effort teardown

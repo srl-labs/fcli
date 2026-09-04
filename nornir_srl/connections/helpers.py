@@ -28,6 +28,35 @@ def as_list(value: Any) -> List[Any]:
     return [value]
 
 
+def bgp_evpn_evis(ni: Any) -> Dict[str, str]:
+    """The EVI of each ``bgp-evpn`` instance of a network-instance, by instance id.
+
+    The EVI is the service identifier a router or bridge domain advertises its
+    EVPN routes with, and the only thing that ties a virtual ethernet-segment
+    to the network-instance it serves. A DCGW runs two instances with an EVI
+    each, so the id has to be kept alongside.
+    """
+    if not isinstance(ni, dict):
+        return {}
+    protocols = ni.get("protocols")
+    if not isinstance(protocols, dict):
+        return {}
+    bgp_evpn = protocols.get("bgp-evpn")
+    if not isinstance(bgp_evpn, dict):
+        return {}
+    evis: Dict[str, str] = {}
+    for position, inst in enumerate(as_list(bgp_evpn.get("bgp-instance")), start=1):
+        if not isinstance(inst, dict):
+            continue
+        evi = inst.get("evi")
+        if evi is None or str(evi) == "":
+            continue
+        iid = inst.get("id", inst.get("index"))
+        key = str(iid) if iid is not None and str(iid) != "" else str(position)
+        evis[key] = str(evi)
+    return evis
+
+
 def model_version(
     capabilities: Optional[Dict[str, Any]],
     *names: str,

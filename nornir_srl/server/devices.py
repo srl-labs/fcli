@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from ..connections.down_reason import clean_leaf
 from ..connections.ifstats import InterfaceStatsMixin
 from ..connections.interfaces import NetworkInstanceMixin
 from ..connections.layer2 import Layer2Mixin
@@ -138,6 +139,10 @@ class CachedDevice(MixinDevice):
                 {
                     "interface": name,
                     "oper-state": itf.get("oper-state", "-"),
+                    # Why a port is down is what tells an idle interface that is
+                    # meant to be idle - a standby ethernet-segment member -
+                    # from one that is not.
+                    "down-reason": clean_leaf(itf.get("oper-down-reason")),
                     "in-Kbps": round(rates.get("in-octets", 0.0) * 8 / 1000, 1),
                     "out-Kbps": round(rates.get("out-octets", 0.0) * 8 / 1000, 1),
                     "in-pps": round(rates.get("in-packets", 0.0), 1),

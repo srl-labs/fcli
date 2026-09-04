@@ -3,9 +3,16 @@
   "use strict";
 
   const WINDOW_STEP = 250; // rows appended per scroll batch
+
+  // An interface an ethernet-segment holds down on purpose. It reports both
+  // halves of the truth - the port is down, and standby is why - so it is
+  // neither counted as a fault nor read as forwarding.
+  const STANDBY_STATE = "down/standby";
+
   const STATE_CLASSES = {
     up: "state-up",
     down: "state-down",
+    [STANDBY_STATE]: "state-standby",
     enable: "state-enable",
     disable: "state-disable",
     established: "state-established",
@@ -36,6 +43,7 @@
     liveLabel: el("live-label"),
     globalSearch: el("global-search"),
     invFilter: el("inv-filter"),
+    reportParams: el("report-params"),
     clearFiltersBtn: el("clear-filters-btn"),
     filterBadge: el("filter-badge"),
     refresh: el("refresh"),
@@ -120,6 +128,7 @@
     errors: [],
     hidden: new Set(),
     colFilters: new Map(),
+    reportParams: new Map(), // the selected report's own arguments, e.g. the RIB LPM address
     sort: { column: null, dir: 1 },
     windowSize: WINDOW_STEP,
     paused: false,
@@ -234,11 +243,67 @@
     }
   }
 
+  /* ---------------------------------------------------- report arguments */
+
+  // Beyond filtering rows, a report can take arguments of its own: the RIB
+  // reports look up an address and keep the longest prefix matching it, the
+  // way 'fcli ipv4-rib -a' does. The server applies them to the state it is
+  // already streaming, so a change reconnects the stream rather than
+  // re-rendering the rows in hand.
+  function renderReportParams() {
+    dom.reportParams.replaceChildren();
+    const specs = (state.report && state.report.params) || [];
+    dom.reportParams.hidden = !specs.length;
+    for (const spec of specs) {
+      const field = document.createElement("label");
+      field.className = "field";
+
+      const name = document.createElement("span");
+      name.className = "muted";
+      name.textContent = spec.label;
+
+      const input = document.createElement("input");
+      input.className = "input";
+      input.type = "search";
+      input.placeholder = spec.placeholder || "";
+      input.autocomplete = "off";
+      input.spellcheck = false;
+      input.value = state.reportParams.get(spec.name) || "";
+      if (spec.help) input.title = spec.help;
+
+      input.addEventListener("change", () => {
+        const value = input.value.trim();
+        const valid = !value || paramIsValid(spec, value);
+        input.classList.toggle("is-invalid", !valid);
+        input.setAttribute("aria-invalid", valid ? "false" : "true");
+        if (!valid) return;
+        if (value) state.reportParams.set(spec.name, value);
+        else state.reportParams.delete(spec.name);
+        updateFilterUI();
+        connect();
+      });
+
+      field.append(name, input);
+      dom.reportParams.append(field);
+    }
+  }
+
+  // Enough to keep an obvious typo from being sent and answered with a stream
+  // that only ever errors. The server validates for real.
+  function paramIsValid(spec, value) {
+    if (spec.kind !== "address") return true;
+    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(value)) {
+      return value.split(".").every((octet) => Number(octet) <= 255);
+    }
+    return value.includes(":") && /^[0-9a-f:.]+$/i.test(value);
+  }
+
   function updateFilterUI() {
     let count = 0;
     if (dom.globalSearch.value.trim()) count++;
     if (dom.invFilter.value.trim()) count++;
     count += state.colFilters.size;
+    count += state.reportParams.size;
     if (count > 0) {
       dom.clearFiltersBtn.hidden = false;
       dom.filterBadge.textContent = count;
@@ -252,6 +317,8 @@
     dom.globalSearch.value = "";
     dom.invFilter.value = "";
     state.colFilters.clear();
+    state.reportParams.clear();
+    renderReportParams();
     saveReportPreferences();
     updateFilterUI();
     renderHead();
@@ -981,8 +1048,14 @@
 
   function topoHalfClass(link, bps) {
     const parts = ["topo-link"];
-    if (link.state === "down") {
-      parts.push("link-down");
+    // A cable that carries nothing gets no bandwidth colour: a down one has
+    // nothing to forward, and a standby one is not forwarding on purpose -
+    // which is why standby is coloured apart from down rather than red.
+    // The class comes from the kind, because "down/standby" is not a name a
+    // CSS class can carry.
+    const kind = stateKind(link.state);
+    if (kind === "down" || kind === "standby") {
+      parts.push(`link-${kind}`);
       return parts.join(" ");
     }
     parts.push(`link-${link.state}`);
@@ -1571,6 +1644,9 @@
     state.columns = [];
     state.rows = [];
     state.errors = [];
+    // Arguments belong to the report that declared them, and an LPM address
+    // carried into another report would silently empty it.
+    state.reportParams.clear();
     state.sort = { column: null, dir: 1 };
     state.previous.clear();
     state.identityColumn = null;
@@ -1599,6 +1675,7 @@
       applyPendingFilters();
     }
     updateFilterUI();
+    renderReportParams();
     renderReportList();
 
     if (isPanelReport(report.name)) {
@@ -1656,7 +1733,11 @@
       state.source = null;
     }
     if (!state.report || isPanelReport(state.report.name) || state.paused) return;
-    const params = new URLSearchParams({ refresh: dom.refresh.value });
+    const params = new URLSearchParams();
+    // The report's own arguments first: the two the server reads for itself
+    // are its to decide, whatever a report calls its parameters.
+    for (const [name, value] of state.reportParams) params.set(name, value);
+    params.set("refresh", dom.refresh.value);
     const inv = dom.invFilter.value.trim();
     if (inv) params.set("inv_filter", inv);
     const source = new EventSource(
@@ -1895,12 +1976,24 @@
     return parts.length === 1 ? parts[0] : `(?:${parts.join("|")})`;
   }
 
-  function jumpToFilteredReport(reportName, niNames, nodeNames) {
+  /** A next-hop cell may be a bare address, a comma list, or `addr/len (indirect)`. */
+  function nextHopMatchPattern(ip) {
+    const text = String(ip || "").trim();
+    if (!text) return "";
+    const e = escapeRegex(text);
+    if (text.includes(":")) {
+      return `(?:^|[^0-9a-f:])${e}(?=$|[^0-9a-f:])`;
+    }
+    return `(?:^|[^0-9])${e}(?=$|[^0-9])`;
+  }
+
+  function jumpToFilteredReport(reportName, niNames, nodeNames, extraFilters) {
     const filters = {};
     const ni = tokenMatchPattern(niNames);
     const nodes = exactMatchPattern(nodeNames);
     if (ni) filters.NI = ni;
     if (nodes) filters.Node = nodes;
+    Object.assign(filters, extraFilters || {});
     state.pendingFilters = { report: reportName, filters };
 
     if (state.report && state.report.name === reportName) {
@@ -1932,6 +2025,57 @@
       jumpToFilteredReport(reportName, niNames, nodeNames);
     });
     return button;
+  }
+
+  function ribReportForAddress(ip) {
+    const text = String(ip || "").trim();
+    if (!text) return "";
+    if (text.includes(":")) return "ipv6_rib";
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(text)) return "ipv4_rib";
+    return "";
+  }
+
+  function jumpToNextHopRib(ip, niName) {
+    const report = ribReportForAddress(ip);
+    const nh = nextHopMatchPattern(ip);
+    if (!report || !nh) return;
+    jumpToFilteredReport(report, niName ? [niName] : [], [], { "next-hop": nh });
+  }
+
+  // A virtual-ES label with its next-hop(s) turned into RIB jumps. The rest of
+  // the label stays text; only `nh: <ip>` is a control, because that address
+  // being active in this IP-VRF is what the segment tracks.
+  function fillVirtualEsLabel(esPill, es, niName) {
+    const match = /\bnh:\s*([^,]+)/.exec(es);
+    if (!match) {
+      esPill.textContent = es;
+      return;
+    }
+    const ips = match[1].trim().split(/\s+/).filter(Boolean);
+    esPill.append(document.createTextNode(es.slice(0, match.index) + "nh: "));
+    ips.forEach((ip, index) => {
+      if (index) esPill.append(document.createTextNode(" "));
+      const report = ribReportForAddress(ip);
+      if (!report) {
+        esPill.append(document.createTextNode(ip));
+        return;
+      }
+      const family = report === "ipv4_rib" ? "IPv4" : "IPv6";
+      const link = document.createElement("a");
+      link.className = "vrf-link";
+      link.href = "#";
+      link.textContent = ip;
+      link.title = niName
+        ? `Show ${family} routes in ${niName} with next-hop ${ip}`
+        : `Show ${family} routes with next-hop ${ip}`;
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        jumpToNextHopRib(ip, niName);
+      });
+      esPill.append(link);
+    });
+    esPill.append(document.createTextNode(es.slice(match.index + match[0].length)));
   }
 
   function reportJumpGroup(buttons) {
@@ -2025,9 +2169,12 @@
   // Anything that is neither plainly up nor plainly down counts as degraded -
   // notably the "degraded" a service gets when only some of its interfaces are
   // up, which red would put on a par with a service that is entirely gone.
+  // Standby is its own kind: an ethernet-segment holding a port down is intent,
+  // and neither red nor orange is the truth about it.
   function stateKind(state) {
     const st = String(state || "").toLowerCase().trim();
     if (!st) return "";
+    if (st === STANDBY_STATE) return "standby";
     if (UP_STATES.includes(st)) return "up";
     if (DOWN_STATES.includes(st)) return "down";
     return "degraded";
@@ -2053,12 +2200,13 @@
     if (!rows || !rows.length) {
       return { status: "unknown", className: "state-badge-down", badgeText: "UNKNOWN" };
     }
-    const counts = { up: 0, down: 0, degraded: 0 };
+    const counts = { up: 0, down: 0, degraded: 0, standby: 0 };
     for (const row of rows) {
       counts[stateKind(row["Oper State"]) || "degraded"] += 1;
     }
 
-    if (counts.up === rows.length) {
+    // A service standing by on one node is not a service in trouble.
+    if (counts.up + counts.standby === rows.length) {
       return { status: "up", className: "state-badge-up", badgeText: "UP" };
     }
     if (counts.down === rows.length) {
@@ -2439,7 +2587,8 @@
             details.append(irbRowDiv);
           }
 
-          // 2. bridge sub-interfaces
+          // 2. bridge sub-interfaces, each with the ethernet-segment its
+          //    parent port sits on
           const subitfStr = row["Sub-Interfaces"] || "-";
           if (subitfStr !== "-") {
             const subRowDiv = document.createElement("div");
@@ -2450,16 +2599,40 @@
             label.textContent = "bridge sub-interfaces:";
             subRowDiv.append(label);
 
-            const pillGroup = document.createElement("div");
-            pillGroup.className = "pill-group";
-            subitfStr.split(",").forEach((s) => {
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
+            // A line each, so a member and its segment stay side by side:
+            // pairing them up across two lists is what made a bridge domain
+            // with several multi-homed members unreadable.
+            subitfStr.split(";").forEach((entry) => {
+              const [itfText, ...esText] = entry.split("->");
+
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
               const p = document.createElement("span");
               p.className = "pill";
-              applyPillState(p, s);
-              p.textContent = s.trim();
-              pillGroup.append(p);
+              applyPillState(p, itfText);
+              p.textContent = itfText.trim();
+              line.append(p);
+
+              const es = esText.join("->").trim();
+              if (es) {
+                const arrow = document.createElement("span");
+                arrow.className = "pill-arrow";
+                arrow.textContent = "→";
+
+                const esPill = document.createElement("span");
+                esPill.className = "pill pill-es";
+                const oper = /\boper:\s*(\S+)/.exec(es);
+                const kind = oper ? stateKind(oper[1]) : "";
+                if (kind && kind !== "up") esPill.classList.add(`pill-${kind}`);
+                esPill.textContent = es;
+                line.append(arrow, esPill);
+              }
+              lines.append(line);
             });
-            subRowDiv.append(pillGroup);
+            subRowDiv.append(lines);
             details.append(subRowDiv);
           }
 
@@ -2746,6 +2919,12 @@
             instBadge.textContent = `bgp-instance ${row["BGP Instance"]}`;
             vrfTitle.append(instBadge);
           }
+          if (row["EVI"]) {
+            const eviBadge = document.createElement("span");
+            eviBadge.className = "bd-bgp-inst-badge";
+            eviBadge.textContent = `evi ${row["EVI"]}`;
+            vrfTitle.append(eviBadge);
+          }
 
           const stateSpan = document.createElement("span");
           const instanceAgg = aggregateServiceState([row]);
@@ -2815,7 +2994,11 @@
 
             const pillGroup = document.createElement("div");
             pillGroup.className = "pill-group";
-            routedStr.split(",").forEach((s) => {
+            // Split only where a new interface starts - the state label is what
+            // says one does. An interface addressed in both families lists its
+            // addresses with a comma between them, and splitting on those left
+            // the second address as a pill of its own, with no state to colour.
+            routedStr.split(/,\s*(?=[^\s,]+\s\[)/).forEach((s) => {
               const p = document.createElement("span");
               p.className = "pill";
               applyPillState(p, s);
@@ -2826,7 +3009,41 @@
             details.append(routedRowDiv);
           }
 
-          // 3. VXLAN-interface
+          // 3. Virtual ethernet-segments, matched to this router on its EVI
+          const vesStr = row["Virtual ES"] || "-";
+          if (vesStr !== "-") {
+            const vesRowDiv = document.createElement("div");
+            vesRowDiv.className = "bd-detail-row";
+
+            const label = document.createElement("strong");
+            label.className = "bd-detail-label";
+            label.textContent = "Virtual ES:";
+            vesRowDiv.append(label);
+
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
+            vesStr.split(";").forEach((entry) => {
+              const es = entry.trim();
+              if (!es) return;
+
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
+              const esPill = document.createElement("span");
+              esPill.className = "pill pill-es";
+              const oper = /\boper:\s*(\S+)/.exec(es);
+              const kind = oper ? stateKind(oper[1]) : "";
+              if (kind && kind !== "up") esPill.classList.add(`pill-${kind}`);
+              fillVirtualEsLabel(esPill, es, row["IP-VRF"]);
+
+              line.append(esPill);
+              lines.append(line);
+            });
+            vesRowDiv.append(lines);
+            details.append(vesRowDiv);
+          }
+
+          // 4. VXLAN-interface
           const vxlanStr = row["VXLAN Interface"] || "-";
           if (vxlanStr !== "-") {
             const vxRowDiv = document.createElement("div");

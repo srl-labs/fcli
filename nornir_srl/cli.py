@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Callable
 from enum import Enum
 import logging
 import os
+import time
 
 import typer
 import yaml  # type: ignore
@@ -269,6 +270,13 @@ def main(
             raise typer.Exit(1)
         lab_name = topo["name"]
         hosts = clab.srl_hosts(topo)
+        logger.debug(
+            "topology '%s' from %s holds %d SR Linux node(s): %s",
+            lab_name,
+            topo_file,
+            len(hosts),
+            ", ".join(sorted(hosts)),
+        )
         groups = clab.srl_groups(gnmi_port, str(cert_file) if cert_file else None)
         with tempfile.NamedTemporaryFile("w+") as hosts_f:
             yaml.safe_dump(hosts, hosts_f)
@@ -296,12 +304,20 @@ def main(
                 f"Config file '{cfg}' does not exist. Provide -c/--cfg or -t/--topo-file."
             )
             raise typer.Exit(1)
+        logger.debug("initializing Nornir from %s", cfg)
         fabric = InitNornir(config_file=str(cfg))
 
     i_filter = (
         {k: v for k, v in (f.split("=") for f in inv_filter)} if inv_filter else {}
     )
     target: Nornir = fabric.filter(**i_filter) if i_filter else fabric
+    logger.debug(
+        "inventory holds %d node(s), %d selected by filter %s: %s",
+        len(fabric.inventory.hosts),
+        len(target.inventory.hosts),
+        i_filter or "-",
+        ", ".join(sorted(target.inventory.hosts)),
+    )
     ctx.obj["target"] = target
     ctx.obj["i_filter"] = i_filter
     ctx.obj["box_type"] = box_type.upper() if box_type else None
@@ -327,8 +343,25 @@ def run_query(
     ctx: typer.Context, spec: ReportSpec, **params: Any
 ) -> AggregatedResult:
     """Run a report's getter across the filtered inventory."""
-    result = ctx.obj["target"].run(
+    target: Nornir = ctx.obj["target"]
+    logger.debug(
+        "running report '%s' (resource '%s') on %d node(s) with params %s",
+        spec.name,
+        spec.resource,
+        len(target.inventory.hosts),
+        params or "-",
+    )
+    started = time.perf_counter()
+    result = target.run(
         task=_task_for(spec, params), name=spec.resource, raise_on_error=False
+    )
+    logger.debug(
+        "report '%s' finished in %.3fs, %d/%d node(s) failed: %s",
+        spec.name,
+        time.perf_counter() - started,
+        len(result.failed_hosts),
+        len(result),
+        ", ".join(sorted(result.failed_hosts)) or "none",
     )
     logger.debug("Aggregated result for %s: %s", spec.name, result)
     return result

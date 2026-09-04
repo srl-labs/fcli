@@ -11,6 +11,8 @@ import jmespath
 
 from .helpers import as_list, first_payload, lpm, model_version, version_bucket
 
+logger = logging.getLogger(__name__)
+
 # CLI / API aliases (e.g. ``-r l3vpn-v4``) → YANG ``afi-safi-name`` used in paths.
 BGP_RIB_ROUTE_FAM_ALIASES: Dict[str, str] = {
     "l3vpn-v4": "l3vpn-ipv4-unicast",
@@ -493,6 +495,12 @@ class RoutingMixin:
                 except BaseException as e:
                     # Leaves / platforms without IP-VPN have no l3vpn-* RIB path; skip instead of failing.
                     if _gnmi_path_missing(e):
+                        logger.debug(
+                            "%s: no %s RIB on this node, reporting it empty: %s",
+                            getattr(self, "hostname", "?"),
+                            route_fam,
+                            e,
+                        )
                         return {"bgp_rib": []}
                     raise
         else:
@@ -760,6 +768,12 @@ class RoutingMixin:
             paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
         )
         payload = first_payload(resp)
+        if lpm_address:
+            # Narrowing to the matched prefix rewrites the route lists in
+            # place, and what came back can be a payload a cache still holds
+            # on behalf of the renders that want the table in full - as it does
+            # on the server, where one report is rendered both ways at once.
+            payload = copy.deepcopy(payload)
         prefix_key = "ipv4-prefix" if afi == "ipv4-unicast" else "ipv6-prefix"
         for ni in as_list(payload.get("network-instance")):
             afi_table = ni.get("route-table", {}).get(afi) or {}

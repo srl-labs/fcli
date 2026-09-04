@@ -70,6 +70,8 @@ class _FakeInterfaces(NetworkInstanceMixin):
 
     def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
         self._responses = responses
+        #: Every path asked for, so a test can assert one was *not* needed.
+        self.requested: List[str] = []
 
     def get(
         self,
@@ -78,6 +80,7 @@ class _FakeInterfaces(NetworkInstanceMixin):
         strip_mod: Optional[bool] = True,
     ) -> List[Dict[str, Any]]:
         path = paths[0]
+        self.requested.append(path)
         for key, resp in self._responses.items():
             if key in path:
                 return resp
@@ -588,7 +591,7 @@ def test_get_bridge_domains():
     assert bd["Oper State"] == "up"
     assert bd["Subnets"] == "10.1.100.0/24"
     assert bd["IRB Interface"] == "irb1.100 [up]: 10.1.100.1/24 (anycast-gw: true) -> ip-vrf-1"
-    assert bd["Sub-Interfaces"] == "ethernet-1/1.100 [up] (VLAN: 100), ethernet-1/2.100 [up] (VLAN: 100)"
+    assert bd["Sub-Interfaces"] == "ethernet-1/1.100 [up] (VLAN: 100); ethernet-1/2.100 [up] (VLAN: 100)"
     assert bd["VXLAN Interface"] == "vxlan1.100"
     assert bd["Gateway"] == ""
     assert bd["BGP Instance"] == ""
@@ -772,6 +775,658 @@ def test_get_bridge_domains_reports_a_disabled_mac_vrf_from_its_own_view():
         == "irb0.0 [down: net-inst-down]: 172.16.20.254/24 (anycast-gw: true)"
     )
     assert bd["Sub-Interfaces"] == "ethernet-1/3.20 [down: net-inst-down] (VLAN: 20)"
+
+
+def test_get_bridge_domains_does_not_degrade_a_service_for_a_standby_segment():
+    """A standby ethernet-segment member is intent, so the service stays up.
+
+    This is the shape a live all-active-standby fabric produces: the mac-vrf
+    blames the member (``subif-down``), the member blames its port
+    (``port-down``), and only the port says what is really going on. Counting
+    that as down left every multi-homed service permanently degraded on
+    whichever leaf was not forwarding.
+    """
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    network_instances = [
+        {
+            "network-instance": [
+                {
+                    "name": "macvrf-101",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [
+                        {"name": "irb0.101", "oper-state": "up"},
+                        {"name": "lag1.101", "oper-state": "up"},
+                        {
+                            "name": "lag2.101",
+                            "oper-state": "down",
+                            "oper-down-reason": "subif-down",
+                        },
+                    ],
+                }
+            ]
+        }
+    ]
+    subinterfaces = [
+        {
+            "interface": [
+                {"name": "irb0", "subinterface": [{"index": 101, "oper-state": "up"}]},
+                {"name": "lag1", "subinterface": [{"index": 101, "oper-state": "up"}]},
+                {
+                    "name": "lag2",
+                    "subinterface": [
+                        {
+                            "index": 101,
+                            "oper-state": "down",
+                            "oper-down-reason": "port-down",
+                        }
+                    ],
+                },
+            ]
+        }
+    ]
+    parent_reasons = [
+        {
+            "interface": [
+                {"name": "lag2", "oper-down-reason": "standby-signaling"},
+            ]
+        }
+    ]
+
+    dev = _FakeLayer2(
+        {
+            "network-instance": network_instances,
+            "subinterface": subinterfaces,
+            "oper-down-reason": parent_reasons,
+        }
+    )
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+
+    assert bd["Oper State"] == "up"
+    assert bd["Sub-Interfaces"] == (
+        "lag1.101 [up] (VLAN: 101); lag2.101 [down/standby] (VLAN: 101)"
+    )
+
+
+def test_get_bridge_domains_still_degrades_a_service_for_a_real_fault():
+    """The same shape, but the port is down for a reason nobody asked for."""
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    network_instances = [
+        {
+            "network-instance": [
+                {
+                    "name": "macvrf-101",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [
+                        {"name": "lag1.101", "oper-state": "up"},
+                        {
+                            "name": "lag2.101",
+                            "oper-state": "down",
+                            "oper-down-reason": "subif-down",
+                        },
+                    ],
+                }
+            ]
+        }
+    ]
+    subinterfaces = [
+        {
+            "interface": [
+                {"name": "lag1", "subinterface": [{"index": 101, "oper-state": "up"}]},
+                {
+                    "name": "lag2",
+                    "subinterface": [
+                        {
+                            "index": 101,
+                            "oper-state": "down",
+                            "oper-down-reason": "port-down",
+                        }
+                    ],
+                },
+            ]
+        }
+    ]
+    parent_reasons = [
+        {"interface": [{"name": "lag2", "oper-down-reason": "min-links-not-met"}]}
+    ]
+
+    dev = _FakeLayer2(
+        {
+            "network-instance": network_instances,
+            "subinterface": subinterfaces,
+            "oper-down-reason": parent_reasons,
+        }
+    )
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+
+    assert bd["Oper State"] == "degraded"
+    # The reason shown is the port's, not the two that only point at it.
+    assert bd["Sub-Interfaces"] == (
+        "lag1.101 [up] (VLAN: 101); lag2.101 [down: min-links-not-met] (VLAN: 101)"
+    )
+
+
+def _rib_device() -> "_FakeRouting":
+    """A node with three nested prefixes, answering from one fixed payload.
+
+    Like the caches the getter is really served from: the server materializes
+    the streamed state, and an unsubscribed path comes off a short-lived Get
+    cache, both of which hand out state somebody else still needs.
+    """
+    rib = [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "route-table": {
+                        "ipv4-unicast": {
+                            "route": [
+                                {"ipv4-prefix": "10.0.0.0/8", "active": True},
+                                {"ipv4-prefix": "10.1.0.0/16", "active": True},
+                                {"ipv4-prefix": "10.1.1.0/24", "active": True},
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+    ]
+    empty = [{"network-instance": []}]
+    return _FakeRouting(
+        {
+            "ipv4-unicast": rib,
+            "next-hop-group": empty,
+            "next-hop[index=": empty,
+        }
+    )
+
+
+def _prefixes(out: Dict[str, Any]) -> List[str]:
+    return [route["Prefix"] for route in out["ip_rib"][0]["Rib"]]
+
+
+def test_get_rib_narrows_to_the_prefix_an_address_falls_into():
+    """What ``fcli ipv4-rib -a`` shows: the route the node would forward on."""
+    assert _prefixes(_rib_device().get_rib(afi="ipv4-unicast")) == [
+        "10.0.0.0/8",
+        "10.1.0.0/16",
+        "10.1.1.0/24",
+    ]
+    narrowed = _rib_device().get_rib(afi="ipv4-unicast", lpm_address="10.1.1.55")
+    assert _prefixes(narrowed) == ["10.1.1.0/24"]
+
+
+def test_a_rib_lookup_leaves_the_whole_table_for_the_next_caller():
+    """Narrowing must not prune the payload it was handed.
+
+    The route lists are rewritten to narrow them, and the state behind them is
+    not the getter's to keep: the server renders the same report with and
+    without a lookup from state it streams once. Pruning it would empty the
+    table for whoever is watching all of it.
+    """
+    device = _rib_device()
+    device.get_rib(afi="ipv4-unicast", lpm_address="10.1.1.55")
+    assert _prefixes(device.get_rib(afi="ipv4-unicast")) == [
+        "10.0.0.0/8",
+        "10.1.0.0/16",
+        "10.1.1.0/24",
+    ]
+
+
+class _RecordingLayer2:
+    """A Layer2 device that answers by path fragment and remembers what was asked."""
+
+    def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+        self._responses = responses
+        self.requested: List[str] = []
+
+    def get(
+        self,
+        paths: List[str],
+        datatype: Optional[str] = "config",
+        strip_mod: Optional[bool] = True,
+    ) -> List[Dict[str, Any]]:
+        path = paths[0]
+        self.requested.append(path)
+        for key, resp in self._responses.items():
+            if key in path:
+                return resp
+        raise KeyError(f"no scripted response for path {path}")
+
+
+def _es_payload() -> List[Dict[str, Any]]:
+    """One segment on lag1, associated with two mac-vrfs that elect different DFs."""
+
+    def _candidates(*peers: Any) -> Dict[str, Any]:
+        return {
+            "bgp-instance": [
+                {
+                    "computed-designated-forwarder-candidates": {
+                        "designated-forwarder-candidate": [
+                            {"address": address, "designated-forwarder": is_df}
+                            for address, is_df in peers
+                        ]
+                    }
+                }
+            ]
+        }
+
+    return [
+        {
+            "system/network-instance/protocols/evpn/ethernet-segments": {
+                "bgp-instance": [
+                    {
+                        "id": 1,
+                        "ethernet-segment": [
+                            {
+                                "name": "ES-01",
+                                "esi": "00:01:01:00:00:00:66:00:01:01",
+                                "multi-homing-mode": "single-active",
+                                "oper-state": "up",
+                                "interface": [{"ethernet-interface": "lag1"}],
+                                "association": {
+                                    "network-instance": [
+                                        {
+                                            "name": "macvrf-101",
+                                            **_candidates(
+                                                ("10.0.0.1", False), ("10.0.0.2", True)
+                                            ),
+                                        },
+                                        {
+                                            "name": "macvrf-202",
+                                            **_candidates(
+                                                ("10.0.0.1", True), ("10.0.0.2", False)
+                                            ),
+                                        },
+                                    ]
+                                },
+                            }
+                        ],
+                    }
+                ]
+            }
+        }
+    ]
+
+
+def test_get_bridge_domains_names_the_segment_each_member_hangs_off():
+    """Each member carries its own segment, and its own DF election.
+
+    The segment goes on the member's line rather than in a list of its own,
+    because a bridge domain with several multi-homed members leaves the reader
+    pairing up two lists. The peers are the ones elected for this mac-vrf: the
+    DF is chosen per service, so the candidates of the other services on the
+    same segment would say the wrong thing about this one.
+    """
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(_RecordingLayer2, Layer2Mixin):
+        pass
+
+    network_instances = [
+        {
+            "network-instance": [
+                {
+                    "name": "macvrf-101",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [
+                        {"name": "lag1.101", "oper-state": "up"},
+                        {"name": "ethernet-1/3.101", "oper-state": "up"},
+                    ],
+                }
+            ]
+        }
+    ]
+    subinterfaces = [
+        {
+            "interface": [
+                {"name": "lag1", "subinterface": [{"index": 101, "oper-state": "up"}]},
+                {
+                    "name": "ethernet-1/3",
+                    "subinterface": [{"index": 101, "oper-state": "up"}],
+                },
+            ]
+        }
+    ]
+
+    dev = _FakeLayer2(
+        {
+            # Before 'network-instance', which is a fragment of the ES path too.
+            "ethernet-segments": _es_payload(),
+            "network-instance": network_instances,
+            "subinterface": subinterfaces,
+        }
+    )
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+
+    # The single-homed member is left as it was; the ESI loses its longest run
+    # of padding, the way an IPv6 address loses one to '::'.
+    assert bd["Sub-Interfaces"] == (
+        "lag1.101 [up] (VLAN: 101) -> ES: ID: 00:01:01:..:66:00:01:01, ES-01, "
+        "mode: single-active, oper: up, peers: 10.0.0.1 10.0.0.2(DF)"
+        "; ethernet-1/3.101 [up] (VLAN: 101)"
+    )
+
+
+def test_get_bridge_domains_does_not_ask_about_segments_without_access_members():
+    """A bridge domain of nothing but an IRB has no port to be multi-homed on."""
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(_RecordingLayer2, Layer2Mixin):
+        pass
+
+    network_instances = [
+        {
+            "network-instance": [
+                {
+                    "name": "macvrf-101",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [{"name": "irb0.101", "oper-state": "up"}],
+                }
+            ]
+        }
+    ]
+    subinterfaces = [
+        {"interface": [{"name": "irb0", "subinterface": [{"index": 101, "oper-state": "up"}]}]}
+    ]
+
+    dev = _FakeLayer2(
+        {
+            "ethernet-segments": _es_payload(),
+            "network-instance": network_instances,
+            "subinterface": subinterfaces,
+        }
+    )
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+
+    assert bd["Sub-Interfaces"] == "-"
+    assert not [p for p in dev.requested if "ethernet-segments" in p]
+
+
+def _ves_payload() -> List[Dict[str, Any]]:
+    """A virtual segment tied to EVI 2, next to an ordinary port-based one."""
+    return [
+        {
+            "system/network-instance/protocols/evpn/ethernet-segments": {
+                "bgp-instance": [
+                    {
+                        "id": 1,
+                        "ethernet-segment": [
+                            {
+                                "name": "L3-ES-1",
+                                "type": "virtual",
+                                "esi": "01:01:00:00:00:00:00:00:00:00",
+                                "multi-homing-mode": "all-active",
+                                "oper-state": "up",
+                                "next-hop": [
+                                    {
+                                        "l3-next-hop": "10.1.100.254",
+                                        "evi": [{"start": 2}],
+                                    }
+                                ],
+                                "association": {
+                                    "network-instance": [
+                                        {
+                                            "name": "ip-vrf-1",
+                                            "bgp-instance": [{"instance": 1}],
+                                        }
+                                    ]
+                                },
+                            },
+                            {
+                                "name": "ES-01",
+                                "esi": "00:01:01:00:00:00:66:00:01:01",
+                                "multi-homing-mode": "all-active",
+                                "oper-state": "up",
+                                "interface": [{"ethernet-interface": "lag1"}],
+                            },
+                        ],
+                    }
+                ]
+            }
+        }
+    ]
+
+
+def _es_device(responses: Dict[str, List[Dict[str, Any]]]):
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(_RecordingLayer2, Layer2Mixin):
+        pass
+
+    return _FakeLayer2({"features": [{"system/features": ["evpn"]}], **responses})
+
+
+def test_get_es_reports_the_evi_a_virtual_segment_is_tied_to():
+    """A virtual ES has no port, and the EVI under its next-hop names its ip-vrf."""
+    dev = _es_device({"ethernet-segments": _ves_payload()})
+
+    rows = {r["name"]: r for r in dev.get_es()["es"]}
+
+    assert rows["L3-ES-1"]["itf/nh"] == "10.1.100.254"
+    assert rows["L3-ES-1"]["evi"] == "2"
+    # A port-based segment is not tied to a service by an EVI at all.
+    assert rows["ES-01"]["itf/nh"] == "lag1"
+    assert rows["ES-01"]["evi"] == ""
+
+
+def test_get_es_names_the_next_hop_of_each_evi_only_when_they_differ():
+    """Two next-hops tied to the same EVIs read as one EVI list; differing ones do not."""
+    payload = _ves_payload()
+    segment = payload[0][
+        "system/network-instance/protocols/evpn/ethernet-segments"
+    ]["bgp-instance"][0]["ethernet-segment"][0]
+    segment["next-hop"] = [
+        {"l3-next-hop": "10.1.100.254", "evi": [{"start": 2}]},
+        {"l3-next-hop": "10.1.200.254", "evi": [{"start": 2}]},
+    ]
+    dev = _es_device({"ethernet-segments": payload})
+    assert dev.get_es()["es"][0]["evi"] == "2"
+
+    segment["next-hop"][1]["evi"] = [{"start": 3}]
+    dev = _es_device({"ethernet-segments": payload})
+    assert (
+        dev.get_es()["es"][0]["evi"] == "10.1.100.254:2 10.1.200.254:3"
+    )
+
+
+def _routers_device(responses: Dict[str, List[Dict[str, Any]]]):
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, resp: Dict[str, List[Dict[str, Any]]]):
+            self._responses = resp
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    # Responses are matched by path fragment, so callers pass
+    # 'ethernet-segments' ahead of 'network-instance': the ethernet-segments
+    # path contains both.
+    return _FakeLayer2({**responses, "subinterface": [{}]})
+
+
+def _ip_vrf(name: str, evi: Any, rt: str) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "type": "ip-vrf",
+        "oper-state": "up",
+        "protocols": {
+            "bgp-evpn": {"bgp-instance": [{"id": 1, "evi": evi}]},
+            "bgp-vpn": {
+                "bgp-instance": [
+                    {
+                        "id": 1,
+                        "route-target": {
+                            "import-rt": [{"target": rt}],
+                            "export-rt": [{"target": rt}],
+                        },
+                    }
+                ]
+            },
+        },
+    }
+
+
+def test_get_routers_shows_the_virtual_segment_associated_with_it():
+    """A virtual ES belongs to the ip-vrf its association state names.
+
+    There is no port to list it under, so the router is where it has to appear,
+    with the next-hop it tracks: that address being active in this route table
+    is what makes the segment advertise at all.
+    """
+    data = [
+        {
+            "network-instance": [
+                _ip_vrf("ip-vrf-1", 2, "target:65000:2"),
+                _ip_vrf("ip-vrf-9", 9, "target:65000:9"),
+            ]
+        }
+    ]
+    dev = _routers_device(
+        {"ethernet-segments": _ves_payload(), "network-instance": data}
+    )
+
+    rows = {r["IP-VRF"]: r for r in dev.get_routers()["routers"]}
+
+    assert rows["ip-vrf-1"]["EVI"] == "2"
+    assert rows["ip-vrf-1"]["Virtual ES"] == (
+        "ID: 01:01:.., L3-ES-1, nh: 10.1.100.254, mode: all-active, oper: up"
+    )
+    # The segment's association does not name the other router.
+    assert rows["ip-vrf-9"]["EVI"] == "9"
+    assert rows["ip-vrf-9"]["Virtual ES"] == "-"
+
+
+def test_get_routers_takes_the_evi_of_each_gateway_tile_from_its_own_instance():
+    """A DCGW is two tiles, each with the EVI and the segments of its instance."""
+    payload = _ves_payload()
+    payload[0]["system/network-instance/protocols/evpn/ethernet-segments"][
+        "bgp-instance"
+    ][0]["ethernet-segment"][0]["association"]["network-instance"] = [
+        {"name": "ipvrf-l3dci", "bgp-instance": [{"instance": 1}]}
+    ]
+    data = [
+        {
+            "network-instance": [
+                {
+                    "name": "ipvrf-l3dci",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                    "protocols": {
+                        "bgp-evpn": {
+                            "bgp-instance": [
+                                {"id": 1, "evi": 2},
+                                {"id": 2, "evi": 3000},
+                            ]
+                        },
+                        "bgp-vpn": {
+                            "bgp-instance": [
+                                {
+                                    "id": 1,
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:65000:2"}],
+                                        "export-rt": [{"target": "target:65000:2"}],
+                                    },
+                                },
+                                {
+                                    "id": 2,
+                                    "route-target": {
+                                        "import-rt": [{"target": "target:3000:3000"}],
+                                        "export-rt": [{"target": "target:3000:3000"}],
+                                    },
+                                },
+                            ]
+                        },
+                    },
+                }
+            ]
+        }
+    ]
+    dev = _routers_device({"ethernet-segments": payload, "network-instance": data})
+
+    rows = {r["BGP Instance"]: r for r in dev.get_routers()["routers"]}
+
+    assert rows["1"]["EVI"] == "2"
+    assert "L3-ES-1" in rows["1"]["Virtual ES"]
+    # The WAN side of the gateway advertises its own EVI and has no segment.
+    assert rows["2"]["EVI"] == "3000"
+    assert rows["2"]["Virtual ES"] == "-"
+
+
+def test_get_routers_does_not_ask_about_segments_without_bgp_evpn():
+    """An ip-vrf that runs no bgp-evpn cannot be carrying a virtual segment."""
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(_RecordingLayer2, Layer2Mixin):
+        pass
+
+    data = [
+        {
+            "network-instance": [
+                {"name": "ip-vrf-1", "type": "ip-vrf", "oper-state": "up"}
+            ]
+        }
+    ]
+    dev = _FakeLayer2(
+        {
+            "ethernet-segments": _ves_payload(),
+            "network-instance": data,
+            "subinterface": [{}],
+        }
+    )
+
+    row = dev.get_routers()["routers"][0]
+
+    assert row["EVI"] == ""
+    assert row["Virtual ES"] == "-"
+    assert not [p for p in dev.requested if "ethernet-segments" in p]
 
 
 def test_get_routers():
@@ -1380,6 +2035,47 @@ def test_get_nwi_itf_joins_subinterface_details_onto_network_instances():
     assert by_name["irb1.100"]["if-oper"] == "up"
 
 
+def test_get_nwi_itf_reports_the_bgp_evpn_evi_of_each_instance():
+    """The EVI is what a virtual ethernet-segment names to find its network-instance.
+
+    A DCGW runs two bgp-evpn instances with an EVI each, and both belong to the
+    one network-instance the row is about.
+    """
+    ni_response = [
+        {
+            "network-instance": [
+                {
+                    "name": "mac-vrf-100",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "protocols": {"bgp-evpn": {"bgp-instance": [{"id": 1, "evi": 100}]}},
+                },
+                {
+                    "name": "ipvrf-l3dci",
+                    "type": "ip-vrf",
+                    "oper-state": "up",
+                    "protocols": {
+                        "bgp-evpn": {
+                            "bgp-instance": [{"id": 1, "evi": 2}, {"id": 2, "evi": 3000}]
+                        }
+                    },
+                },
+                {"name": "default", "type": "default", "oper-state": "up"},
+            ]
+        }
+    ]
+    device = _FakeInterfaces(
+        {"subinterface": _SUBITF_RESPONSE, "network-instance": ni_response}
+    )
+
+    rows = {r["NI"]: r for r in device.get_nwi_itf()["nwi_itfs"]}
+
+    assert rows["mac-vrf-100"]["evi"] == "100"
+    assert rows["ipvrf-l3dci"]["evi"] == "2, 3000"
+    # An instance that runs no EVPN has no EVI to show.
+    assert rows["default"]["evi"] == ""
+
+
 def test_get_nwi_itf_records_the_other_network_instance_an_irb_is_in():
     """An IRB sits in a mac-vrf and an ip-vrf; each row names the other one."""
     ni_response = [
@@ -1512,6 +2208,87 @@ def test_get_sum_subitf_names_subinterfaces_and_lists_addresses():
 def test_get_sum_subitf_survives_an_empty_response():
     device = _FakeInterfaces({"subinterface": []})
     assert device.get_sum_subitf() == {"subinterface": []}
+
+
+def test_get_sum_subitf_does_not_ask_why_a_port_is_down_when_none_is():
+    """The parent-port reasons cost a Get, so a healthy node must not spend one."""
+    device = _FakeInterfaces({"subinterface": _SUBITF_RESPONSE})
+
+    device.get_sum_subitf()
+
+    assert "oper-down-reason" not in "".join(device.requested)
+
+
+def test_get_sum_subitf_calls_a_standby_subinterface_standby():
+    """``port-down`` is resolved against the port, and standby is not a fault.
+
+    An ethernet-segment holding ``lag2`` in standby leaves every subinterface on
+    it down with ``port-down``, which says nothing on its own.
+    """
+    subinterfaces = [
+        {
+            "interface": [
+                {
+                    "name": "lag2",
+                    "subinterface": [
+                        {
+                            "index": 101,
+                            "oper-state": "down",
+                            "oper-down-reason": "port-down",
+                        }
+                    ],
+                }
+            ]
+        }
+    ]
+    parent_reasons = [
+        {"interface": [{"name": "lag2", "oper-down-reason": "standby-signaling"}]}
+    ]
+    device = _FakeInterfaces(
+        {"subinterface": subinterfaces, "oper-down-reason": parent_reasons}
+    )
+
+    rows = device.get_sum_subitf()["subinterface"]
+    subitf = rows[0]["subitfs"][0]
+
+    assert subitf["Subitf"] == "lag2.101"
+    assert subitf["oper"] == "down/standby"
+    assert subitf["down-reason"] == "standby-signaling"
+
+
+def test_get_sum_subitf_reports_the_root_cause_of_a_real_fault():
+    """A port that is genuinely down still reads as down, with its own reason."""
+    subinterfaces = [
+        {
+            "interface": [
+                {
+                    "name": "ethernet-1/4",
+                    "subinterface": [
+                        {
+                            "index": 0,
+                            "oper-state": "down",
+                            "oper-down-reason": "port-down",
+                        }
+                    ],
+                }
+            ]
+        }
+    ]
+    parent_reasons = [
+        {
+            "interface": [
+                {"name": "ethernet-1/4", "oper-down-reason": "port-admin-disabled"}
+            ]
+        }
+    ]
+    device = _FakeInterfaces(
+        {"subinterface": subinterfaces, "oper-down-reason": parent_reasons}
+    )
+
+    subitf = device.get_sum_subitf()["subinterface"][0]["subitfs"][0]
+
+    assert subitf["oper"] == "down"
+    assert subitf["down-reason"] == "port-admin-disabled"
 
 
 def test_get_arp_and_nd_label_entries_with_the_network_instance():

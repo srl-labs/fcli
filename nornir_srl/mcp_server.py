@@ -508,7 +508,8 @@ def network_instances(
     """Get network instances and their interfaces.
 
     Returns NI name, operational state, type (ip-vrf/mac-vrf/default), router-id,
-    vxlan-interface, import/export RTs, and associated interfaces with IP addresses, VLANs, and MTU.
+    vxlan-interface, the EVPN EVI, import/export RTs, and associated interfaces with
+    IP addresses, VLANs, and MTU.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
@@ -632,8 +633,9 @@ def ethernet_segments(
 ) -> str:
     """Get EVPN Ethernet Segment information.
 
-    Returns ESI, type, multi-homing mode, oper state, interfaces, next-hops,
-    and associated network instances with DF (Designated Forwarder) candidates.
+    Returns ESI, type, multi-homing mode, oper state, interfaces, next-hops, the
+    EVIs a virtual segment is tied to, and associated network instances with DF
+    (Designated Forwarder) candidates.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').

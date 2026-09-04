@@ -264,6 +264,12 @@ class HostStream:
                 added.append(spec)
         if not added:
             return
+        logger.debug(
+            "%s: %d new path(s) to bootstrap: %s",
+            self.name,
+            len(added),
+            ", ".join(s.path for s in added),
+        )
         for spec in added:
             self._bootstrap(spec, self._tree)
         self._dirty.set()
@@ -293,6 +299,10 @@ class HostStream:
             if not _gnmi_path_missing(exc):
                 logger.warning(
                     "%s: bootstrap Get failed for %s: %s", self.name, spec.path, exc
+                )
+            else:
+                logger.debug(
+                    "%s: %s does not exist on this node: %s", self.name, spec.path, exc
                 )
             return False
         # Serve the first render from this response instead of repeating the Get
@@ -343,6 +353,11 @@ class HostStream:
                     envelopes.append(env_path)
             state.streamable = streamable
             if not streamable:
+                logger.debug(
+                    "%s: %s cannot be streamed, serving it from cached Gets",
+                    self.name,
+                    spec.path,
+                )
                 state.envelopes = []
                 state.bootstrapped = False
                 return False
@@ -355,6 +370,10 @@ class HostStream:
                     self._dirty.set()
                 state.envelopes = envelopes
                 state.bootstrapped = True
+            else:
+                logger.debug(
+                    "%s: %s is still empty, leaving it pending", self.name, spec.path
+                )
             return state.bootstrapped
 
     def resync(self) -> None:
@@ -374,6 +393,8 @@ class HostStream:
             ]
         if not specs:
             return
+        logger.debug("%s: resyncing %d path(s)", self.name, len(specs))
+        started = time.time()
         fresh: Dict[str, Any] = {}
         for spec in specs:
             if not self._bootstrap(spec, fresh):
@@ -385,6 +406,12 @@ class HostStream:
         with self._lock:
             self._tree = fresh
         self.last_update = time.time()
+        logger.debug(
+            "%s: resynced %d path(s) in %.3fs",
+            self.name,
+            len(specs),
+            self.last_update - started,
+        )
 
     def _reconcile(self) -> None:
         """Apply pending path-set changes, one restart per burst.
@@ -423,6 +450,7 @@ class HostStream:
                 del self._paths[path]
         if idle:
             logger.info("%s: retired %d idle path(s)", self.name, len(idle))
+            logger.debug("%s: retired %s", self.name, ", ".join(idle))
         return bool(idle)
 
     def _restart(self) -> None:
@@ -435,6 +463,13 @@ class HostStream:
             specs = [
                 s.spec for s in self._paths.values() if s.streamable and s.bootstrapped
             ]
+        logger.debug(
+            "%s: restarting subscription (generation %d) with %d path(s): %s",
+            self.name,
+            generation,
+            len(specs),
+            ", ".join(s.path for s in specs) or "none",
+        )
         self._close_subscription()
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=3)
@@ -546,6 +581,13 @@ class HostStream:
         prefix = update.get("prefix") or ""
         timestamp = update.get("timestamp") or 0
         touched_itfs = set()
+        logger.debug(
+            "%s: notification on %s with %d update(s) and %d delete(s)",
+            self.name,
+            prefix or "/",
+            len(update.get("update") or []),
+            len(update.get("delete") or []),
+        )
         with self._lock:
             self._direct_cache.clear()
             self._failed_gets.clear()
@@ -675,9 +717,22 @@ class HostStream:
         with self._lock:
             cached = self._direct_cache.get(cache_key)
             if cached and now - cached[0] < self.get_ttl:
+                logger.debug(
+                    "%s: serving %s from the %.0fs Get cache (%.1fs old)",
+                    self.name,
+                    path,
+                    self.get_ttl,
+                    now - cached[0],
+                )
                 return cached[1]
             failed = self._failed_gets.get(cache_key)
             if failed and now - failed[0] < self.get_ttl:
+                logger.debug(
+                    "%s: %s failed %.1fs ago, not asking again yet",
+                    self.name,
+                    path,
+                    now - failed[0],
+                )
                 raise failed[1]
         try:
             resp = self._raw_get(path, datatype)
@@ -729,6 +784,12 @@ class HostStream:
                 # services reports read - and counting those as failures is what
                 # left the Nodes pane flashing red on a healthy fabric.
                 if _gnmi_path_missing(exc):
+                    logger.debug(
+                        "%s: %s rejected as unknown, not counted against the node: %s",
+                        self.name,
+                        path,
+                        exc,
+                    )
                     self._failing_since = None
                     self._get_error = None
                     raise

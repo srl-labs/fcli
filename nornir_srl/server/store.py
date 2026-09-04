@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from nornir.core import Nornir
 
+from ..connections.down_reason import STANDBY_STATE, is_intent
 from ..connections.srlinux import CONNECTION_NAME
 from ..connections.layer2 import stamp_underlay_sites
 from ..reports import ReportSpec, SubscriptionSpec, get_report
@@ -57,9 +58,14 @@ class FabricStore:
         self._specs: Dict[Tuple[str, str], List[SubscriptionSpec]] = {}
         #: Why a node could not serve a report, and when that was decided.
         self._activation_errors: Dict[Tuple[str, str], Tuple[float, str]] = {}
-        #: Centralized table cache per (report_name, inv_filter_tuple) -> (timestamp, table)
+        #: Centralized table cache per (report_name, inv_filter, report params)
+        #: -> (timestamp, table)
         self._table_cache: Dict[
-            Tuple[str, Optional[Tuple[Tuple[str, str], ...]]],
+            Tuple[
+                str,
+                Optional[Tuple[Tuple[str, str], ...]],
+                Optional[Tuple[Tuple[str, Any], ...]],
+            ],
             Tuple[float, Dict[str, Any]],
         ] = {}
         #: Timestamp of the most recent fabric state update or topology change.
@@ -94,6 +100,10 @@ class FabricStore:
                     break
         connected = len(self._streams)
         logger.info("connected to %d/%d node(s)", connected, len(hosts))
+        with self._lock:
+            unreachable = sorted(self._connect_errors)
+        if unreachable:
+            logger.debug("not connected: %s", ", ".join(unreachable))
         if self.resync_interval > 0:
             self._resync_thread = threading.Thread(
                 target=self._resync_loop, name="fcli-resync", daemon=True
@@ -107,10 +117,12 @@ class FabricStore:
             return
         with self._lock:
             self._connect_attempts[name] = time.time()
+        logger.debug("%s: opening a gNMI connection", name)
         try:
             device = host.get_connection(CONNECTION_NAME, self.nornir.config)
         except Exception as exc:  # noqa: BLE001 - reported per node in the UI
             logger.warning("%s: connection failed: %s", name, exc)
+            logger.debug("%s: connection failed", name, exc_info=exc)
             with self._lock:
                 self._connect_errors[name] = str(exc)
                 self._last_state_change = time.time()
@@ -132,6 +144,11 @@ class FabricStore:
                     on_update=self._on_host_update,
                 )
                 self._last_state_change = time.time()
+                logger.debug(
+                    "%s: connected, streaming at a %ds sample interval",
+                    name,
+                    self.sample_interval or 15,
+                )
         if stopping:
             try:
                 host.close_connection(CONNECTION_NAME)
@@ -181,6 +198,8 @@ class FabricStore:
                 # once rather than once each.
                 self._connect_attempts[name] = now
                 due.append(name)
+        if due:
+            logger.debug("queued for reconnect: %s", ", ".join(due))
         for name in due:
             host = self.nornir.inventory.hosts.get(name)
             if host is not None:
@@ -393,18 +412,37 @@ class FabricStore:
                 # The reason is often temporary though - the node was rebooting
                 # - so the verdict expires instead of standing for good.
                 if time.time() - failed[0] < self.connect_retry_interval:
+                    logger.debug(
+                        "%s: skipping report '%s', it failed %.0fs ago: %s",
+                        name,
+                        report.name,
+                        time.time() - failed[0],
+                        failed[1],
+                    )
                     return
                 del self._activation_errors[key]
             specs = self._specs.get(key)
         try:
             if specs is None:
+                started = time.perf_counter()
                 specs = self._discover(report, stream)
+                logger.debug(
+                    "%s: report '%s' needs %d path(s), discovered in %.3fs: %s",
+                    name,
+                    report.name,
+                    len(specs),
+                    time.perf_counter() - started,
+                    ", ".join(s.path for s in specs) or "none",
+                )
                 with self._lock:
                     self._specs[key] = specs
             stream.ensure_paths(specs)
         except Exception as exc:  # noqa: BLE001 - reported per node in the UI
             logger.warning(
                 "%s: activating report '%s' failed: %s", name, report.name, exc
+            )
+            logger.debug(
+                "%s: activating report '%s' failed", name, report.name, exc_info=exc
             )
             with self._lock:
                 self._activation_errors[key] = (time.time(), str(exc))
@@ -437,8 +475,15 @@ class FabricStore:
         self,
         report: ReportSpec,
         inv_filter: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Render *report* across the (filtered) inventory from streamed state."""
+        """Render *report* across the (filtered) inventory from streamed state.
+
+        *params* are the report's own arguments, as declared by
+        :attr:`ReportSpec.params`. They only ever narrow what the getter makes
+        of the state already streamed, so they cost no gNMI and never change
+        which paths a node subscribes to.
+        """
         if self._stop.is_set():
             return {
                 "report": report.name,
@@ -456,17 +501,25 @@ class FabricStore:
         self.activate(report, names)
 
         inv_key = tuple(sorted(inv_filter.items())) if inv_filter else None
-        cache_key = (report.name, inv_key)
+        param_key = tuple(sorted((params or {}).items())) or None
+        cache_key = (report.name, inv_key, param_key)
         now = time.time()
         with self._lock:
             cached = self._table_cache.get(cache_key)
             if cached is not None:
                 cached_at, cached_table = cached
                 if (cached_at >= self._last_state_change or (now - cached_at < 0.5)) and not cached_table.get("errors"):
+                    logger.debug(
+                        "report '%s': serving the table cached %.2fs ago",
+                        report.name,
+                        now - cached_at,
+                    )
                     return cached_table
 
         started = time.time()
-        results = list(self._pool.map(lambda n: self._host_rows(report, n), names))
+        results = list(
+            self._pool.map(lambda n: self._host_rows(report, n, params), names)
+        )
 
         columns: List[str] = []
         rows: List[Dict[str, Any]] = []
@@ -504,8 +557,9 @@ class FabricStore:
             "oldest_update": _oldest_update(self._streams_for(names)),
         }
         with self._lock:
-            # The cache is keyed by inventory filter as well as report, and API
-            # clients pick the filter, so the key space has no natural bound.
+            # The cache is keyed by the inventory filter and the report's own
+            # parameters as well as its name, and an API client picks both, so
+            # the key space has no natural bound.
             if (
                 cache_key not in self._table_cache
                 and len(self._table_cache) >= _MAX_CACHED_TABLES
@@ -513,10 +567,24 @@ class FabricStore:
                 oldest = min(self._table_cache, key=lambda k: self._table_cache[k][0])
                 del self._table_cache[oldest]
             self._table_cache[cache_key] = (started, res_table)
+        logger.debug(
+            "report '%s': rendered %d row(s) over %d column(s) from %d node(s) "
+            "in %.1fms, %d node(s) in error%s",
+            report.name,
+            len(clean_rows),
+            len(all_columns),
+            len(names),
+            res_table["render_ms"],
+            len(errors),
+            f" ({', '.join(e['node'] for e in errors)})" if errors else "",
+        )
         return res_table
 
     def _host_rows(
-        self, report: ReportSpec, name: str
+        self,
+        report: ReportSpec,
+        name: str,
+        params: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, List[str], List[Dict[str, Any]], Optional[str], Set[str]]:
         with self._lock:
             stream = self._streams.get(name)
@@ -531,9 +599,11 @@ class FabricStore:
         host = self.nornir.inventory.hosts.get(name)
         node = (host.hostname if host and host.hostname else name) or name
         try:
-            result = report.getter(CachedDevice(stream))
+            result = report.getter(CachedDevice(stream), **(params or {}))
         except Exception as exc:  # noqa: BLE001 - reported per node in the UI
-            logger.debug("%s: report '%s' failed: %s", name, report.name, exc)
+            logger.debug(
+                "%s: report '%s' failed: %s", name, report.name, exc, exc_info=exc
+            )
             return name, [], [], str(exc), set()
         items = (result or {}).get(report.resource) or []
         columns, rows = flatten(node, items)
@@ -744,7 +814,10 @@ def _tally_interfaces(health: _Health, itfs: Any) -> None:
         if not _is_configured(itf, oper_state):
             continue
         health.itf_total += 1
-        if oper_state == "down":
+        # A port an ethernet-segment holds in standby is down because it was
+        # told to be; counting it as a fault puts a permanent red number on a
+        # healthy multi-homed fabric.
+        if oper_state == "down" and not is_intent(itf.get("oper-down-reason")):
             health.itf_down += 1
         stats = itf.get("statistics", {})
         if not isinstance(stats, dict):
@@ -816,7 +889,10 @@ def _effective_state(ni: Dict[str, Any], oper_state: str, itf_states: Dict[str, 
             for itf in attached
             if isinstance(itf, dict) and itf.get("name")
         )
-        if state
+        # A member in standby is counted neither way: an ethernet-segment leaves
+        # the non-forwarding leaf's port down by design, and counting that as
+        # down would degrade every multi-homed service on that node.
+        if state and state != STANDBY_STATE
     ]
     if not states:
         return oper_state
@@ -836,6 +912,8 @@ def _tally_network_instances(health: _Health, nis: Any, itfs: Any) -> None:
         for itf in itfs:
             if isinstance(itf, dict) and itf.get("name"):
                 state = _leaf(itf.get("oper-state"))
+                if state == "down" and is_intent(itf.get("oper-down-reason")):
+                    state = STANDBY_STATE
                 if state:
                     itf_states[str(itf["name"])] = state
     for ni in nis:

@@ -377,6 +377,20 @@ body {
   outline-offset: -1px;
 }
 
+/* A value the report would not accept, left in place to be corrected rather
+   than sent and answered with an error. */
+.input.is-invalid {
+  border-color: var(--err);
+}
+
+/* The arguments the selected report declares, e.g. the RIB LPM address. */
+.report-params {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
 .grow {
   flex: 1 1 220px;
 }
@@ -530,8 +544,11 @@ td.state-down {
   font-weight: 600;
 }
 
+/* 'down/standby' joins these: a port an ethernet-segment holds down is not
+   carrying traffic, but it is not a fault either, so it must not read as red. */
 td.state-disable,
-td.state-inactive {
+td.state-inactive,
+td.state-standby {
   color: var(--muted);
 }
 
@@ -1092,6 +1109,16 @@ th.filtered::after {
   align-items: center;
 }
 
+/* One pill-group per line, for entries that belong together: a bridge
+   sub-interface and the ethernet-segment its port sits on. */
+.pill-lines {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}
+
 .pill {
   background: var(--bg);
   color: var(--text);
@@ -1106,6 +1133,21 @@ th.filtered::after {
   background: rgba(56, 189, 248, 0.15);
   color: #38bdf8;
   border: 1px solid rgba(56, 189, 248, 0.3);
+}
+
+.pill-es {
+  background: rgba(167, 139, 250, 0.15);
+  color: #a78bfa;
+  border: 1px solid rgba(167, 139, 250, 0.3);
+}
+
+.pill-es .vrf-link {
+  color: inherit;
+  text-underline-offset: 2px;
+}
+
+.pill-es .vrf-link:hover {
+  color: #ddd6fe;
 }
 
 .pill-macvrf {
@@ -1130,6 +1172,14 @@ th.filtered::after {
   background: color-mix(in srgb, var(--err) 15%, transparent) !important;
   color: var(--err) !important;
   border: 1px solid color-mix(in srgb, var(--err) 40%, transparent) !important;
+}
+
+/* Down by intent: an ethernet-segment standby port is neither a fault nor
+   forwarding, so it is coloured as neither. */
+.pill-standby {
+  background: color-mix(in srgb, var(--muted) 15%, transparent) !important;
+  color: var(--muted) !important;
+  border: 1px dashed color-mix(in srgb, var(--muted) 45%, transparent) !important;
 }
 
 .pill-arrow {
@@ -1479,6 +1529,13 @@ button.pill-jump:focus-visible {
 
 .topo-link.link-down {
   stroke: var(--err);
+  stroke-dasharray: 5 4;
+}
+
+/* Held down by an ethernet-segment rather than broken: dashed like a down
+   cable, but in the colour of something nobody has to look at. */
+.topo-link.link-standby {
+  stroke: var(--muted);
   stroke-dasharray: 5 4;
 }
 

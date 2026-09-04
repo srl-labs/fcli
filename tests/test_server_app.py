@@ -34,8 +34,14 @@ from .fakes import (
     IFSTATE_RESPONSE,
     IFSTATS_PATH,
     IFSTATS_RESPONSE,
+    IPV4_RIB_PATH,
+    IPV4_RIB_RESPONSE,
     LLDP_PATH,
     LLDP_RESPONSE,
+    NH_PATH,
+    NH_RESPONSE,
+    NHGROUP_PATH,
+    NHGROUP_RESPONSE,
     SYS_INFO_RESPONSES,
     FakeDevice,
     es_response,
@@ -66,6 +72,9 @@ def _responses(name="leaf1"):
         IFSTATS_PATH: IFSTATS_RESPONSE,
         IFSTATE_PATH: IFSTATE_RESPONSE,
         IFADMIN_PATH: IFADMIN_RESPONSE,
+        IPV4_RIB_PATH: IPV4_RIB_RESPONSE,
+        NHGROUP_PATH: NHGROUP_RESPONSE,
+        NH_PATH: NH_RESPONSE,
         "/network-instance[name=*]/protocols/bgp/neighbor": [
             {
                 "network-instance": [
@@ -305,6 +314,52 @@ def test_sys_info_report_uses_multiple_paths(store):
     row = table["rows"][0]
     assert row["type"] == "7220 IXR-D2L"
     assert row["software-version"] == "24.10.1"
+
+
+def test_the_rib_report_is_the_whole_route_table_without_an_address(store):
+    fabric_store, _devices = store
+    table = fabric_store.table(get_report("ipv4_rib"))
+    prefixes = {row["Prefix"] for row in table["rows"]}
+    assert prefixes == {"10.0.0.0/8", "10.1.0.0/16", "10.1.1.0/24"}
+
+
+def test_the_rib_report_narrows_to_the_prefix_an_address_falls_into(store):
+    """The server's answer to the CLI's ``fcli ipv4-rib -a``.
+
+    Of the three nested prefixes the node carries, a lookup keeps the one it
+    would actually forward on.
+    """
+    fabric_store, _devices = store
+    table = fabric_store.table(
+        get_report("ipv4_rib"), None, {"address": "10.1.1.55"}
+    )
+    assert {row["Prefix"] for row in table["rows"]} == {"10.1.1.0/24"}
+    assert table["errors"] == []
+    # Narrowed, not shortened: the route still comes with its next-hop.
+    assert table["rows"][0]["next-hop"] == "10.10.10.1"
+
+
+def test_an_address_in_no_prefix_narrows_the_rib_report_to_nothing(store):
+    fabric_store, _devices = store
+    table = fabric_store.table(get_report("ipv4_rib"), None, {"address": "9.9.9.9"})
+    assert table["rows"] == []
+    assert table["errors"] == []
+
+
+def test_narrowing_the_rib_report_leaves_the_next_render_the_whole_table(store):
+    """One report rendered two ways at once: the lookups must not interfere.
+
+    Every render reads the same streamed state, and two browsers can be
+    watching this report with different addresses, or none.
+    """
+    fabric_store, _devices = store
+    fabric_store.table(get_report("ipv4_rib"), None, {"address": "10.1.1.55"})
+    table = fabric_store.table(get_report("ipv4_rib"))
+    assert {row["Prefix"] for row in table["rows"]} == {
+        "10.0.0.0/8",
+        "10.1.0.0/16",
+        "10.1.1.0/24",
+    }
 
 
 def test_status_lists_subscriptions(store):
@@ -775,6 +830,39 @@ def test_report_endpoint_honours_the_inventory_filter(client):
     assert {row["Node"] for row in table["rows"]} == {"spine1"}
 
 
+def test_report_endpoint_looks_an_address_up_in_the_rib(client):
+    test_client, _devices = client
+    table = test_client.get("/api/report/ipv4_rib?address=10.1.1.55").json()
+    assert {row["Prefix"] for row in table["rows"]} == {"10.1.1.0/24"}
+
+
+def test_report_endpoint_says_why_it_will_not_look_up_a_bad_address(client):
+    """An EventSource cannot read a body, so the browser checks this too - but
+    an API client asking for nonsense gets told, rather than an empty table."""
+    test_client, _devices = client
+    resp = test_client.get("/api/report/ipv4_rib?address=10.1.1.999")
+    assert resp.status_code == 400
+    assert "not an IP address" in resp.json()["error"]
+    assert test_client.get("/api/stream/ipv4_rib?address=nope").status_code == 400
+
+
+def test_reports_endpoint_describes_the_arguments_a_report_takes(client):
+    """All the browser knows about a report's own arguments comes from here."""
+    test_client, _devices = client
+    payload = test_client.get("/api/reports").json()
+    by_name = {r["name"]: r for r in payload["reports"]}
+    assert by_name["ipv4_rib"]["params"] == [
+        {
+            "name": "address",
+            "label": "LPM",
+            "placeholder": "LPM lookup, e.g. 10.0.0.1",
+            "help": "Longest prefix matching this address, per node and route table",
+            "kind": "address",
+        }
+    ]
+    assert by_name["lldp"]["params"] == []
+
+
 def test_unknown_report_is_a_404(client):
     test_client, _devices = client
     assert test_client.get("/api/report/nope").status_code == 404
@@ -1070,4 +1158,30 @@ def test_overview_ignores_admin_disabled_interfaces(store):
     # ethernet-1/3 (admin enable, configured, oper down) is counted as down
     assert data["interfaces"]["down"] == 1
     assert data["interfaces"]["total"] == 3
+
+
+def test_overview_does_not_count_a_standby_port_as_down(store):
+    """An ethernet-segment holding a port in standby is intent, not a fault.
+
+    Counting it put a permanent red 'oper down' number on a healthy
+    multi-homed fabric.
+    """
+    fabric_store, _devices = store
+    stream = list(fabric_store._streams.values())[0]
+
+    def down_count(reason):
+        stream._tree["interface"] = [
+            {"name": "lag1", "admin-state": "enable", "oper-state": "up"},
+            {
+                "name": "lag2",
+                "admin-state": "enable",
+                "oper-state": "down",
+                "oper-down-reason": reason,
+            },
+        ]
+        return fabric_store.overview()["interfaces"]["down"]
+
+    # The same port, down for the same length of time; only the reason differs.
+    assert down_count("standby-signaling") == 0
+    assert down_count("min-links-not-met") == 1
 
