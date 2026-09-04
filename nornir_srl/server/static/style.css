@@ -1604,6 +1604,12 @@ button.pill-jump:focus-visible {
   font-family: var(--mono);
 }
 
+.topo-node-platform {
+  fill: var(--muted);
+  font-size: 9px;
+  font-family: var(--mono);
+}
+
 /* Hovering or selecting a node pushes everything it is not cabled to back. */
 .topo-svg.is-focused .topo-node,
 .topo-svg.is-focused .topo-link-pair {

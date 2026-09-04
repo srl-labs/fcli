@@ -130,6 +130,9 @@ class NodeFacts:
     name: str
     hostname: str = ""
     system_name: str = ""
+    #: Chassis type from ``/platform/chassis``, the same field the sys-info
+    #: report shows as ``type``.
+    platform: str = ""
     site: str = ""
     mac_vrfs: int = 0
     ip_vrfs: int = 0
@@ -168,9 +171,10 @@ def node_facts(
 ) -> NodeFacts:
     """Read one node's contribution out of its streamed state.
 
-    *snapshot* is the ``system``, ``network-instance`` and ``interface`` trees as
-    :meth:`~nornir_srl.server.stream.HostStream.snapshot_roots` returns them. A
-    node with nothing streamed yet yields facts that classify as ``unknown``
+    *snapshot* is the ``system``, ``network-instance``, ``interface`` and
+    ``platform`` trees as
+    :meth:`~nornir_srl.server.stream.HostStream.snapshot_roots` returns them.
+    A node with nothing streamed yet yields facts that classify as ``unknown``
     rather than as a node without services.
     """
     labels = labels or {}
@@ -180,6 +184,7 @@ def node_facts(
         name=name,
         hostname=hostname or name,
         system_name=str(_branch(system, "name").get("host-name") or ""),
+        platform=_chassis_type(snapshot),
         site=str(labels.get("site") or ""),
         connected=connected,
         error=error,
@@ -331,6 +336,7 @@ def _node_payload(node: NodeFacts, role: str, peers: List[str], clients: int) ->
         "label": node.label,
         "role": role,
         "layer": _LAYER_OF.get(role, _LAYER_OF["edge"]),
+        "platform": node.platform,
         "site": node.site,
         "mac_vrfs": node.mac_vrfs,
         "ip_vrfs": node.ip_vrfs,
@@ -1109,6 +1115,12 @@ def _branch(node: Any, *names: str) -> Dict[str, Any]:
             return {}
         node = node.get(name, {})
     return node if isinstance(node, dict) else {}
+
+
+def _chassis_type(snapshot: Dict[str, Any]) -> str:
+    """The chassis type the sys-info report shows, or empty if none streamed."""
+    entries = _as_list(_branch(snapshot, "platform").get("chassis"))
+    return str(entries[0].get("type") or "") if entries else ""
 
 
 def _norm(value: Any) -> str:

@@ -540,11 +540,11 @@
   };
 
   const TOPO = {
-    nodeHeight: 46,
+    nodeHeight: 58,
     minNodeWidth: 96,
     gapX: 26,
     siteGap: 30,
-    rowHeight: 122,
+    rowHeight: 134,
     padLeft: 124, // room for the tier label down the left edge
     padRight: 28,
     padY: 24,
@@ -604,8 +604,12 @@
       let width = 0;
       let site = null;
       const sized = nodes.map((node) => {
-        // Wide enough for whichever of the two lines in the box is the longer.
-        const text = Math.max(node.label.length * 8, topoNodeSub(node).length * 6.2);
+        // Wide enough for whichever of the lines in the box is the longer.
+        const text = Math.max(
+          node.label.length * 8,
+          topoNodeSub(node).length * 6.2,
+          (node.platform || "").length * 6.2
+        );
         const w = Math.max(TOPO.minNodeWidth, text + 28);
         if (width) width += TOPO.gapX;
         if (site !== null && node.site !== site) width += TOPO.siteGap - TOPO.gapX;
@@ -1176,20 +1180,31 @@
       const label = svgEl("text", {
         class: "topo-node-label",
         x: box.cx,
-        y: box.y + 20,
+        y: box.y + 18,
         "text-anchor": "middle",
       });
       label.textContent = node.label;
       const sub = svgEl("text", {
         class: "topo-node-sub",
         x: box.cx,
-        y: box.y + 35,
+        y: box.y + 33,
         "text-anchor": "middle",
       });
       sub.textContent = topoNodeSub(node);
+      cell.append(label, sub);
+      if (node.platform) {
+        const platform = svgEl("text", {
+          class: "topo-node-platform",
+          x: box.cx,
+          y: box.y + 47,
+          "text-anchor": "middle",
+        });
+        platform.textContent = node.platform;
+        cell.append(platform);
+      }
       const title = svgEl("title");
       title.textContent = topoNodeTitle(node);
-      cell.append(label, sub, title);
+      cell.append(title);
       group.append(cell);
     }
     return group;
@@ -1230,6 +1245,7 @@
       return lines.join(" - ");
     }
     if (node.site) lines.push(`site ${node.site}`);
+    if (node.platform) lines.push(node.platform);
     if (node.mac_vrfs || node.ip_vrfs) {
       lines.push(`${node.mac_vrfs} mac-vrf, ${node.ip_vrfs} ip-vrf`);
     }
@@ -1410,6 +1426,7 @@
     }
     const panel = topoDetailShell(node.label, node.name === node.label ? "" : node.name);
     panel.append(topoDetailRow("role", ROLE_LABELS[node.role] || node.role));
+    if (node.platform) panel.append(topoDetailRow("platform", node.platform));
     if (node.site) panel.append(topoDetailRow("site", node.site));
     panel.append(
       topoDetailRow("services", `${node.mac_vrfs} mac-vrf · ${node.ip_vrfs} ip-vrf`)

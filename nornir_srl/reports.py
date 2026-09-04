@@ -329,9 +329,9 @@ REPORTS: List[ReportSpec] = [
         getter=lambda d: {},
         category="Dashboard",
         surfaces=STREAMING,
-        # Every path is read as 'all': 'host-name' and 'type' are config leaves,
-        # which a 'state' Get answers nothing for (see SubscriptionSpec), and the
-        # rest are narrow enough that asking for both costs nothing.
+        # Paths that mix config leaves ('host-name', 'type') are read as 'all':
+        # a 'state' Get answers nothing for those (see SubscriptionSpec). The
+        # chassis type is state-only, the same path the sys-info report uses.
         subscribe=(
             # LLDP gives the cables; the host-name is what a neighbour is
             # advertised under, and the only reliable way back to the inventory.
@@ -341,6 +341,9 @@ REPORTS: List[ReportSpec] = [
                 sample_interval=30,
             ),
             SubscriptionSpec("/system/name/host-name", datatype="all", sample_interval=30),
+            # Chassis type, drawn on each node. Sampled rarely: it does not
+            # change without a hardware swap.
+            SubscriptionSpec("/platform/chassis", datatype="state", sample_interval=60),
             SubscriptionSpec("/interface[name=*]/oper-state", datatype="all", sample_interval=30),
             # Which of the down ports are only standing by, so the cable to a
             # multi-homed client is not drawn from the leaf that is not

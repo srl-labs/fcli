@@ -87,6 +87,7 @@ def _facts(
     instances: Tuple[Dict[str, Any], ...] = (),
     interfaces: Tuple[Dict[str, Any], ...] = (),
     segments: Tuple[Tuple[str, str, str], ...] = (),
+    platform: str = "",
     connected: bool = True,
     egress: Optional[Dict[str, int]] = None,
 ):
@@ -100,6 +101,8 @@ def _facts(
         snapshot["network-instance"] = list(instances)
     if interfaces:
         snapshot["interface"] = list(interfaces)
+    if platform:
+        snapshot["platform"] = {"chassis": {"type": platform}}
     return node_facts(
         f"clab-dc-{name}",
         hostname=f"clab-dc-{name}",
@@ -245,6 +248,27 @@ def test_node_facts_without_state_is_not_a_node_without_services():
     facts = _facts("leaf9")
     assert not facts.has_state
     assert facts.adjacencies == []
+
+
+def test_node_facts_reads_the_chassis_type():
+    facts = _facts("leaf1", host_name="leaf1", platform="7220 IXR-D2L")
+    assert facts.platform == "7220 IXR-D2L"
+
+
+def test_node_facts_reads_chassis_type_from_a_list_entry():
+    facts = node_facts(
+        "leaf1",
+        snapshot={"platform": {"chassis": [{"type": "7220 IXR-D3"}]}},
+    )
+    assert facts.platform == "7220 IXR-D3"
+
+
+def test_topology_carries_the_chassis_type_on_each_node():
+    graph = build_topology(
+        [_facts("leaf1", host_name="leaf1", platform="7220 IXR-D2L", instances=LEAF_SERVICES)]
+    )
+    node = next(n for n in graph["nodes"] if n["label"] == "leaf1")
+    assert node["platform"] == "7220 IXR-D2L"
 
 
 def test_node_facts_leaves_out_the_management_network():

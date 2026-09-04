@@ -956,6 +956,7 @@ def test_topology_subscribes_to_lldp_and_the_services(store):
     assert "/network-instance[name=*]/protocols/bgp-vpn" in registered
     assert "/network-instance[name=*]/interface" in registered
     assert "/system/network-instance/protocols/evpn/ethernet-segments" in registered
+    assert "/platform/chassis" in registered
 
 
 def test_topology_infers_the_tier_from_the_services_of_a_node(store):
@@ -1050,6 +1051,13 @@ def test_topology_keeps_a_node_that_has_streamed_nothing(store):
     graph = fabric_store.topology()
     assert {n["role"] for n in graph["nodes"] if n["name"] in HOSTS} == {"unknown"}
     assert all(n["connected"] for n in graph["nodes"] if n["name"] in HOSTS)
+
+
+def test_topology_exposes_the_chassis_type(store):
+    fabric_store, _devices = store
+    graph = fabric_store.topology()
+    leaf1 = next(n for n in graph["nodes"] if n["name"] == "leaf1")
+    assert leaf1["platform"] == "7220 IXR-D2L"
 
 
 @pytest.mark.anyio

@@ -730,8 +730,13 @@ _OVERVIEW_ROOTS: Tuple[str, ...] = ("interface", "network-instance")
 
 #: Tree roots the topology is inferred from: LLDP and the host-name under
 #: ``system``, the services under ``network-instance``, port states under
-#: ``interface``.
-_TOPOLOGY_ROOTS: Tuple[str, ...] = ("system", "network-instance", "interface")
+#: ``interface``, chassis type under ``platform``.
+_TOPOLOGY_ROOTS: Tuple[str, ...] = (
+    "system",
+    "network-instance",
+    "interface",
+    "platform",
+)
 
 
 def _interface_egress(stream: Optional[HostStream]) -> Dict[str, int]:
