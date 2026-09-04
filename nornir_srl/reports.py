@@ -179,6 +179,10 @@ def coerce_params(report: ReportSpec, raw: Mapping[str, Any]) -> Dict[str, Any]:
         value = spec.coerce(raw.get(spec.name, ""))
         if value is not None:
             params[spec.name] = value
+    if report.resource == "bgp_rib":
+        detail = str(raw.get("detail", "")).strip().lower()
+        if detail in ("1", "true", "yes"):
+            params["detail"] = True
     return params
 
 
@@ -187,8 +191,8 @@ def _bound_bgp_rib(
 ) -> Callable[..., Dict[str, Any]]:
     """A ``bgp_rib`` getter with its address family already chosen."""
 
-    def getter(device: Any) -> Dict[str, Any]:
-        kwargs: Dict[str, Any] = {"route_fam": route_fam, "detail": False}
+    def getter(device: Any, detail: bool = False) -> Dict[str, Any]:
+        kwargs: Dict[str, Any] = {"route_fam": route_fam, "detail": detail}
         if route_type is not None:
             kwargs["route_type"] = route_type
         return device.get_bgp_rib(**kwargs)

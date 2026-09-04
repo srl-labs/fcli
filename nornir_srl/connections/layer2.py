@@ -121,26 +121,28 @@ def _peer_address_sort_key(address: str) -> Tuple[int, Any]:
 
 
 def _bgp_peers_for_ni(ni: Dict[str, Any]) -> str:
-    """BGP neighbors of one network-instance, as ``<addr> UP|DOWN`` tokens."""
+    """BGP neighbors of one network-instance, as ``<local> -> <addr> UP|DOWN`` tokens."""
     protocols = ni.get("protocols")
     if not isinstance(protocols, dict):
         return "-"
     bgp = protocols.get("bgp")
     if not isinstance(bgp, dict):
         return "-"
-    items: List[str] = []
+    items: List[Tuple[str, str]] = []
     for neighbor in as_list(bgp.get("neighbor")):
         if not isinstance(neighbor, dict):
             continue
         addr = neighbor.get("peer-address")
         if not addr:
             continue
+        transport = neighbor.get("transport") or {}
+        local_addr = transport.get("local-address") or "-"
         up = _clean_state(neighbor.get("session-state")) == "established"
-        items.append(f"{addr} {'UP' if up else 'DOWN'}")
+        items.append((addr, f"{local_addr} -> {addr} {'UP' if up else 'DOWN'}"))
     if not items:
         return "-"
-    items.sort(key=lambda label: _peer_address_sort_key(label.rsplit(" ", 1)[0]))
-    return ", ".join(items)
+    items.sort(key=lambda item: _peer_address_sort_key(item[0]))
+    return ", ".join(label for _, label in items)
 
 
 #: Where a node's ethernet-segments live. Read by the ES report, and by the

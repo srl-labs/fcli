@@ -3,6 +3,8 @@
   "use strict";
 
   const WINDOW_STEP = 250; // rows appended per scroll batch
+  const COL_WIDTH_MIN = 56;
+  const COL_WIDTH_DEFAULT = 150;
 
   // An interface an ethernet-segment holds down on purpose. It reports both
   // halves of the truth - the port is down, and standby is why - so it is
@@ -57,7 +59,8 @@
     diffExit: el("diff-exit"),
     columnsBtn: el("columns-btn"),
     columnsMenu: el("columns-menu"),
-    exportBtn: el("export"),
+    exportBtn: el("export-btn"),
+    exportMenu: el("export-menu"),
     errors: el("errors"),
     tableWrap: el("table-wrap"),
     overviewDashboard: el("overview-dashboard"),
@@ -80,6 +83,7 @@
     viewModeBtn: el("view-mode-btn"),
     headRow: el("head-row"),
     filterRow: el("filter-row"),
+    gridCols: el("grid-cols"),
     body: el("grid-body"),
     empty: el("empty"),
     rowCount: el("row-count"),
@@ -136,6 +140,7 @@
     errors: [],
     hidden: new Set(),
     colFilters: new Map(),
+    colWidths: new Map(),
     reportParams: new Map(), // the selected report's own arguments, e.g. the RIB LPM address
     sort: { column: null, dir: 1 },
     windowSize: WINDOW_STEP,
@@ -154,6 +159,7 @@
     topoFabric: null, // the fabric being drawn, or "all"
     collapsedCards: new Set(),
     collapsedNodes: new Set(),
+    collapsedSections: new Set(),
     navStack: [],
     navIndex: -1,
     chatEnabled: false,
@@ -233,6 +239,10 @@
         `fcli-filters-${state.report.name}`,
         JSON.stringify([...state.colFilters.entries()])
       );
+      localStorage.setItem(
+        `fcli-colwidths-${state.report.name}`,
+        JSON.stringify(Object.fromEntries(state.colWidths))
+      );
       localStorage.setItem("fcli-global-search", dom.globalSearch.value);
       localStorage.setItem("fcli-inv-filter", dom.invFilter.value);
       localStorage.setItem("fcli-refresh", dom.refresh.value);
@@ -245,6 +255,7 @@
     if (!state.report || isPanelReport(state.report.name)) return;
     state.hidden.clear();
     state.colFilters.clear();
+    state.colWidths.clear();
     try {
       const hiddenData = localStorage.getItem(`fcli-hidden-${state.report.name}`);
       if (hiddenData) {
@@ -256,6 +267,16 @@
       const filtersData = localStorage.getItem(`fcli-filters-${state.report.name}`);
       if (filtersData) {
         JSON.parse(filtersData).forEach(([col, val]) => state.colFilters.set(col, val));
+      }
+      const widthsData = localStorage.getItem(`fcli-colwidths-${state.report.name}`);
+      if (widthsData) {
+        const parsed = JSON.parse(widthsData);
+        if (parsed && typeof parsed === "object") {
+          for (const [col, width] of Object.entries(parsed)) {
+            const px = Number(width);
+            if (px >= COL_WIDTH_MIN) state.colWidths.set(col, px);
+          }
+        }
       }
     } catch (_err) {
       /* storage unavailable */
@@ -1942,6 +1963,7 @@
     dom.body.replaceChildren();
     dom.headRow.replaceChildren();
     dom.filterRow.replaceChildren();
+    dom.gridCols.replaceChildren();
 
     if (overviewTimer) {
       clearInterval(overviewTimer);
@@ -2085,6 +2107,66 @@
     return state.columns.filter((c) => !state.hidden.has(c));
   }
 
+  function columnWidth(column) {
+    return state.colWidths.get(column) || COL_WIDTH_DEFAULT;
+  }
+
+  function renderColGroup(columns) {
+    dom.gridCols.replaceChildren(
+      ...columns.map((column) => {
+        const col = document.createElement("col");
+        col.style.width = `${columnWidth(column)}px`;
+        col.dataset.column = column;
+        return col;
+      })
+    );
+  }
+
+  let columnResize = null;
+
+  function startColumnResize(event, column) {
+    event.preventDefault();
+    event.stopPropagation();
+    columnResize = {
+      column,
+      startX: event.clientX,
+      startWidth: columnWidth(column),
+    };
+    document.body.classList.add("col-resizing");
+    const onMove = (moveEvent) => {
+      if (!columnResize) return;
+      const delta = moveEvent.clientX - columnResize.startX;
+      const width = Math.max(
+        COL_WIDTH_MIN,
+        Math.round(columnResize.startWidth + delta)
+      );
+      state.colWidths.set(columnResize.column, width);
+      const col = dom.gridCols.querySelector(
+        `col[data-column="${CSS.escape(columnResize.column)}"]`
+      );
+      if (col) col.style.width = `${width}px`;
+    };
+    const onUp = () => {
+      columnResize = null;
+      document.body.classList.remove("col-resizing");
+      saveReportPreferences();
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onUp);
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onUp);
+  }
+
+  function resetColumnWidth(event, column) {
+    event.preventDefault();
+    event.stopPropagation();
+    state.colWidths.delete(column);
+    renderColGroup(visibleColumns());
+    saveReportPreferences();
+  }
+
   function renderHead() {
     const activeEl = document.activeElement;
     const activeColumn = activeEl && activeEl.dataset ? activeEl.dataset.column : null;
@@ -2093,9 +2175,13 @@
 
     dom.headRow.replaceChildren();
     dom.filterRow.replaceChildren();
-    for (const column of visibleColumns()) {
+    const columns = visibleColumns();
+    renderColGroup(columns);
+    for (const column of columns) {
       const th = document.createElement("th");
-      th.textContent = column;
+      const label = document.createElement("span");
+      label.className = "col-label";
+      label.textContent = column;
       if (state.colFilters.has(column)) {
         th.classList.add("filtered");
       }
@@ -2103,9 +2189,16 @@
         const arrow = document.createElement("span");
         arrow.className = "sort-arrow";
         arrow.textContent = state.sort.dir === 1 ? "▲" : "▼";
-        th.append(arrow);
+        label.append(arrow);
       }
-      th.addEventListener("click", () => {
+      const grip = document.createElement("span");
+      grip.className = "col-resize";
+      grip.title = "Drag to resize · double-click to reset";
+      grip.addEventListener("pointerdown", (event) => startColumnResize(event, column));
+      grip.addEventListener("dblclick", (event) => resetColumnWidth(event, column));
+      th.append(label, grip);
+      th.addEventListener("click", (event) => {
+        if (event.target.closest(".col-resize")) return;
         if (state.sort.column === column) {
           state.sort.dir = -state.sort.dir;
         } else {
@@ -2718,6 +2811,19 @@
         if (nodeKey) state.collapsedNodes.delete(nodeKey);
       }
 
+      const parentVrf = targetEl.closest(".bd-vrf");
+      if (parentVrf) {
+        parentVrf.querySelectorAll(".bd-detail-section.is-collapsed").forEach((section) => {
+          section.classList.remove("is-collapsed");
+          const sectionContent = section.querySelector(".bd-detail-section-content");
+          if (sectionContent) sectionContent.hidden = false;
+          const sectionHeader = section.querySelector(".bd-detail-section-header");
+          if (sectionHeader) sectionHeader.setAttribute("aria-expanded", "true");
+          const sectionKey = section.dataset.sectionKey;
+          if (sectionKey) state.collapsedSections.delete(sectionKey);
+        });
+      }
+
       targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
       targetEl.classList.remove("highlight-pulse");
       void targetEl.offsetWidth; // trigger reflow
@@ -2863,6 +2969,63 @@
       jumpToVrf(report, target, node);
     });
     return button;
+  }
+
+  function makeCollapsibleDetailSection(sectionKey, labelText, contentEl) {
+    const isCollapsed = state.collapsedSections.has(sectionKey);
+
+    const section = document.createElement("div");
+    section.className = "bd-detail-section";
+    section.dataset.sectionKey = sectionKey;
+    if (isCollapsed) section.classList.add("is-collapsed");
+
+    const header = document.createElement("div");
+    header.className = "bd-detail-section-header";
+    header.setAttribute("role", "button");
+    header.setAttribute("tabindex", "0");
+    header.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
+
+    const chevron = document.createElement("span");
+    chevron.className = "bd-detail-section-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    chevron.textContent = "▼";
+
+    const label = document.createElement("strong");
+    label.className = "bd-detail-label";
+    label.textContent = labelText;
+
+    header.append(chevron, label);
+
+    const content = document.createElement("div");
+    content.className = "bd-detail-section-content";
+    if (isCollapsed) content.hidden = true;
+    content.append(contentEl);
+
+    const toggle = () => {
+      const collapsed = section.classList.toggle("is-collapsed");
+      content.hidden = collapsed;
+      header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      if (collapsed) {
+        state.collapsedSections.add(sectionKey);
+      } else {
+        state.collapsedSections.delete(sectionKey);
+      }
+    };
+
+    header.addEventListener("click", (e) => {
+      if (e.target.closest("a, button")) return;
+      toggle();
+    });
+
+    header.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggle();
+      }
+    });
+
+    section.append(header, content);
+    return section;
   }
 
   function renderBridgeDomainsCards(rows) {
@@ -3477,6 +3640,13 @@
           const vrfTitle = document.createElement("span");
           vrfTitle.className = "bd-vrf-title";
           vrfTitle.append(vrfName);
+
+          const stateSpan = document.createElement("span");
+          const instanceAgg = aggregateServiceState([row]);
+          stateSpan.className = instanceAgg.className;
+          stateSpan.textContent = row["Oper State"] || instanceAgg.badgeText;
+          vrfTitle.append(stateSpan);
+
           if (row["BGP Instance"]) {
             const instBadge = document.createElement("span");
             instBadge.className = "bd-bgp-inst-badge";
@@ -3490,32 +3660,24 @@
             vrfTitle.append(eviBadge);
           }
 
-          const stateSpan = document.createElement("span");
-          const instanceAgg = aggregateServiceState([row]);
-          stateSpan.className = instanceAgg.className;
-          stateSpan.textContent = row["Oper State"] || instanceAgg.badgeText;
-
-          vrfHeader.append(vrfTitle, stateSpan);
+          vrfHeader.append(vrfTitle);
           vrfDiv.append(vrfHeader);
 
           const details = document.createElement("div");
           details.className = "bd-details";
+          const ipVrfName = row["IP-VRF"] || "-";
+          const sectionPrefix = `${nodeKey}:${ipVrfName}`;
 
           // 1. MAC-VRF's
           const macVrfsStr = row["MAC-VRFs"] || "-";
           if (macVrfsStr !== "-") {
-            const macRowDiv = document.createElement("div");
-            macRowDiv.className = "bd-detail-row";
-
-            const label = document.createElement("strong");
-            label.className = "bd-detail-label";
-            label.textContent = "MAC-VRF's:";
-            macRowDiv.append(label);
-
-            const pillGroup = document.createElement("div");
-            pillGroup.className = "pill-group";
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
             const items = macVrfsStr.split(/,\s*(?=[^\s(]+\s*\()/g);
             items.forEach((itemStr) => {
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
               const p = document.createElement("span");
               p.className = "pill pill-macvrf";
               applyPillState(p, itemStr);
@@ -3539,62 +3701,68 @@
               } else {
                 p.textContent = itemStr.trim();
               }
-              pillGroup.append(p);
+              line.append(p);
+              lines.append(line);
             });
-            macRowDiv.append(pillGroup);
-            details.append(macRowDiv);
+            details.append(
+              makeCollapsibleDetailSection(`${sectionPrefix}:mac-vrfs`, "MAC-VRF's:", lines),
+            );
           }
 
           // 2. Routed interfaces
           const routedStr = row["Routed Interfaces"] || "-";
           if (routedStr !== "-") {
-            const routedRowDiv = document.createElement("div");
-            routedRowDiv.className = "bd-detail-row";
-
-            const label = document.createElement("strong");
-            label.className = "bd-detail-label";
-            label.textContent = "Routed interfaces:";
-            routedRowDiv.append(label);
-
-            const pillGroup = document.createElement("div");
-            pillGroup.className = "pill-group";
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
             // Split only where a new interface starts - the state label is what
             // says one does. An interface addressed in both families lists its
             // addresses with a comma between them, and splitting on those left
             // the second address as a pill of its own, with no state to colour.
             routedStr.split(/,\s*(?=[^\s,]+\s\[)/).forEach((s) => {
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
               const p = document.createElement("span");
               p.className = "pill";
               applyPillState(p, s);
               p.textContent = s.trim();
-              pillGroup.append(p);
+              line.append(p);
+              lines.append(line);
             });
-            routedRowDiv.append(pillGroup);
-            details.append(routedRowDiv);
+            details.append(
+              makeCollapsibleDetailSection(
+                `${sectionPrefix}:routed-interfaces`,
+                "Routed interfaces:",
+                lines,
+              ),
+            );
           }
 
           // 3. BGP peers
           const bgpPeersStr = row["BGP Peers"] || "-";
           if (bgpPeersStr !== "-") {
-            const bgpRowDiv = document.createElement("div");
-            bgpRowDiv.className = "bd-detail-row";
-
-            const label = document.createElement("strong");
-            label.className = "bd-detail-label";
-            label.textContent = "BGP peers:";
-            bgpRowDiv.append(label);
-
-            const pillGroup = document.createElement("div");
-            pillGroup.className = "pill-group";
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
             bgpPeersStr.split(/,\s*/).forEach((itemStr) => {
-              const match = itemStr.trim().match(/^(\S+)\s+(UP|DOWN)$/);
+              const match = itemStr.trim().match(/^(\S+)\s->\s(\S+)\s+(UP|DOWN)$/);
               if (!match) return;
-              const [, peerAddr, peerState] = match;
+              const [, localAddr, peerAddr, peerState] = match;
 
-              const p = document.createElement("span");
-              p.className = "pill";
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
+              const localPill = document.createElement("span");
+              localPill.className = "pill";
+              localPill.textContent = localAddr;
+
+              const arrow = document.createElement("span");
+              arrow.className = "pill-arrow";
+              arrow.textContent = "→";
+
+              const peerPill = document.createElement("span");
+              peerPill.className = "pill";
               const kind = stateKind(peerState);
-              if (kind) p.classList.add(`pill-${kind}`);
+              if (kind) peerPill.classList.add(`pill-${kind}`);
 
               const link = document.createElement("a");
               link.className = "vrf-link";
@@ -3607,24 +3775,18 @@
                 jumpToBgpPeer(nodeName, row["IP-VRF"], peerAddr);
               });
 
-              p.append(link, document.createTextNode(` ${peerState}`));
-              pillGroup.append(p);
+              peerPill.append(link, document.createTextNode(` ${peerState}`));
+              line.append(localPill, arrow, peerPill);
+              lines.append(line);
             });
-            bgpRowDiv.append(pillGroup);
-            details.append(bgpRowDiv);
+            details.append(
+              makeCollapsibleDetailSection(`${sectionPrefix}:bgp-peers`, "BGP peers:", lines),
+            );
           }
 
           // 4. Virtual ethernet-segments, matched to this router on its EVI
           const vesStr = row["Virtual ES"] || "-";
           if (vesStr !== "-") {
-            const vesRowDiv = document.createElement("div");
-            vesRowDiv.className = "bd-detail-row";
-
-            const label = document.createElement("strong");
-            label.className = "bd-detail-label";
-            label.textContent = "Virtual ES:";
-            vesRowDiv.append(label);
-
             const lines = document.createElement("div");
             lines.className = "pill-lines";
             vesStr.split(";").forEach((entry) => {
@@ -3644,31 +3806,33 @@
               line.append(esPill);
               lines.append(line);
             });
-            vesRowDiv.append(lines);
-            details.append(vesRowDiv);
+            details.append(
+              makeCollapsibleDetailSection(`${sectionPrefix}:virtual-es`, "Virtual ES:", lines),
+            );
           }
 
           // 5. VXLAN-interface
           const vxlanStr = row["VXLAN Interface"] || "-";
           if (vxlanStr !== "-") {
-            const vxRowDiv = document.createElement("div");
-            vxRowDiv.className = "bd-detail-row";
-
-            const label = document.createElement("strong");
-            label.className = "bd-detail-label";
-            label.textContent = "VXLAN-interface:";
-            vxRowDiv.append(label);
-
-            const pillGroup = document.createElement("div");
-            pillGroup.className = "pill-group";
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
             vxlanStr.split(",").forEach((v) => {
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
               const p = document.createElement("span");
               p.className = "pill pill-vxlan";
               p.textContent = v.trim();
-              pillGroup.append(p);
+              line.append(p);
+              lines.append(line);
             });
-            vxRowDiv.append(pillGroup);
-            details.append(vxRowDiv);
+            details.append(
+              makeCollapsibleDetailSection(
+                `${sectionPrefix}:vxlan-interface`,
+                "VXLAN-interface:",
+                lines,
+              ),
+            );
           }
 
           vrfDiv.append(details);
@@ -3693,6 +3857,7 @@
     expandBtn.addEventListener("click", () => {
       state.collapsedCards.clear();
       state.collapsedNodes.clear();
+      state.collapsedSections.clear();
       dom.servicesTreeView.querySelectorAll(".bd-card.is-collapsed").forEach((card) => {
         card.classList.remove("is-collapsed");
         const body = card.querySelector(".bd-body");
@@ -3706,6 +3871,13 @@
         if (content) content.hidden = false;
         const title = node.querySelector(".bd-node-title");
         if (title) title.setAttribute("aria-expanded", "true");
+      });
+      dom.servicesTreeView.querySelectorAll(".bd-detail-section.is-collapsed").forEach((section) => {
+        section.classList.remove("is-collapsed");
+        const content = section.querySelector(".bd-detail-section-content");
+        if (content) content.hidden = false;
+        const header = section.querySelector(".bd-detail-section-header");
+        if (header) header.setAttribute("aria-expanded", "true");
       });
     });
 
@@ -3731,6 +3903,15 @@
         if (content) content.hidden = true;
         const title = node.querySelector(".bd-node-title");
         if (title) title.setAttribute("aria-expanded", "false");
+      });
+      dom.servicesTreeView.querySelectorAll(".bd-detail-section").forEach((section) => {
+        const sectionKey = section.dataset.sectionKey;
+        if (sectionKey) state.collapsedSections.add(sectionKey);
+        section.classList.add("is-collapsed");
+        const content = section.querySelector(".bd-detail-section-content");
+        if (content) content.hidden = true;
+        const header = section.querySelector(".bd-detail-section-header");
+        if (header) header.setAttribute("aria-expanded", "false");
       });
     });
 
@@ -3862,23 +4043,71 @@
     dom.rowCount.textContent = `${rows.length} row${plural}${suffix}${windowed}`;
   }
 
-  /* ------------------------------------------------------------- export */
+  async function exportPayload() {
+    return { columns: visibleColumns(), rows: filteredRows() };
+  }
 
-  function exportCsv() {
-    const columns = visibleColumns();
-    const rows = filteredRows();
-    const escape = (value) => {
-      const text = String(value ?? "");
-      return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
-    };
-    const lines = [columns.join(",")];
-    for (const row of rows) lines.push(columns.map((c) => escape(row[c])).join(","));
-    const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+  function downloadText(filename, mime, text) {
+    const blob = new Blob([text], { type: mime });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = (state.report ? state.report.name : "fcli") + ".csv";
+    link.download = filename;
     link.click();
     URL.revokeObjectURL(link.href);
+  }
+
+  function exportMenuButton(text, onClick) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "menu-item";
+    button.textContent = text;
+    button.addEventListener("click", () => {
+      dom.exportMenu.hidden = true;
+      onClick();
+    });
+    return button;
+  }
+
+  function renderExportMenu() {
+    dom.exportMenu.replaceChildren(
+      exportMenuButton("CSV", () => exportReport("csv")),
+      exportMenuButton("JSON", () => exportReport("json")),
+      exportMenuButton("YAML", () => exportReport("yaml"))
+    );
+  }
+
+  async function exportReport(format) {
+    if (!state.report) return;
+    try {
+      const { columns, rows } = await exportPayload();
+      const base = state.report.name;
+      if (format === "csv") {
+        const escape = (value) => {
+          const text = String(value ?? "");
+          return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+        };
+        const lines = [columns.join(",")];
+        for (const row of rows) lines.push(columns.map((c) => escape(row[c])).join(","));
+        downloadText(`${base}.csv`, "text/csv", lines.join("\n"));
+      } else if (format === "json") {
+        downloadText(`${base}.json`, "application/json", JSON.stringify(rows, null, 2));
+      } else {
+        const yaml = rows
+          .map((row) => {
+            const lines = ["-"];
+            for (const column of columns) {
+              const value = row[column];
+              if (value === undefined || value === "") continue;
+              lines.push(`  ${column}: ${JSON.stringify(String(value))}`);
+            }
+            return lines.join("\n");
+          })
+          .join("\n");
+        downloadText(`${base}.yaml`, "text/yaml", yaml);
+      }
+    } catch (err) {
+      showErrors([{ node: "export", error: String(err.message || err) }]);
+    }
   }
 
   /* ---------------------------------------------------------- inventory */
@@ -4265,6 +4494,9 @@
     if (!dom.compareMenu.hidden && !event.target.closest(".menu")) {
       dom.compareMenu.hidden = true;
     }
+    if (!dom.exportMenu.hidden && !event.target.closest(".menu")) {
+      dom.exportMenu.hidden = true;
+    }
   });
 
   dom.compareBtn.addEventListener("click", () => {
@@ -4272,13 +4504,17 @@
     dom.compareMenu.hidden = !opening;
     if (opening) renderCompareMenu();
   });
+  dom.exportBtn.addEventListener("click", () => {
+    const opening = dom.exportMenu.hidden;
+    dom.exportMenu.hidden = !opening;
+    if (opening) renderExportMenu();
+  });
   dom.diffExit.addEventListener("click", () => exitDiff());
   dom.diffSame.addEventListener("change", () => {
     // Same comparison, asked again for the rows it left out.
     if (state.diff) showDiff({ against: state.diff.against, nodes: state.diff.nodes });
   });
 
-  dom.exportBtn.addEventListener("click", exportCsv);
   dom.topoExportDrawio.addEventListener("click", exportTopologyDrawio);
 
   dom.tableWrap.addEventListener("scroll", () => {

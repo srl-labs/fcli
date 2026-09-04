@@ -96,6 +96,14 @@ def test_a_report_that_declares_no_parameters_is_handed_none():
     assert coerce_params(get_report("lldp"), {"address": "10.0.0.1"}) == {}
 
 
+def test_coerce_params_detail_for_bgp_rib_reports():
+    spec = get_report("bgp_rib_evpn_2")
+    assert coerce_params(spec, {"detail": "1"}) == {"detail": True}
+    assert coerce_params(spec, {"detail": "true"}) == {"detail": True}
+    assert coerce_params(spec, {}) == {}
+    assert coerce_params(get_report("ipv4_rib"), {"detail": "1"}) == {}
+
+
 #: Single leaves SR Linux defines as config rather than state.
 CONFIG_LEAVES = frozenset(
     {
@@ -316,3 +324,22 @@ def test_pass_filter_matches_case_insensitive_regexes():
     assert not pass_filter(row, {"oper-state": "up"})
     # Every filter key has to match something.
     assert not pass_filter(row, {"oper-state": "down", "missing": "x"})
+
+
+def test_cli_table_omits_bgp_rib_communities_column():
+    columns = cli._cli_table_columns(
+        "bgp_rib", ["NI", "peer", "communities", "RT", "next-hop"]
+    )
+    assert columns == ["NI", "peer", "RT", "next-hop"]
+    assert cli._cli_table_columns("bgp_peers", ["peer", "communities"]) == [
+        "peer",
+        "communities",
+    ]
+
+
+def test_cli_table_omits_bgp_peers_local_endpoint_columns():
+    columns = cli._cli_table_columns(
+        "bgp_peers",
+        ["peer", "local-address", "local-port", "state", "peer-as"],
+    )
+    assert columns == ["peer", "state", "peer-as"]
