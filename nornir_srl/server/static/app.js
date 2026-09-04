@@ -48,6 +48,13 @@
     filterBadge: el("filter-badge"),
     refresh: el("refresh"),
     pause: el("pause"),
+    compareBtn: el("compare-btn"),
+    compareMenu: el("compare-menu"),
+    diffBar: el("diff-bar"),
+    diffLabel: el("diff-label"),
+    diffCounts: el("diff-counts"),
+    diffSame: el("diff-same"),
+    diffExit: el("diff-exit"),
     columnsBtn: el("columns-btn"),
     columnsMenu: el("columns-menu"),
     exportBtn: el("export"),
@@ -156,6 +163,14 @@
     chatProvider: null,
     chatEffort: null,
     chatWidth: 360,
+    // A comparison replaces the live table while it is on screen: the rows
+    // below are a verdict on two renderings, and a stream pushing fresh ones
+    // over them would be reading as live something that is not.
+    diff: null, // { against, nodes, labels, counts, keyed }
+    snapshots: [],
+    // The containerlab topology this server was started on, when it has a
+    // name. Snapshots of another fabric are marked as such in the menu.
+    fabric: "",
   };
 
   let overviewTimer = null;
@@ -189,6 +204,9 @@
 
   /** Reports the server computes for a panel of their own, not as a table. */
   const isPanelReport = (name) => name === "overview" || name === "topology";
+
+  /** The column a comparison puts its verdict in; matches nornir_srl.diff. */
+  const DIFF_STATUS = "\u00b1";
 
   /** Natural compare, so ethernet-1/10 sorts after ethernet-1/2. */
   const collator = new Intl.Collator(undefined, {
@@ -334,6 +352,7 @@
     const res = await fetch("/api/reports");
     const data = await res.json();
     state.reports = data.reports;
+    state.fabric = data.topo_name || "";
     dom.version.textContent = "v" + data.version;
     if (data.topo_name) {
       if (dom.topoBadge) {
@@ -540,11 +559,11 @@
   };
 
   const TOPO = {
-    nodeHeight: 46,
+    nodeHeight: 58,
     minNodeWidth: 96,
     gapX: 26,
     siteGap: 30,
-    rowHeight: 122,
+    rowHeight: 134,
     padLeft: 124, // room for the tier label down the left edge
     padRight: 28,
     padY: 24,
@@ -604,8 +623,12 @@
       let width = 0;
       let site = null;
       const sized = nodes.map((node) => {
-        // Wide enough for whichever of the two lines in the box is the longer.
-        const text = Math.max(node.label.length * 8, topoNodeSub(node).length * 6.2);
+        // Wide enough for whichever of the lines in the box is the longer.
+        const text = Math.max(
+          node.label.length * 8,
+          topoNodeSub(node).length * 6.2,
+          (node.platform || "").length * 6.2
+        );
         const w = Math.max(TOPO.minNodeWidth, text + 28);
         if (width) width += TOPO.gapX;
         if (site !== null && node.site !== site) width += TOPO.siteGap - TOPO.gapX;
@@ -1176,20 +1199,31 @@
       const label = svgEl("text", {
         class: "topo-node-label",
         x: box.cx,
-        y: box.y + 20,
+        y: box.y + 18,
         "text-anchor": "middle",
       });
       label.textContent = node.label;
       const sub = svgEl("text", {
         class: "topo-node-sub",
         x: box.cx,
-        y: box.y + 35,
+        y: box.y + 33,
         "text-anchor": "middle",
       });
       sub.textContent = topoNodeSub(node);
+      cell.append(label, sub);
+      if (node.platform) {
+        const platform = svgEl("text", {
+          class: "topo-node-platform",
+          x: box.cx,
+          y: box.y + 47,
+          "text-anchor": "middle",
+        });
+        platform.textContent = node.platform;
+        cell.append(platform);
+      }
       const title = svgEl("title");
       title.textContent = topoNodeTitle(node);
-      cell.append(label, sub, title);
+      cell.append(title);
       group.append(cell);
     }
     return group;
@@ -1230,6 +1264,7 @@
       return lines.join(" - ");
     }
     if (node.site) lines.push(`site ${node.site}`);
+    if (node.platform) lines.push(node.platform);
     if (node.mac_vrfs || node.ip_vrfs) {
       lines.push(`${node.mac_vrfs} mac-vrf, ${node.ip_vrfs} ip-vrf`);
     }
@@ -1410,6 +1445,7 @@
     }
     const panel = topoDetailShell(node.label, node.name === node.label ? "" : node.name);
     panel.append(topoDetailRow("role", ROLE_LABELS[node.role] || node.role));
+    if (node.platform) panel.append(topoDetailRow("platform", node.platform));
     if (node.site) panel.append(topoDetailRow("site", node.site));
     panel.append(
       topoDetailRow("services", `${node.mac_vrfs} mac-vrf · ${node.ip_vrfs} ip-vrf`)
@@ -1641,6 +1677,11 @@
       syncCurrentVisit();
     }
     state.report = report;
+    // A comparison belongs to the report it was made of.
+    state.diff = null;
+    state.snapshots = [];
+    dom.diffBar.hidden = true;
+    dom.compareMenu.hidden = true;
     state.columns = [];
     state.rows = [];
     state.errors = [];
@@ -1685,6 +1726,7 @@
       dom.viewModeBtn.hidden = true;
       dom.columnsBtn.hidden = true;
       dom.exportBtn.hidden = true;
+      dom.compareBtn.hidden = true;
       dom.overviewDashboard.hidden = report.name !== "overview";
       dom.topologyView.hidden = report.name !== "topology";
       if (state.source) {
@@ -1705,6 +1747,7 @@
       dom.topologyView.hidden = true;
       dom.columnsBtn.hidden = false;
       dom.exportBtn.hidden = false;
+      dom.compareBtn.hidden = false;
       if (["bridge_domains", "services", "routers"].includes(report.name)) {
         if (!(snap && snap.viewMode)) {
           state.viewMode = localStorage.getItem(`fcli-viewmode-${report.name}`) || "tree";
@@ -1733,13 +1776,11 @@
       state.source = null;
     }
     if (!state.report || isPanelReport(state.report.name) || state.paused) return;
-    const params = new URLSearchParams();
-    // The report's own arguments first: the two the server reads for itself
-    // are its to decide, whatever a report calls its parameters.
-    for (const [name, value] of state.reportParams) params.set(name, value);
+    // A comparison is a verdict on two renderings; a stream pushing a third
+    // over it would present as live something that is not.
+    if (state.diff) return;
+    const params = queryParams();
     params.set("refresh", dom.refresh.value);
-    const inv = dom.invFilter.value.trim();
-    if (inv) params.set("inv_filter", inv);
     const source = new EventSource(
       `/api/stream/${encodeURIComponent(state.report.name)}?${params}`
     );
@@ -1762,6 +1803,7 @@
   }
 
   function ingest(table) {
+    if (state.diff) return; // a stream that outlived the switch to a comparison
     const columnsChanged = table.columns.join(" ") !== state.columns.join(" ");
     state.columns = table.columns;
     state.rows = table.rows;
@@ -1883,6 +1925,278 @@
       });
       label.append(box, document.createTextNode(column));
       dom.columnsMenu.append(label);
+    }
+  }
+
+  /* ------------------------------------------------------------ compare */
+
+  // Two questions, one view: what changed since this fabric was working, and
+  // why does this leaf not look like the one beside it. Both come back as an
+  // ordinary table with a verdict column in front, so nothing here has to know
+  // what report it is looking at.
+
+  /** Whether the report on screen can be compared at all. */
+  const isComparable = (report) =>
+    Boolean(report) && !isPanelReport(report.name);
+
+  function queryParams() {
+    const params = new URLSearchParams();
+    for (const [name, value] of state.reportParams) params.set(name, value);
+    const inv = dom.invFilter.value.trim();
+    if (inv) params.set("inv_filter", inv);
+    return params;
+  }
+
+  async function loadSnapshots() {
+    if (!state.report) return [];
+    try {
+      const res = await fetch(
+        `/api/snapshots?report=${encodeURIComponent(state.report.name)}`
+      );
+      const data = await res.json();
+      state.snapshots = data.snapshots || [];
+    } catch (_err) {
+      state.snapshots = [];
+    }
+    return state.snapshots;
+  }
+
+  function compareMenuButton(text, onClick, { title = "" } = {}) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "menu-item";
+    button.textContent = text;
+    if (title) button.title = title;
+    button.addEventListener("click", () => {
+      dom.compareMenu.hidden = true;
+      onClick();
+    });
+    return button;
+  }
+
+  function compareMenuHeading(text) {
+    const heading = document.createElement("div");
+    heading.className = "menu-heading";
+    heading.textContent = text;
+    return heading;
+  }
+
+  async function renderCompareMenu() {
+    dom.compareMenu.replaceChildren();
+    if (!isComparable(state.report)) {
+      dom.compareMenu.append(compareMenuHeading("Nothing to compare here"));
+      return;
+    }
+
+    dom.compareMenu.append(
+      compareMenuButton("⛁ Save a snapshot of this table", saveSnapshot, {
+        title: "Keep this table as it is now, to compare against later",
+      })
+    );
+
+    const nodes = [...new Set(state.rows.map((row) => String(row.Node ?? "")))]
+      .filter(Boolean)
+      .sort(collator.compare);
+    if (nodes.length >= 2) {
+      dom.compareMenu.append(compareMenuHeading("Compare two nodes"));
+      dom.compareMenu.append(nodePicker(nodes));
+    }
+
+    const snapshots = await loadSnapshots();
+    dom.compareMenu.append(compareMenuHeading("Compare against a snapshot"));
+    if (!snapshots.length) {
+      const empty = document.createElement("div");
+      empty.className = "menu-empty";
+      empty.textContent = "none saved yet";
+      dom.compareMenu.append(empty);
+      return;
+    }
+    for (const snapshot of snapshots) {
+      const row = document.createElement("div");
+      row.className = "menu-row";
+      // One directory holds the snapshots of every fabric, so say which one
+      // this came from before it is clicked rather than only when refused.
+      const elsewhere =
+        snapshot.fabric && state.fabric && snapshot.fabric !== state.fabric;
+      const button = compareMenuButton(
+        `${snapshot.label} · ${snapshot.rows} row(s)`,
+        () => showDiff({ against: snapshot.id }),
+        {
+          title: elsewhere
+            ? `Taken of fabric '${snapshot.fabric}', not this one`
+            : new Date(snapshot.taken_at * 1000).toLocaleString(),
+        }
+      );
+      if (elsewhere) {
+        button.classList.add("menu-item-foreign");
+        const where = document.createElement("span");
+        where.className = "menu-note";
+        where.textContent = snapshot.fabric;
+        button.append(where);
+      }
+      row.append(button);
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "menu-remove";
+      remove.textContent = "✕";
+      remove.title = "Delete this snapshot";
+      remove.addEventListener("click", async (event) => {
+        event.stopPropagation();
+        await fetch(`/api/snapshot/${encodeURIComponent(snapshot.id)}`, {
+          method: "DELETE",
+        });
+        renderCompareMenu();
+      });
+      row.append(remove);
+      dom.compareMenu.append(row);
+    }
+  }
+
+  function nodePicker(nodes) {
+    const wrap = document.createElement("div");
+    wrap.className = "menu-row";
+    const first = document.createElement("select");
+    const second = document.createElement("select");
+    for (const select of [first, second]) {
+      select.className = "input";
+      for (const node of nodes) {
+        const option = document.createElement("option");
+        option.value = node;
+        option.textContent = node;
+        select.append(option);
+      }
+    }
+    first.value = nodes[0];
+    second.value = nodes[1];
+    const go = document.createElement("button");
+    go.type = "button";
+    go.className = "btn";
+    go.textContent = "⇄";
+    go.title = "Compare these two nodes";
+    go.addEventListener("click", () => {
+      dom.compareMenu.hidden = true;
+      if (first.value === second.value) return;
+      showDiff({ nodes: `${first.value},${second.value}` });
+    });
+    wrap.append(first, second, go);
+    return wrap;
+  }
+
+  async function saveSnapshot() {
+    const label = prompt(
+      "Name this snapshot",
+      `${state.report.title} ${new Date().toLocaleTimeString()}`
+    );
+    if (label === null) return;
+    const params = queryParams();
+    if (label.trim()) params.set("label", label.trim());
+    const res = await fetch(
+      `/api/snapshot/${encodeURIComponent(state.report.name)}?${params}`,
+      { method: "POST" }
+    );
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      showErrors([{ node: "snapshot", error: body.error || res.statusText }]);
+      return;
+    }
+    renderCompareMenu();
+  }
+
+  /**
+   * Put a comparison on screen in place of the live table.
+   *
+   * *how* is either ``{against: <snapshot id>}`` or ``{nodes: "a,b"}``, and is
+   * remembered so the same comparison can be re-run when the unchanged rows
+   * are toggled.
+   */
+  async function showDiff(how) {
+    if (!isComparable(state.report)) return;
+    const params = queryParams();
+    if (how.against) params.set("against", how.against);
+    if (how.nodes) params.set("nodes", how.nodes);
+    if (dom.diffSame.checked) params.set("same", "1");
+
+    const res = await fetch(
+      `/api/diff/${encodeURIComponent(state.report.name)}?${params}`
+    );
+    const table = await res.json();
+    if (!res.ok) {
+      showErrors([{ node: "compare", error: table.error || res.statusText }]);
+      return;
+    }
+
+    // The stream would push a live table over the comparison a second later.
+    if (state.source) {
+      state.source.close();
+      state.source = null;
+    }
+    setLive("idle", "comparing");
+
+    state.diff = { ...how, ...(table.diff || {}) };
+    // A comparison has columns of its own - the verdict, and no Node when two
+    // nodes are what is being compared - so nothing is carried over.
+    state.hidden.clear();
+    state.sort = { column: null, dir: 1 };
+    state.previous.clear();
+    state.identityColumn = null;
+    state.firstPaint = true;
+    state.windowSize = WINDOW_STEP;
+    state.columns = table.columns;
+    state.rows = table.rows;
+    state.errors = table.errors || [];
+
+    renderDiffBar();
+    showErrors(state.errors);
+    renderHead();
+    renderColumnsMenu();
+    renderBody();
+    dom.streamInfo.textContent = "comparison, not live";
+    dom.updated.textContent = "compared " + new Date().toLocaleTimeString();
+  }
+
+  function renderDiffBar() {
+    if (!state.diff) {
+      dom.diffBar.hidden = true;
+      return;
+    }
+    const { labels = [], counts = {}, keyed } = state.diff;
+    dom.diffBar.hidden = false;
+    dom.diffLabel.textContent = `${labels[0] ?? "before"} → ${labels[1] ?? "after"}`;
+    const parts = [
+      `${counts.removed ?? 0} gone`,
+      `${counts.added ?? 0} new`,
+    ];
+    // Without key columns a change cannot be told from a row arriving and
+    // another leaving, and saying "0 changed" would be a claim, not a count.
+    if (keyed) parts.splice(1, 0, `${counts.changed ?? 0} changed`);
+    parts.push(`${counts.same ?? 0} unchanged`);
+    dom.diffCounts.textContent = parts.join(" · ");
+    dom.diffCounts.title = keyed
+      ? ""
+      : "This report declares no key columns, so a changed row reads as one gone and one new";
+  }
+
+  /** Leave the comparison and go back to the live table. */
+  function exitDiff({ reconnect = true } = {}) {
+    if (!state.diff) return;
+    state.diff = null;
+    dom.diffBar.hidden = true;
+    state.columns = [];
+    state.rows = [];
+    state.errors = [];
+    state.hidden.clear();
+    state.sort = { column: null, dir: 1 };
+    state.previous.clear();
+    state.identityColumn = null;
+    state.firstPaint = true;
+    dom.body.replaceChildren();
+    dom.headRow.replaceChildren();
+    dom.filterRow.replaceChildren();
+    loadReportPreferences();
+    showErrors([]);
+    if (reconnect) {
+      dom.rowCount.textContent = "loading...";
+      connect();
     }
   }
 
@@ -3176,7 +3490,10 @@
     if (state.report && isPanelReport(state.report.name)) return;
     const rows = filteredRows();
 
+    // The services tree draws a fabric, not a verdict on two of them, so a
+    // comparison is always shown as a table.
     if (
+      !state.diff &&
       state.report &&
       ["bridge_domains", "services", "routers"].includes(state.report.name) &&
       state.viewMode === "tree"
@@ -3204,11 +3521,18 @@
       const key = rowKey(row, identity);
       const previous = state.previous.get(key);
       const tr = document.createElement("tr");
-      if (!state.firstPaint && previous === undefined) tr.className = "added";
+      if (state.diff) {
+        // The verdict of the comparison, not the flash of a live update.
+        tr.className = "diff-" + String(row[DIFF_STATUS] ?? "same");
+      } else if (!state.firstPaint && previous === undefined) {
+        tr.className = "added";
+      }
       for (const column of columns) {
         const value = row[column] ?? "";
         const td = document.createElement("td");
         td.textContent = value;
+        const changes = state.diff ? row["_changes"] : null;
+        if (changes && changes[column]) td.classList.add("diff-cell");
         let stateClass = STATE_CLASSES[String(value).toLowerCase()];
         if (state.report && state.report.name === "bgp_peers" && column.toLowerCase().includes("state")) {
           if (String(value).toLowerCase() === "established") {
@@ -3220,6 +3544,7 @@
         if (stateClass) td.classList.add(stateClass);
         else if (isNumeric(value) && value !== "") td.classList.add("num");
         if (
+          !state.diff &&
           !state.firstPaint &&
           previous !== undefined &&
           previous[column] !== undefined &&
@@ -3646,6 +3971,20 @@
     if (!dom.columnsMenu.hidden && !event.target.closest(".menu")) {
       dom.columnsMenu.hidden = true;
     }
+    if (!dom.compareMenu.hidden && !event.target.closest(".menu")) {
+      dom.compareMenu.hidden = true;
+    }
+  });
+
+  dom.compareBtn.addEventListener("click", () => {
+    const opening = dom.compareMenu.hidden;
+    dom.compareMenu.hidden = !opening;
+    if (opening) renderCompareMenu();
+  });
+  dom.diffExit.addEventListener("click", () => exitDiff());
+  dom.diffSame.addEventListener("change", () => {
+    // Same comparison, asked again for the rows it left out.
+    if (state.diff) showDiff({ against: state.diff.against, nodes: state.diff.nodes });
   });
 
   dom.exportBtn.addEventListener("click", exportCsv);

@@ -109,10 +109,25 @@
           </label>
           <button id="pause" class="btn" type="button">⏸ Pause</button>
           <div class="menu">
+            <button id="compare-btn" class="btn" type="button">⇄ Compare</button>
+            <div id="compare-menu" class="menu-panel" hidden></div>
+          </div>
+          <div class="menu">
             <button id="columns-btn" class="btn" type="button">⚙ Columns</button>
             <div id="columns-menu" class="menu-panel" hidden></div>
           </div>
           <button id="export" class="btn" type="button">⭳ CSV</button>
+        </section>
+
+        <!-- Shown in place of the live table while a comparison is on screen. -->
+        <section id="diff-bar" class="diff-bar" hidden>
+          <span id="diff-label" class="diff-label"></span>
+          <span id="diff-counts" class="diff-counts"></span>
+          <label class="field">
+            <input id="diff-same" type="checkbox" />
+            <span class="muted">show unchanged</span>
+          </label>
+          <button id="diff-exit" class="btn" type="button">✕ Back to live</button>
         </section>
 
         <section id="errors" class="errors" hidden></section>

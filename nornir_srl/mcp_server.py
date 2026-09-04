@@ -36,6 +36,7 @@ from nornir.core import Nornir
 from nornir.core.task import Result, Task
 
 from . import clab
+from .checks import CHECKS, collect_fabric_state, run_checks
 from .connections.srlinux import CONNECTION_NAME
 from .connections.helpers import clean_structured_key
 from .reports import ReportSpec, get_report
@@ -776,6 +777,49 @@ def routing_policies(
             policies.append({"Node": node, "routing-policy": policy})
 
     return json.dumps(policies, indent=2, default=str)
+
+
+@mcp.tool()
+def fabric_checks(
+    check: Optional[str] = None,
+    inv_filter: Optional[str] = None,
+) -> str:
+    """Run the fabric sanity checks and return everything they found.
+
+    The fastest way to find out what is wrong with a fabric. Each check
+    correlates one or more reports across every node at once, so it can see
+    faults a single table cannot: a link only one end reports, two leaves that
+    disagree about the VNI of a service, an ethernet-segment with no designated
+    forwarder. Prefer this over reading the individual reports when the question
+    is 'what is broken', and follow up with the specific report a finding names.
+
+    Returns a JSON list of findings, worst first, each with:
+        Severity: 'error' (the fabric is not doing what it was built to do) or
+            'warning' (legitimate in some fabrics, a fault in most).
+        Check: which check found it. One of: bgp_down, bgp_af_down,
+            bgp_no_routes, itf_down, itf_errors, lldp_one_sided, mtu_mismatch,
+            evpn_service_mismatch, es_df. 'collection' means a report could not
+            be read from a node, so that node went unchecked.
+        Node, Subject, Detail: where it is and what is wrong.
+
+    An empty list means every check passed on every node in scope.
+
+    Args:
+        check: Run only this check, by the name listed above. Omit to run all.
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+    """
+    known = {c.name for c in CHECKS}
+    if check and check not in known:
+        return json.dumps(
+            {"error": f"unknown check '{check}'", "available": sorted(known)}, indent=2
+        )
+    i_filter, _ = _parse_filters(inv_filter, None)
+    nornir = get_nornir()
+    target = nornir.filter(**i_filter) if i_filter else nornir
+    findings = run_checks(collect_fabric_state(target), only=[check] if check else None)
+    return json.dumps([f.as_row() for f in findings], indent=2, default=str)
 
 
 # ---- CLI entry point ----

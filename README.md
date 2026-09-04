@@ -121,7 +121,7 @@ fcli -t topo.clab.yml server
 fcli -t topo.clab.yml -i role=leaf bgp-peers
 ```
 
-Only nodes of kind `srl` / `nokia_srlinux` (or whose image is SR Linux) are inventoried. The topology `prefix` is applied to hostnames the same way containerlab does. Node `labels:` become host data and are the keys `-i` can filter on. TLS uses the lab's CA when `--cert-file` is given; the default gNMI port is 57400 (`--gnmi-port` / `-p` to override, e.g. 57410 for EDA-deployed labs).
+Only nodes of kind `srl` / `nokia_srlinux` (or whose image is SR Linux) are inventoried. The topology `prefix` is applied to hostnames the same way containerlab does. Node `labels:` become host data and are the keys `-i` can filter on. The default gNMI port is 57400 (`--gnmi-port` / `-p` to override, e.g. 57410 for EDA-deployed labs).
 
 ### Nornir config
 
@@ -175,6 +175,25 @@ leafs:
 ```
 
 The certificate is specified once for the `srl` group via `connection_options.srlinux.extras.path_cert`. Host `data:` keys are what `-i` filters on.
+
+### gNMI TLS
+
+gNMI is always TLS, but by default the certificate a node presents is trusted as it comes: nothing tells `fcli` that the thing answering on port 57400 is the node it asked for, so the fabric credentials it sends are only as safe as the path to the node. That is all a freshly deployed containerlab node can offer, so it stays the default for labs.
+
+Point `--cert-file` at the CA that issued the node certificates, and they are verified against it:
+
+```bash
+fcli -c nornir_config.yaml --cert-file root-ca.pem bgp-peers
+```
+
+The same anchor can live in the inventory as `extras.path_cert`, as above. Two flags cover the rest:
+
+| Flag | Effect |
+| --- | --- |
+| `--verify` / `--skip-verify` | Force verification on or off, whatever the inventory says |
+| `--tls-server-name` | Name the certificate is checked against, when it is not the node's hostname |
+
+`--tls-server-name` is what a mismatch needs: SR Linux issues its certificate to a name of its own, which is rarely the address the inventory reaches it on. For mutual TLS, add `path_key` and `path_root` to `extras` alongside `path_cert`.
 
 ## Live server
 
@@ -343,7 +362,10 @@ Options:
   -i, --inv-filter TEXT  inventory filter, e.g. -i site=lab -i role=leaf
   -b, --box-type TEXT    box type of printed table ('python -m rich.box')
   -t, --topo-file PATH   CLAB topology file. Mutually exclusive with -c
-  --cert-file PATH       CLAB certificate file
+  --cert-file PATH       PEM trust anchor for the gNMI certificate of a node
+  --verify/--skip-verify verify that certificate [default: --skip-verify
+                         unless --cert-file is given]
+  --tls-server-name TEXT name to verify it against, if not the hostname
   -p, --gnmi-port        gNMI port [default: 57400]
   -o, --output           table | json | yaml | csv [default: table]
   -l, --log-level        DEBUG | INFO | WARNING | ERROR | CRITICAL

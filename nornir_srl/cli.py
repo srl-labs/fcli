@@ -17,14 +17,16 @@ from rich.box import MINIMAL_DOUBLE_HEAD
 from rich.theme import Theme
 from nornir import InitNornir
 from nornir.core import Nornir
+from nornir.core.inventory import ConnectionOptions
 from nornir.core.task import Result, Task, AggregatedResult
 
 from . import clab
+from .checks import CHECKS, CHECKS_COLUMNS, Finding, collect_fabric_state, run_checks
 from .connections.srlinux import CONNECTION_NAME
 from .connections.routing import BGP_RIB_ROUTE_FAM_ALIASES
 from .connections.helpers import clean_structured_key
 from .reports import ReportSpec, get_report
-from .rows import NodeRows, clean_columns, extract
+from .rows import NodeRows, Row, cell, clean_columns, extract, pass_filter
 from .utils.logging_config import setup_logging
 from . import __version__
 
@@ -59,6 +61,45 @@ NORNIR_DEFAULT_CONFIG = clab.NORNIR_DEFAULT_CONFIG
 
 
 # ------------------------- helpers -------------------------
+
+
+def _apply_tls_options(
+    fabric: Nornir,
+    cert_file: Optional[Path],
+    skip_verify: Optional[bool],
+    tls_server_name: Optional[str],
+) -> None:
+    """Force the TLS settings given on the command line onto every host.
+
+    Nornir resolves an ``extras`` dict from the most specific level that
+    defines one and does not merge across levels, so an inventory carrying any
+    extras of its own would otherwise mask what was asked for here.
+    """
+    overrides: Dict[str, Any] = {}
+    if cert_file:
+        overrides["path_cert"] = str(cert_file)
+    if skip_verify is not None:
+        overrides["skip_verify"] = bool(skip_verify)
+    if tls_server_name:
+        overrides["override"] = tls_server_name
+    if not overrides:
+        return
+    for host in fabric.inventory.hosts.values():
+        resolved = host.get_connection_parameters(CONNECTION_NAME)
+        extras = dict(resolved.extras or {})
+        extras.update(overrides)
+        options = host.connection_options.get(CONNECTION_NAME)
+        if options is None:
+            host.connection_options[CONNECTION_NAME] = ConnectionOptions(
+                hostname=resolved.hostname,
+                port=resolved.port,
+                username=resolved.username,
+                password=resolved.password,
+                platform=resolved.platform,
+                extras=extras,
+            )
+        else:
+            options.extras = extras
 
 
 def _report_failure(resource: str) -> Callable[[str, Optional[BaseException]], None]:
@@ -112,6 +153,8 @@ STYLE_MAP = {
     "bridged": "[blue]",
     "established": "[ok]",
     "active": "[cyan]",
+    "error": "[err]",
+    "warning": "[warn]",
 }
 
 
@@ -230,7 +273,23 @@ def main(
         help="CLAB topology file, mutually exclusive with -c",
     ),
     cert_file: Optional[Path] = typer.Option(
-        None, "--cert-file", exists=True, help="CLAB certificate file"
+        None,
+        "--cert-file",
+        exists=True,
+        help="PEM trust anchor used to verify the gNMI certificate of every node",
+    ),
+    skip_verify: Optional[bool] = typer.Option(
+        None,
+        "--skip-verify/--verify",
+        help=(
+            "Trust the certificate a node presents without verifying it. "
+            "The default when no --cert-file is given"
+        ),
+    ),
+    tls_server_name: Optional[str] = typer.Option(
+        None,
+        "--tls-server-name",
+        help="Name to verify the gNMI certificate against, when it differs from the node's hostname",
     ),
     gnmi_port: int = typer.Option(
         SRL_DEFAULT_GNMI_PORT,
@@ -277,7 +336,12 @@ def main(
             len(hosts),
             ", ".join(sorted(hosts)),
         )
-        groups = clab.srl_groups(gnmi_port, str(cert_file) if cert_file else None)
+        groups = clab.srl_groups(
+            gnmi_port,
+            str(cert_file) if cert_file else None,
+            skip_verify=skip_verify,
+            tls_server_name=tls_server_name,
+        )
         with tempfile.NamedTemporaryFile("w+") as hosts_f:
             yaml.safe_dump(hosts, hosts_f)
             hosts_f.seek(0)
@@ -306,6 +370,7 @@ def main(
             raise typer.Exit(1)
         logger.debug("initializing Nornir from %s", cfg)
         fabric = InitNornir(config_file=str(cfg))
+        _apply_tls_options(fabric, cert_file, skip_verify, tls_server_name)
 
     i_filter = (
         {k: v for k, v in (f.split("=") for f in inv_filter)} if inv_filter else {}
@@ -365,6 +430,104 @@ def run_query(
     )
     logger.debug("Aggregated result for %s: %s", spec.name, result)
     return result
+
+
+def report_table(
+    ctx: typer.Context, spec: ReportSpec, **params: Any
+) -> Dict[str, Any]:
+    """Render a report into the table shape the server and snapshots share.
+
+    The same keys, the same cleaned column names and the same cells the live
+    server produces, so a snapshot taken here compares against one taken there.
+    """
+    result = run_query(ctx, spec, **params)
+    errors: List[Dict[str, str]] = []
+
+    def on_error(node: str, exception: Optional[BaseException]) -> None:
+        errors.append({"node": node, "error": str(exception)})
+
+    raw_columns, per_node = extract(spec.resource, result, on_error=on_error)
+    columns = clean_columns(raw_columns)
+    rows = [
+        {
+            "Node": node.node,
+            **{c: cell(row.values.get(raw)) for c, raw in zip(columns, raw_columns)},
+        }
+        for node in per_node
+        for row in node.rows
+    ]
+    return {
+        "report": spec.name,
+        "title": spec.title,
+        "columns": ["Node"] + columns,
+        "rows": rows,
+        "errors": errors,
+        "nodes": len(per_node),
+        "generated": time.time(),
+    }
+
+
+def print_table_shape(
+    table: Dict[str, Any],
+    *,
+    box_type: Optional[str] = None,
+    output: OutputFormat = OutputFormat.TABLE,
+) -> None:
+    """Print a table in the shape :func:`report_table` returns."""
+    # A comparison of two nodes has no Node column: it is the one thing the
+    # two are guaranteed to disagree about, so it is dropped from the table.
+    grouped = "Node" in table["columns"]
+    columns = [c for c in table["columns"] if c != "Node"]
+    rows = table["rows"]
+    for error in table.get("errors") or []:
+        typer.echo(f"{error['node']}: {error['error']}", err=True)
+    if output != OutputFormat.TABLE:
+        print_structured(columns, rows, output)
+        return
+    per_node: Dict[str, NodeRows] = {}
+    for row in rows:
+        node = str(row.get("Node", "")) if grouped else ""
+        per_node.setdefault(node, NodeRows(node=node)).rows.append(
+            Row({c: row.get(c, "") for c in columns})
+        )
+    print_table(
+        f"[bold]{table['title']}[/bold]",
+        columns,
+        list(per_node.values()),
+        box_type=box_type,
+    )
+
+
+def print_findings(
+    findings: List[Finding],
+    *,
+    box_type: Optional[str] = None,
+    f_filter: Optional[Dict[str, str]] = None,
+    output: OutputFormat = OutputFormat.TABLE,
+) -> None:
+    """Print what the checks found, worst node first."""
+    columns = [c for c in CHECKS_COLUMNS if c != "Node"]
+    rows = [f.as_row() for f in findings]
+    if f_filter:
+        rows = [row for row in rows if pass_filter(row, f_filter)]
+
+    if output != OutputFormat.TABLE:
+        print_structured(columns, rows, output)
+        return
+
+    per_node: Dict[str, NodeRows] = {}
+    for row in rows:
+        node = per_node.setdefault(str(row["Node"]), NodeRows(node=str(row["Node"])))
+        node.rows.append(Row({c: row[c] for c in columns}))
+    if not per_node:
+        Console(theme=TABLE_THEME).print("[ok]No findings.[/ok]")
+        return
+    print_table(
+        f"[bold]Fabric checks[/bold]\n{len(rows)} finding(s) on {len(per_node)} node(s)",
+        columns,
+        list(per_node.values()),
+        box_type=box_type,
+    )
 
 
 def run_report(
@@ -427,6 +590,12 @@ def server(
         help="Stop streaming paths no report has read for this long (seconds); "
         "0 keeps every path subscribed for the lifetime of the server",
     ),
+    snapshot_dir: Optional[Path] = typer.Option(
+        None,
+        "--snapshot-dir",
+        help="Where saved report snapshots are kept "
+        "(default: ~/.local/state/fcli/snapshots)",
+    ),
 ) -> None:
     """Serves live report tables over HTTP, fed by gNMI subscriptions"""
     from .server.app import serve
@@ -449,6 +618,7 @@ def server(
         idle_timeout=idle_timeout,
         log_level=ctx.obj["log_level"],
         topo_name=ctx.obj.get("topo_name"),
+        snapshot_dir=snapshot_dir,
     )
 
 
@@ -713,6 +883,246 @@ def routing_pol(ctx: typer.Context) -> None:
         typer.echo(json.dumps(policies, indent=2, default=str))
     else:
         typer.echo(yaml.safe_dump(policies, default_flow_style=False).rstrip())
+
+
+@app.command()
+def checks(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+    only: Optional[List[str]] = typer.Option(
+        None,
+        "--check",
+        help="Run only this check. Repeatable. Omit to run them all",
+    ),
+) -> None:
+    """Runs the fabric sanity checks and lists what they found"""
+    known = {check.name for check in CHECKS}
+    unknown = sorted(set(only or []) - known)
+    if unknown:
+        typer.echo(
+            f"Unknown check(s): {', '.join(unknown)}. "
+            f"Available: {', '.join(sorted(known))}",
+            err=True,
+        )
+        raise typer.Exit(1)
+
+    state = collect_fabric_state(ctx.obj["target"])
+    findings = run_checks(state, only=only or None)
+    print_findings(
+        findings,
+        box_type=ctx.obj["box_type"],
+        f_filter=(
+            {k: v for k, v in (f.split("=") for f in field_filter)}
+            if field_filter
+            else {}
+        ),
+        output=ctx.obj["output"],
+    )
+    # A fabric with something wrong with it exits non-zero, so this is usable
+    # as the last step of a deployment as well as by hand.
+    if any(f.severity == "error" for f in findings):
+        raise typer.Exit(1)
+
+
+# ------------------------- snapshots and comparison -------------------------
+
+snapshot_app = typer.Typer(
+    name="snapshot",
+    help="Keep a report as it is now, to compare a fabric against later",
+)
+app.add_typer(snapshot_app)
+
+SNAPSHOT_DIR = typer.Option(
+    None,
+    "--snapshot-dir",
+    help="Where snapshots are kept (default: ~/.local/state/fcli/snapshots)",
+)
+
+
+def _snapshot_store(directory: Optional[Path]) -> "SnapshotStore":
+    from .server.snapshots import SnapshotStore
+
+    return SnapshotStore(directory)
+
+
+def _comparable_report(name: str) -> ReportSpec:
+    try:
+        spec = get_report(name.replace("-", "_"))
+    except KeyError:
+        typer.echo(f"Unknown report '{name}'.", err=True)
+        raise typer.Exit(1)
+    if not spec.tabular:
+        typer.echo(f"The {name} report has no table to compare.", err=True)
+        raise typer.Exit(1)
+    return spec
+
+
+@snapshot_app.command("save")
+def snapshot_save(
+    ctx: typer.Context,
+    report: str = typer.Argument(..., help="Report to snapshot, e.g. bgp-peers"),
+    label: str = typer.Option("", "--label", "-n", help="Name this snapshot"),
+    snapshot_dir: Optional[Path] = SNAPSHOT_DIR,
+) -> None:
+    """Renders a report now and keeps it"""
+    spec = _comparable_report(report)
+    table = report_table(ctx, spec)
+    saved = _snapshot_store(snapshot_dir).save(
+        spec.name,
+        table,
+        label=label,
+        inv_filter=ctx.obj["i_filter"],
+        fabric=ctx.obj.get("topo_name") or "",
+        inventory=list(ctx.obj["target"].inventory.hosts),
+    )
+    typer.echo(
+        f"{saved.id}  {saved.label}  "
+        f"{len(table['rows'])} row(s) from {table['nodes']} node(s)"
+    )
+
+
+@snapshot_app.command("list")
+def snapshot_list(
+    ctx: typer.Context,
+    report: Optional[str] = typer.Argument(None, help="Only snapshots of this report"),
+    snapshot_dir: Optional[Path] = SNAPSHOT_DIR,
+) -> None:
+    """Lists the snapshots saved so far, newest first"""
+    name = _comparable_report(report).name if report else None
+    saved = _snapshot_store(snapshot_dir).list(name)
+    if ctx.obj["output"] != OutputFormat.TABLE:
+        print_structured(
+            ["report", "fabric", "label", "taken", "rows", "inv-filter"],
+            [
+                {
+                    "Node": "-",
+                    "report": s.report,
+                    "fabric": s.fabric,
+                    "label": s.label,
+                    "taken": s.taken_at,
+                    "rows": s.as_dict()["rows"],
+                    "inv-filter": s.inv_filter,
+                    "id": s.id,
+                }
+                for s in saved
+            ],
+            ctx.obj["output"],
+        )
+        return
+    if not saved:
+        typer.echo("No snapshots.")
+        return
+    # One directory holds the snapshots of every fabric, so which one each was
+    # taken of belongs in the listing rather than only in the refusal.
+    here = ctx.obj.get("topo_name") or ""
+    for entry in saved:
+        taken = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.taken_at))
+        elsewhere = entry.fabric and here and entry.fabric != here
+        typer.echo(
+            f"{entry.id}  {taken}  {entry.report:<16} "
+            f"{entry.as_dict()['rows']:>6} row(s)  "
+            f"{entry.fabric or '-':<16}{' (other fabric)' if elsewhere else ''}  "
+            f"{entry.label}"
+        )
+
+
+@snapshot_app.command("rm")
+def snapshot_rm(
+    snapshot_id: str = typer.Argument(..., help="Snapshot to delete"),
+    snapshot_dir: Optional[Path] = SNAPSHOT_DIR,
+) -> None:
+    """Deletes a snapshot"""
+    if not _snapshot_store(snapshot_dir).delete(snapshot_id):
+        typer.echo(f"No snapshot '{snapshot_id}'.", err=True)
+        raise typer.Exit(1)
+    typer.echo(f"Deleted {snapshot_id}")
+
+
+@app.command()
+def diff(
+    ctx: typer.Context,
+    report: str = typer.Argument(..., help="Report to compare, e.g. bgp-peers"),
+    against: Optional[str] = typer.Option(
+        None,
+        "--against",
+        "-a",
+        help="Snapshot id to compare this report against",
+    ),
+    nodes: Optional[str] = typer.Option(
+        None,
+        "--nodes",
+        "-N",
+        help="Two node names, comma separated, to compare against each other",
+    ),
+    show_same: bool = typer.Option(
+        False, "--same", help="Include the rows that are identical"
+    ),
+    snapshot_dir: Optional[Path] = SNAPSHOT_DIR,
+) -> None:
+    """Compares a report against a snapshot of it, or one node against another"""
+    from .diff import diff_nodes, diff_tables
+    from .server.snapshots import comparable
+
+    if bool(against) == bool(nodes):
+        typer.echo("Give either --against <snapshot> or --nodes <a>,<b>.", err=True)
+        raise typer.Exit(1)
+
+    spec = _comparable_report(report)
+
+    # Settle what we are comparing against before polling the fabric: there is
+    # no point running every node to then say the snapshot is not there.
+    snapshot = None
+    wanted: List[str] = []
+    if nodes:
+        wanted = [n.strip() for n in nodes.split(",") if n.strip()]
+        if len(wanted) != 2:
+            typer.echo("--nodes takes exactly two node names.", err=True)
+            raise typer.Exit(1)
+    else:
+        snapshot = _snapshot_store(snapshot_dir).get(str(against))
+        if snapshot is None:
+            typer.echo(f"No snapshot '{against}'.", err=True)
+            raise typer.Exit(1)
+        if snapshot.report != spec.name:
+            typer.echo(
+                f"That snapshot is of the {snapshot.report} report.", err=True
+            )
+            raise typer.Exit(1)
+        mismatch = comparable(
+            snapshot,
+            ctx.obj["i_filter"],
+            {},
+            fabric=ctx.obj.get("topo_name") or "",
+            inventory=list(ctx.obj["target"].inventory.hosts),
+        )
+        if mismatch:
+            typer.echo(f"Not comparable: {mismatch}", err=True)
+            raise typer.Exit(1)
+
+    table = report_table(ctx, spec)
+
+    if snapshot is None:
+        result = diff_nodes(
+            table, wanted[0], wanted[1], spec.key_columns, include_same=show_same
+        )
+    else:
+        result = diff_tables(
+            snapshot.table,
+            table,
+            spec.key_columns,
+            labels=(snapshot.label, "now"),
+            include_same=show_same,
+        )
+
+    print_table_shape(
+        result, box_type=ctx.obj["box_type"], output=ctx.obj["output"]
+    )
+    counts = result["diff"]["counts"]
+    summary = [f"{counts['removed']} gone", f"{counts['added']} new"]
+    if result["diff"]["keyed"]:
+        summary.insert(1, f"{counts['changed']} changed")
+    summary.append(f"{counts['same']} unchanged")
+    typer.echo(" · ".join(summary))
 
 
 if __name__ == "__main__":

@@ -117,11 +117,19 @@ def srl_hosts(topo: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
 def srl_groups(
     gnmi_port: int = SRL_DEFAULT_GNMI_PORT,
     cert_file: Optional[str] = None,
+    skip_verify: Optional[bool] = None,
+    tls_server_name: Optional[str] = None,
 ) -> Dict[str, Dict[str, Any]]:
     """The Nornir groups inventory the hosts from :func:`srl_hosts` belong to."""
     extras: Dict[str, Any] = {}
     if cert_file:
         extras["path_cert"] = str(cert_file)
+    if skip_verify is not None:
+        extras["skip_verify"] = bool(skip_verify)
+    if tls_server_name:
+        # A node's certificate is issued to a name of its own, which is rarely
+        # the name containerlab gives the container it runs in.
+        extras["override"] = str(tls_server_name)
     return {
         "srl": {
             "connection_options": {

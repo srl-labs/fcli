@@ -7,15 +7,16 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from nornir.core import Nornir
 
+from ..checks import CHECKS_COLUMNS, CHECKS_REPORT, FabricState, REQUIRED_REPORTS, run_checks
 from ..connections.down_reason import STANDBY_STATE, is_intent
 from ..connections.srlinux import CONNECTION_NAME
 from ..connections.layer2 import stamp_underlay_sites
 from ..reports import ReportSpec, SubscriptionSpec, get_report
-from ..rows import clean_columns, flatten, merge_fields, sub_item_keys
+from ..rows import cell, clean_columns, flatten, merge_fields, sub_item_keys
 from .devices import CachedDevice, RecordingDevice
 from .stream import HostStream
 from .topology import build_topology, node_facts
@@ -373,6 +374,10 @@ class FabricStore:
             raise RuntimeError(error or f"node {name} is not connected")
         return stream.direct_get(path, datatype)
 
+    def targets(self, inv_filter: Optional[Dict[str, str]] = None) -> List[str]:
+        """The inventory nodes *inv_filter* selects, whether or not they answer."""
+        return self._targets(inv_filter)
+
     def _targets(self, inv_filter: Optional[Dict[str, str]]) -> List[str]:
         target = self.nornir.filter(**inv_filter) if inv_filter else self.nornir
         return list(target.inventory.hosts)
@@ -517,34 +522,44 @@ class FabricStore:
                     return cached_table
 
         started = time.time()
-        results = list(
-            self._pool.map(lambda n: self._host_rows(report, n, params), names)
-        )
-
-        columns: List[str] = []
-        rows: List[Dict[str, Any]] = []
         errors: List[Dict[str, str]] = []
-        # A node with no routes at all cannot tell that 'Rib' groups rows rather
-        # than holding a value, so the fabric decides it together.
-        containers: Set[str] = set()
-        for name, cols, host_rows, error, host_containers in results:
-            if error:
-                errors.append({"node": name, "error": error})
-                continue
-            merge_fields(columns, cols)
-            containers |= host_containers
-            rows.extend(host_rows)
+        if report.name == CHECKS_REPORT:
+            # Findings are about the fabric rather than about one node, so they
+            # are gathered across it rather than merged per host. A node the
+            # checks could not read becomes a finding, not a table-level error.
+            all_columns = list(CHECKS_COLUMNS)
+            clean_rows = self._checks_rows(inv_filter)
+        else:
+            results = list(
+                self._pool.map(lambda n: self._host_rows(report, n, params), names)
+            )
 
-        columns = [c for c in columns if c not in containers]
-        all_columns = ["Node"] + clean_columns(columns)
-        clean_rows = [
-            {c: _cell(row.get(raw)) for c, raw in zip(all_columns, ["Node"] + columns)}
-            for row in rows
-        ]
-        if report.name in ("bridge_domains", "routers", "services"):
-            if stamp_underlay_sites(clean_rows):
-                if "Site" not in all_columns:
-                    all_columns.append("Site")
+            columns: List[str] = []
+            rows: List[Dict[str, Any]] = []
+            # A node with no routes at all cannot tell that 'Rib' groups rows
+            # rather than holding a value, so the fabric decides it together.
+            containers: Set[str] = set()
+            for name, cols, host_rows, error, host_containers in results:
+                if error:
+                    errors.append({"node": name, "error": error})
+                    continue
+                merge_fields(columns, cols)
+                containers |= host_containers
+                rows.extend(host_rows)
+
+            columns = [c for c in columns if c not in containers]
+            all_columns = ["Node"] + clean_columns(columns)
+            clean_rows = [
+                {
+                    c: _cell(row.get(raw))
+                    for c, raw in zip(all_columns, ["Node"] + columns)
+                }
+                for row in rows
+            ]
+            if report.name in ("bridge_domains", "routers", "services"):
+                if stamp_underlay_sites(clean_rows):
+                    if "Site" not in all_columns:
+                        all_columns.append("Site")
         res_table = {
             "report": report.name,
             "title": report.title,
@@ -580,34 +595,91 @@ class FabricStore:
         )
         return res_table
 
-    def _host_rows(
+    def _host_payload(
         self,
         report: ReportSpec,
         name: str,
         params: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[str, List[str], List[Dict[str, Any]], Optional[str], Set[str]]:
+    ) -> Tuple[str, Optional[List[Any]], Optional[str]]:
+        """What *report*'s getter makes of one node, before it becomes a table.
+
+        The items are ``None`` rather than empty when there was nothing to ask:
+        a node that is going away as the store shuts down has no state, which
+        is not the same as having none.
+        """
         with self._lock:
             stream = self._streams.get(name)
             if stream is None:
-                error = self._connect_errors.get(name, "not connected")
-                return name, [], [], error, set()
+                return name, None, self._connect_errors.get(name, "not connected")
             activation_error = self._activation_errors.get((name, report.name))
         if activation_error:
-            return name, [], [], activation_error[1], set()
+            return name, None, activation_error[1]
         if self._stop.is_set():
-            return name, [], [], None, set()
-        host = self.nornir.inventory.hosts.get(name)
-        node = (host.hostname if host and host.hostname else name) or name
+            return name, None, None
         try:
             result = report.getter(CachedDevice(stream), **(params or {}))
         except Exception as exc:  # noqa: BLE001 - reported per node in the UI
             logger.debug(
                 "%s: report '%s' failed: %s", name, report.name, exc, exc_info=exc
             )
-            return name, [], [], str(exc), set()
-        items = (result or {}).get(report.resource) or []
+            return name, None, str(exc)
+        return name, (result or {}).get(report.resource) or [], None
+
+    def _host_rows(
+        self,
+        report: ReportSpec,
+        name: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, List[str], List[Dict[str, Any]], Optional[str], Set[str]]:
+        name, items, error = self._host_payload(report, name, params)
+        if error is not None or items is None:
+            return name, [], [], error, set()
+        host = self.nornir.inventory.hosts.get(name)
+        node = (host.hostname if host and host.hostname else name) or name
         columns, rows = flatten(node, items)
         return name, columns, rows, None, sub_item_keys(items)
+
+    # ------------------------------------------------------------------ #
+    # checks
+    # ------------------------------------------------------------------ #
+
+    def fabric_state(
+        self,
+        inv_filter: Optional[Dict[str, str]] = None,
+        reports: Sequence[str] = REQUIRED_REPORTS,
+    ) -> FabricState:
+        """Collect what the sanity checks read, across the filtered inventory."""
+        names = self._targets(inv_filter)
+        self._heal_connections(names)
+        state = FabricState()
+        state.hostnames = {
+            name: (host.hostname or name)
+            for name, host in self.nornir.inventory.hosts.items()
+            if name in set(names)
+        }
+        for report_name in reports:
+            spec = get_report(report_name)
+            try:
+                self.activate(spec, names)
+            except Exception as exc:  # noqa: BLE001 - the other reports still answer
+                logger.warning("activating report '%s' for checks failed: %s", report_name, exc)
+            payloads: Dict[str, Any] = {}
+            collected = self._pool.map(
+                lambda n, s=spec: self._host_payload(s, n), names
+            )
+            for node, items, error in collected:
+                if error is not None:
+                    state.errors[(report_name, node)] = error
+                elif items is not None:
+                    payloads[node] = items
+            state.reports[report_name] = payloads
+        return state
+
+    def _checks_rows(
+        self, inv_filter: Optional[Dict[str, str]]
+    ) -> List[Dict[str, Any]]:
+        """The findings of every check, as the rows of a table."""
+        return [f.as_row() for f in run_checks(self.fabric_state(inv_filter))]
 
     # ------------------------------------------------------------------ #
     # introspection
@@ -730,8 +802,13 @@ _OVERVIEW_ROOTS: Tuple[str, ...] = ("interface", "network-instance")
 
 #: Tree roots the topology is inferred from: LLDP and the host-name under
 #: ``system``, the services under ``network-instance``, port states under
-#: ``interface``.
-_TOPOLOGY_ROOTS: Tuple[str, ...] = ("system", "network-instance", "interface")
+#: ``interface``, chassis type under ``platform``.
+_TOPOLOGY_ROOTS: Tuple[str, ...] = (
+    "system",
+    "network-instance",
+    "interface",
+    "platform",
+)
 
 
 def _interface_egress(stream: Optional[HostStream]) -> Dict[str, int]:
@@ -971,15 +1048,9 @@ def _roll_up(instances: List[Tuple[str, str]]) -> Dict[str, int]:
     }
 
 
-def _cell(value: Any) -> Any:
-    """Render one value into something JSON- and table-friendly."""
-    if value is None:
-        return ""
-    if isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, list):
-        return ", ".join(str(v) for v in value)
-    return str(value)
+#: Kept as a module-level name because the tables both surfaces render have to
+#: agree cell for cell; see :func:`nornir_srl.rows.cell`.
+_cell = cell
 
 
 def _oldest_update(streams: List[HostStream]) -> Optional[float]:

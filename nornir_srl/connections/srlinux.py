@@ -24,6 +24,26 @@ logger = logging.getLogger(__name__)
 
 CONNECTION_NAME = "srlinux"
 
+#: Set once the first unverified connection has warned, so a fabric of fifty
+#: nodes says it once rather than fifty times.
+_warned_unverified = False
+
+
+def _resolve_skip_verify(extras: Dict[str, Any]) -> bool:
+    """Whether to connect without authenticating the target's certificate.
+
+    pygnmi with ``skip_verify`` set downloads whatever certificate the target
+    presents, trusts it as its own root and overrides the hostname check, so
+    nothing about the device is actually verified. That is the only thing a
+    containerlab node - self-signed, no CA distributed - can offer, so it stays
+    the default. Configuring a trust anchor is taken as meaning it should be
+    used, and ``skip_verify`` in the inventory settles it either way.
+    """
+    configured = extras.pop("skip_verify", None)
+    if configured is not None:
+        return bool(configured)
+    return not extras.get("path_cert")
+
 
 class GnmiPath:
     RE_PATH_COMPONENT = re.compile(
@@ -100,13 +120,24 @@ class SrLinux(
         # as permanently gone for far longer than it is actually down.
         if not any(name == "grpc.max_reconnect_backoff_ms" for name, _ in grpc_options):
             grpc_options.append(("grpc.max_reconnect_backoff_ms", 10_000))
+        skip_verify = _resolve_skip_verify(extras)
+        if skip_verify:
+            global _warned_unverified
+            if not _warned_unverified:
+                _warned_unverified = True
+                logger.warning(
+                    "gNMI TLS is not verified: the certificate a node presents is "
+                    "trusted as-is, so credentials go to whatever answers on the "
+                    "gNMI port. Pass --cert-file <ca.pem> to authenticate the fabric."
+                )
         # extras can carry credentials-adjacent settings, so only its keys.
         logger.debug(
-            "%s: connecting as %s to gNMI port %s (platform=%s, extras=%s, grpc_options=%s)",
+            "%s: connecting as %s to gNMI port %s (platform=%s, skip_verify=%s, extras=%s, grpc_options=%s)",
             hostname,
             username,
             port,
             platform,
+            skip_verify,
             sorted(extras),
             grpc_options,
         )
@@ -115,7 +146,7 @@ class SrLinux(
             target=target,
             username=username,
             password=password,
-            skip_verify=True,
+            skip_verify=skip_verify,
             grpc_options=grpc_options,
             **extras,  # type: ignore
         )
