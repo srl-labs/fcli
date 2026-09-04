@@ -1658,7 +1658,19 @@ def test_get_routers():
                                     }
                                 }
                             ]
-                        }
+                        },
+                        "bgp": {
+                            "neighbor": [
+                                {
+                                    "peer-address": "10.0.0.2",
+                                    "session-state": "established",
+                                },
+                                {
+                                    "peer-address": "2001:db8::2",
+                                    "session-state": "idle",
+                                },
+                            ]
+                        },
                     },
                     "interface": [
                         {
@@ -1701,6 +1713,7 @@ def test_get_routers():
         "mac-vrf-100 (irb1.100 [up]: 10.1.100.1/24, 2001:db8:100::1/64, fe80::1/64)"
     )
     assert r["Routed Interfaces"] == "ethernet-1/10.0 [up] (192.168.1.1/30)"
+    assert r["BGP Peers"] == "10.0.0.2 UP, 2001:db8::2 DOWN"
     assert r["VXLAN Interface"] == "vxlan1.1"
     assert r["Subnets"] == "10.1.100.0/24, 2001:db8:100::/64"
     assert r["Gateway"] == ""
@@ -1724,6 +1737,7 @@ def test_get_routers():
     assert r2["Route Targets"] == "none (isolated)"
     assert r2["Router"] == "none (isolated) - isolated-vrf"
     assert r2["Gateway"] == ""
+    assert r2["BGP Peers"] == "-"
 
     # Test that mgmt ip-vrf is excluded
     mgmt_data = [

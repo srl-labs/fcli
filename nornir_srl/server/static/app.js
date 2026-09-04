@@ -75,6 +75,7 @@
     topoZoomOut: el("topo-zoom-out"),
     topoZoomLevel: el("topo-zoom-level"),
     topoZoomFit: el("topo-zoom-fit"),
+    topoExportDrawio: el("topo-export-drawio"),
     servicesTreeView: el("services-tree-view"),
     viewModeBtn: el("view-mode-btn"),
     headRow: el("head-row"),
@@ -250,7 +251,7 @@
         JSON.parse(hiddenData).forEach((col) => state.hidden.add(col));
       } else if (["bridge_domains", "services", "routers"].includes(state.report.name)) {
         // Node identifiers shown next to the name in the tree, not as table columns.
-        ["System IPv4", "System IPv6", "Gateway", "BGP Instance", "Underlay Hosts", "Site"].forEach((c) => state.hidden.add(c));
+        ["System IPv4", "System IPv6", "Gateway", "BGP Instance", "BGP Peers", "Underlay Hosts", "Site"].forEach((c) => state.hidden.add(c));
       }
       const filtersData = localStorage.getItem(`fcli-filters-${state.report.name}`);
       if (filtersData) {
@@ -678,6 +679,7 @@
     renderTopoHeatLegend();
     dom.topoStats.textContent = topoSummary(graph);
     dom.rowCount.textContent = `${graph.nodes.length} node(s), ${graph.links.length} link(s)`;
+    if (dom.topoExportDrawio) dom.topoExportDrawio.disabled = !graph.nodes.length;
     if (!graph.nodes.length) {
       const empty = document.createElement("p");
       empty.className = "empty";
@@ -1308,6 +1310,248 @@
       parts.push(`${graph.unresolved.length} neighbour(s) outside the inventory`);
     }
     return parts.join(" · ");
+  }
+
+  const escapeXml = (text) =>
+    String(text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+  const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  const parseHex = (hex) => {
+    const raw = String(hex || "").replace("#", "");
+    if (raw.length === 3) {
+      return raw.split("").map((ch) => parseInt(ch + ch, 16));
+    }
+    if (raw.length !== 6) return [238, 241, 245];
+    return [raw.slice(0, 2), raw.slice(2, 4), raw.slice(4, 6)].map((part) => parseInt(part, 16));
+  };
+
+  const toHex = ([r, g, b]) =>
+    `#${[r, g, b].map((value) => Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0")).join("")}`;
+
+  /** A light tint of *hex*, for draw.io fills that stay readable with dark text. */
+  const tintHex = (hex, white = 0.9) => {
+    const [r, g, b] = parseHex(hex);
+    const color = 1 - white;
+    return toHex([
+      Math.round(r * color + 255 * white),
+      Math.round(g * color + 255 * white),
+      Math.round(b * color + 255 * white),
+    ]);
+  };
+
+  function topoRoleStroke(role) {
+    return cssVar(`--role-${role}`) || cssVar("--role-unknown") || "#667085";
+  }
+
+  function topoRoleFill(role) {
+    return tintHex(topoRoleStroke(role));
+  }
+
+  function topoLinkStroke(link) {
+    const kind = stateKind(link.state);
+    if (kind === "down") return cssVar("--err") || "#b42318";
+    if (kind === "standby") return cssVar("--warn") || "#a35b00";
+    const bps = Math.max(Number(link.a_out_bps) || 0, Number(link.b_out_bps) || 0);
+    const cls = topoBwClass(bps || null);
+    const byClass = {
+      "bw-green": "--ok",
+      "bw-yellow": "--warn",
+      "bw-orange": "--heat",
+      "bw-red": "--err",
+      "bw-none": "--muted",
+    };
+    return cssVar(byClass[cls] || "--muted") || "#667085";
+  }
+
+  function topoNodeDrawioLabel(node) {
+    const lines = [
+      `<b><font color="#1c2128">${escapeXml(node.label)}</font></b>`,
+      `<font color="#667085" style="font-size:10px">${escapeXml(topoNodeSub(node))}</font>`,
+    ];
+    if (node.platform) {
+      lines.push(
+        `<font color="#667085" style="font-size:9px">${escapeXml(node.platform)}</font>`
+      );
+    }
+    return lines.join("<br>");
+  }
+
+  function topoNodeDrawioStyle(node) {
+    const stroke = !node.connected ? cssVar("--err") || "#b42318" : topoRoleStroke(node.role);
+    const fill = topoRoleFill(node.role);
+    const parts = [
+      "rounded=1",
+      "whiteSpace=wrap",
+      "html=1",
+      `fillColor=${fill}`,
+      `strokeColor=${stroke}`,
+      "fontColor=#1c2128",
+      "align=center",
+      "verticalAlign=middle",
+      "fontSize=11",
+      "spacing=6",
+    ];
+    if (!node.connected || node.role === "external") parts.push("dashed=1");
+    if (node.role === "dcgw") parts.push("strokeWidth=2");
+    return parts.join(";");
+  }
+
+  function topoEdgeDrawioStyle(link, aIsTop) {
+    const stroke = topoLinkStroke(link);
+    const parts = [
+      "html=1",
+      "endArrow=none",
+      "startArrow=none",
+      `strokeColor=${stroke}`,
+      "strokeWidth=2",
+      "rounded=1",
+    ];
+    if (link.access) parts.push("dashed=1");
+    if (link.intra_layer) {
+      parts.push("exitX=0.5", "exitY=1", "entryX=0.5", "entryY=1", "curved=1");
+    } else {
+      parts.push(
+        aIsTop ? "exitX=0.5;exitY=1;entryX=0.5;entryY=0" : "exitX=0.5;exitY=0;entryX=0.5;entryY=1"
+      );
+    }
+    return parts.join(";");
+  }
+
+  function buildDrawioXml(graph, layout) {
+    let nextId = 2;
+    const cells = [
+      '<mxCell id="0"/>',
+      '<mxCell id="1" parent="0"/>',
+    ];
+    const nodeIds = new Map();
+
+    const addCell = (attrs, geometry) => {
+      const id = String(nextId++);
+      const parts = [`<mxCell id="${id}"`];
+      for (const [key, value] of Object.entries(attrs)) {
+        if (value != null && value !== "") parts.push(`${key}="${escapeXml(value)}"`);
+      }
+      parts.push(">");
+      if (geometry) parts.push(geometry);
+      parts.push("</mxCell>");
+      cells.push(parts.join(" "));
+      return id;
+    };
+
+    const bandFill = "#f6f7f9";
+    for (const row of layout.rows) {
+      addCell(
+        {
+          parent: "1",
+          vertex: "1",
+          style: `rounded=1;whiteSpace=wrap;html=1;fillColor=${bandFill};strokeColor=none;opacity=60;`,
+        },
+        `<mxGeometry x="8" y="${row.y - 18}" width="${layout.width - 16}" height="${
+          TOPO.nodeHeight + 36
+        }" as="geometry"/>`
+      );
+      addCell(
+        {
+          value: row.layer.label,
+          parent: "1",
+          vertex: "1",
+          style: "text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=11;fontStyle=1;fontColor=#1c2128;",
+        },
+        `<mxGeometry x="20" y="${row.y + TOPO.nodeHeight / 2 - 8}" width="100" height="16" as="geometry"/>`
+      );
+    }
+
+    for (const node of graph.nodes) {
+      const box = layout.positions.get(node.name);
+      if (!box) continue;
+      const id = addCell(
+        {
+          value: topoNodeDrawioLabel(node),
+          parent: "1",
+          vertex: "1",
+          style: topoNodeDrawioStyle(node),
+        },
+        `<mxGeometry x="${box.x}" y="${box.y}" width="${box.w}" height="${box.h}" as="geometry"/>`
+      );
+      nodeIds.set(node.name, id);
+    }
+
+    for (const link of graph.links) {
+      const a = layout.positions.get(link.a);
+      const b = layout.positions.get(link.b);
+      const source = nodeIds.get(link.a);
+      const target = nodeIds.get(link.b);
+      if (!a || !b || !source || !target) continue;
+      const { aIsTop } = linkAnchors(a, b);
+      let geometry = '<mxGeometry relative="1" as="geometry"/>';
+      if (link.intra_layer) {
+        const p0 = { x: a.cx, y: a.y + a.h };
+        const p2 = { x: b.cx, y: b.y + b.h };
+        const p1 = { x: (a.cx + b.cx) / 2, y: a.y + a.h + 46 };
+        geometry = `<mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="${p1.x}" y="${p1.y}"/></Array></mxGeometry>`;
+      }
+      const value =
+        dom.topoPortLabels.checked && !link.intra_layer && link.count === 1
+          ? escapeXml(
+              `${shortPort(link.ports[0].a_port)} ↔ ${shortPort(link.ports[0].b_port)}`
+            )
+          : link.count > 1
+            ? `${link.count}×`
+            : "";
+      addCell(
+        {
+          value,
+          parent: "1",
+          edge: "1",
+          source,
+          target,
+          style: topoEdgeDrawioStyle(link, aIsTop),
+        },
+        geometry
+      );
+    }
+
+    const fabricId = currentTopoFabric(graph);
+    const fabric =
+      fabricId === "all"
+        ? "All fabrics"
+        : (topoFabrics(graph).find((entry) => entry.id === fabricId) || {}).label || fabricId;
+    const diagramName = escapeXml(fabric);
+
+    return (
+      `<mxfile host="fcli" agent="fcli topology export" version="22.1.0">` +
+      `<diagram id="topology" name="${diagramName}">` +
+      `<mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="0" arrows="1" fold="1" page="0" pageScale="1" pageWidth="${layout.width}" pageHeight="${layout.height}" math="0" shadow="0">` +
+      `<root>${cells.join("")}</root>` +
+      `</mxGraphModel>` +
+      `</diagram>` +
+      `</mxfile>`
+    );
+  }
+
+  function exportTopologyDrawio() {
+    if (!state.topology || !state.topology.nodes.length) return;
+    const graph = topoFabricView(state.topology);
+    const layout = layoutTopology(graph);
+    const xml = buildDrawioXml(graph, layout);
+    const blob = new Blob([xml], { type: "application/xml" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const fabricId = currentTopoFabric(state.topology);
+    const fabricLabel =
+      fabricId === "all"
+        ? "all"
+        : (topoFabrics(state.topology).find((entry) => entry.id === fabricId) || {}).label ||
+          fabricId;
+    link.href = url;
+    link.download = `topology-${String(fabricLabel).replace(/[^\w.-]+/g, "-")}.drawio`;
+    link.click();
+    URL.revokeObjectURL(url);
   }
 
   function renderTopoLegend(graph) {
@@ -2356,6 +2600,12 @@
     jumpToFilteredReport(report, niName ? [niName] : [], [], { "next-hop": nh });
   }
 
+  function jumpToBgpPeer(nodeName, niName, peerAddress) {
+    jumpToFilteredReport("bgp_peers", [niName], [nodeName], {
+      peer: exactMatchPattern([peerAddress]),
+    });
+  }
+
   // A virtual-ES label with its next-hop(s) turned into RIB jumps. The rest of
   // the label stays text; only `nh: <ip>` is a control, because that address
   // being active in this IP-VRF is what the segment tracks.
@@ -3323,7 +3573,48 @@
             details.append(routedRowDiv);
           }
 
-          // 3. Virtual ethernet-segments, matched to this router on its EVI
+          // 3. BGP peers
+          const bgpPeersStr = row["BGP Peers"] || "-";
+          if (bgpPeersStr !== "-") {
+            const bgpRowDiv = document.createElement("div");
+            bgpRowDiv.className = "bd-detail-row";
+
+            const label = document.createElement("strong");
+            label.className = "bd-detail-label";
+            label.textContent = "BGP peers:";
+            bgpRowDiv.append(label);
+
+            const pillGroup = document.createElement("div");
+            pillGroup.className = "pill-group";
+            bgpPeersStr.split(/,\s*/).forEach((itemStr) => {
+              const match = itemStr.trim().match(/^(\S+)\s+(UP|DOWN)$/);
+              if (!match) return;
+              const [, peerAddr, peerState] = match;
+
+              const p = document.createElement("span");
+              p.className = "pill";
+              const kind = stateKind(peerState);
+              if (kind) p.classList.add(`pill-${kind}`);
+
+              const link = document.createElement("a");
+              link.className = "vrf-link";
+              link.textContent = peerAddr;
+              link.href = "#";
+              link.title = `Show BGP peer ${peerAddr} in ${row["IP-VRF"]} on ${nodeName}`;
+              link.addEventListener("click", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                jumpToBgpPeer(nodeName, row["IP-VRF"], peerAddr);
+              });
+
+              p.append(link, document.createTextNode(` ${peerState}`));
+              pillGroup.append(p);
+            });
+            bgpRowDiv.append(pillGroup);
+            details.append(bgpRowDiv);
+          }
+
+          // 4. Virtual ethernet-segments, matched to this router on its EVI
           const vesStr = row["Virtual ES"] || "-";
           if (vesStr !== "-") {
             const vesRowDiv = document.createElement("div");
@@ -3357,7 +3648,7 @@
             details.append(vesRowDiv);
           }
 
-          // 4. VXLAN-interface
+          // 5. VXLAN-interface
           const vxlanStr = row["VXLAN Interface"] || "-";
           if (vxlanStr !== "-") {
             const vxRowDiv = document.createElement("div");
@@ -3988,6 +4279,7 @@
   });
 
   dom.exportBtn.addEventListener("click", exportCsv);
+  dom.topoExportDrawio.addEventListener("click", exportTopologyDrawio);
 
   dom.tableWrap.addEventListener("scroll", () => {
     const { scrollTop, scrollHeight, clientHeight } = dom.tableWrap;
