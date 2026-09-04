@@ -1008,6 +1008,199 @@ def test_a_rib_lookup_leaves_the_whole_table_for_the_next_caller():
     ]
 
 
+def _vrf_rib_device(
+    afi: str,
+    route: Dict[str, Any],
+    nhgroups: Dict[str, List[str]],
+    nhs: Dict[str, Dict[str, Any]],
+    ni: str = "ipvrf-1",
+    nh_ni: Optional[str] = None,
+) -> "_FakeRouting":
+    """A node with one route in *ni*, and the two tables that resolve it.
+
+    *nhgroups* maps a group index to the next-hop indices in it, *nhs* a
+    next-hop index to its state; both live in *nh_ni*, which defaults to *ni*.
+    """
+    nh_ni = nh_ni or ni
+
+    def _table(ni_name: str, table: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return [{"network-instance": [{"name": ni_name, "route-table": table}]}]
+
+    return _FakeRouting(
+        {
+            afi: _table(
+                ni,
+                {
+                    afi: {
+                        "route": [
+                            {
+                                "route-type": "bgp",
+                                "active": True,
+                                "metric": 0,
+                                "preference": 170,
+                                "origin-network-instance": ni,
+                                **route,
+                            }
+                        ]
+                    }
+                },
+            ),
+            "next-hop-group": _table(
+                nh_ni,
+                {
+                    "next-hop-group": [
+                        {"index": index, "next-hop": [{"next-hop": n} for n in members]}
+                        for index, members in nhgroups.items()
+                    ]
+                },
+            ),
+            "next-hop[index=": _table(
+                nh_ni,
+                {"next-hop": [{"index": index, **nh} for index, nh in nhs.items()]},
+            ),
+        }
+    )
+
+
+#: An indirect next-hop as SR Linux reports it: the BGP peer address, and the
+#: route it recurses on named by prefix *and* by that route's own next-hop-group.
+def _indirect(address: str, prefix: str, via: Optional[str]) -> Dict[str, Any]:
+    resolving: Dict[str, Any] = {"ip-prefix": prefix, "route-type": "local"}
+    if via is not None:
+        resolving["next-hop-group"] = via
+    return {
+        "type": "indirect",
+        "ip-address": address,
+        "indirect": {"resolved": True, "resolving-route": resolving},
+    }
+
+
+def test_get_rib_follows_an_indirect_next_hop_to_the_egress_interface():
+    """A BGP route in an ip-vrf must name a port, not the route it recurses on.
+
+    The next-hop of a BGP route is the peer, which is rarely connected: the
+    next-hop is ``indirect`` and carries only the prefix it resolves through.
+    The port lives one level down, in the next-hop-group of *that* route.
+    """
+    device = _vrf_rib_device(
+        "ipv4-unicast",
+        {"ipv4-prefix": "5.5.5.5/32", "next-hop-group": "100"},
+        nhgroups={"100": ["200"], "742": ["632"]},
+        nhs={
+            "200": _indirect("10.1.5.1", "10.1.5.0/31", via="742"),
+            "632": {
+                "type": "direct",
+                "ip-address": "10.1.5.1",
+                "subinterface": "ethernet-1/3.1",
+            },
+        },
+    )
+
+    route = device.get_rib(afi="ipv4-unicast")["ip_rib"][0]["Rib"][0]
+
+    assert route["next-hop"] == ["10.1.5.0/31 (indirect)"]
+    assert route["itf"] == ["ethernet-1/3.1"]
+
+
+def test_get_rib_follows_an_indirect_ipv6_next_hop_to_the_egress_interface():
+    device = _vrf_rib_device(
+        "ipv6-unicast",
+        {"ipv6-prefix": "2001:db8::5/128", "next-hop-group": "100"},
+        nhgroups={"100": ["200"], "742": ["632"]},
+        nhs={
+            "200": _indirect("2001:db8:5::1", "2001:db8:5::/127", via="742"),
+            "632": {
+                "type": "direct",
+                "ip-address": "2001:db8:5::1",
+                "subinterface": "ethernet-1/3.1",
+            },
+        },
+    )
+
+    route = device.get_rib(afi="ipv6-unicast")["ip_rib"][0]["Rib"][0]
+
+    assert route["itf"] == ["ethernet-1/3.1"]
+
+
+def test_get_rib_names_the_resolving_route_when_it_leads_to_no_interface():
+    """The prefix is still better than nothing when the chain cannot be walked.
+
+    The route, next-hop-group and next-hop tables are three separate Gets, so
+    the group a resolving route names can be one this node did not return.
+    """
+    device = _vrf_rib_device(
+        "ipv4-unicast",
+        {"ipv4-prefix": "5.5.5.5/32", "next-hop-group": "100"},
+        nhgroups={"100": ["200"]},
+        nhs={"200": _indirect("10.1.5.1", "10.1.5.0/31", via="742")},
+    )
+
+    route = device.get_rib(afi="ipv4-unicast")["ip_rib"][0]["Rib"][0]
+
+    assert route["itf"] == ["10.1.5.0/31"]
+
+
+def test_get_rib_reports_the_tunnel_of_an_overlay_next_hop():
+    """An EVPN route leaves through a tunnel, which is what to show for it.
+
+    Its next-hop is indirect too, but resolves through a tunnel rather than a
+    route, and the VTEP it points at says more than ``vxlan0`` would.
+    """
+    device = _vrf_rib_device(
+        "ipv4-unicast",
+        {"ipv4-prefix": "10.0.2.2/32", "next-hop-group": "100"},
+        nhgroups={"100": ["200"]},
+        nhs={
+            "200": {
+                "type": "indirect",
+                "ip-address": "192.168.255.2",
+                "indirect": {
+                    "resolved": True,
+                    "resolving-tunnel": {
+                        "ip-prefix": "192.168.255.2/32",
+                        "tunnel-type": "vxlan",
+                        "next-hop-group": "319",
+                    },
+                },
+            }
+        },
+    )
+
+    route = device.get_rib(afi="ipv4-unicast")["ip_rib"][0]["Rib"][0]
+
+    assert route["itf"] == ["vxlan:192.168.255.2/32"]
+
+
+def test_get_rib_resolves_a_next_hop_group_in_another_network_instance():
+    """A service VRF can hold the route and the underlay VRF its next-hop-group.
+
+    ``next-hop-group-network-instance`` names where to resolve it, and looking
+    in the route's own instance finds nothing.
+    """
+    device = _vrf_rib_device(
+        "ipv4-unicast",
+        {
+            "ipv4-prefix": "5.5.5.5/32",
+            "next-hop-group": "100",
+            "next-hop-group-network-instance": "default",
+        },
+        nhgroups={"100": ["200"]},
+        nhs={
+            "200": {
+                "type": "direct",
+                "ip-address": "10.0.0.1",
+                "subinterface": "ethernet-1/1.0",
+            }
+        },
+        nh_ni="default",
+    )
+
+    route = device.get_rib(afi="ipv4-unicast")["ip_rib"][0]["Rib"][0]
+
+    assert route["next-hop"] == ["10.0.0.1"]
+    assert route["itf"] == ["ethernet-1/1.0"]
+
+
 class _RecordingLayer2:
     """A Layer2 device that answers by path fragment and remembers what was asked."""
 

@@ -23,6 +23,11 @@ BGP_RIB_ROUTE_FAM_ALIASES: Dict[str, str] = {
     "l3vpn-ipv6-unicast": "l3vpn-ipv6-unicast",
 }
 
+#: How far :meth:`RoutingMixin.get_rib` follows a chain of indirect next-hops
+#: looking for the egress interface. Recursive resolution is a handful of hops
+#: deep at most; the bound is what stops a next-hop table that points at itself.
+_MAX_NH_RESOLVE_DEPTH = 8
+
 _pygnmi_suppress_lock = threading.Lock()
 _pygnmi_suppress_depth = 0
 _pygnmi_suppress_saved: Tuple[List[logging.Handler], int, bool] | None = None
@@ -744,12 +749,20 @@ class RoutingMixin:
                 resolving_route = indirect.get(
                     "resolving-route", nh.get("resolving-route")
                 )
-                if resolving_tunnel:
-                    tunnel_type = resolving_tunnel.get("tunnel-type") or ""
-                    tunnel_prefix = resolving_tunnel.get("ip-prefix") or ""
+                # A next-hop already resolved onto a tunnel carries it directly,
+                # under its own key and naming the type ``type`` rather than
+                # ``tunnel-type``; an indirect one names the tunnel it recurses
+                # on instead. Either way the VTEP is what the route egresses to.
+                tunnel = resolving_tunnel or nh.get("tunnel") or {}
+                if tunnel:
+                    tunnel_type = tunnel.get("tunnel-type") or tunnel.get("type") or ""
+                    tunnel_prefix = tunnel.get("ip-prefix") or ""
                     entry["tunnel"] = f"{tunnel_type}:{tunnel_prefix}"
                 if resolving_route:
                     entry["resolving-route"] = resolving_route.get("ip-prefix")
+                    # The resolving route names its own next-hop-group, which is
+                    # what lets an indirect next-hop be followed to a real port.
+                    entry["resolving-nhg"] = resolving_route.get("next-hop-group")
                 tmp_map[nh.get("index")] = entry
             nh_mapping[ni.get("name")] = tmp_map
 
@@ -763,6 +776,36 @@ class RoutingMixin:
                     for nh in as_list(nhgroup.get("next-hop"))
                 ]
             nhgroup_mapping[ni_name] = nh_map
+
+        def egress(
+            ni_name: str, nh: Dict[str, Any], seen: Tuple[str, ...] = ()
+        ) -> List[Tuple[str, str]]:
+            """Where a next-hop leaves the node, as ``(kind, value)`` pairs.
+
+            A next-hop resolved down to a port or a tunnel says so itself. An
+            indirect one only names the route it resolves through, so the port
+            is one level further down, in the next-hop-group of *that* route -
+            which is why a BGP route in an ip-vrf, whose next-hop is the BGP
+            peer rather than a connected address, is followed rather than
+            reported as the prefix it recurses on. The prefix is still what is
+            shown when the chain cannot be walked to an interface.
+            """
+            if nh.get("subinterface"):
+                return [("itf", nh["subinterface"])]
+            if nh.get("tunnel"):
+                return [("tunnel", nh["tunnel"])]
+            via = nh.get("resolving-nhg")
+            if via and via not in seen and len(seen) < _MAX_NH_RESOLVE_DEPTH:
+                hops = [
+                    hop
+                    for onward in nhgroup_mapping.get(ni_name, {}).get(via, [])
+                    for hop in egress(ni_name, onward, seen + (via,))
+                ]
+                if hops:
+                    return hops
+            if nh.get("resolving-route"):
+                return [("route", nh["resolving-route"])]
+            return []
 
         resp = self.get(
             paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
@@ -798,11 +841,12 @@ class RoutingMixin:
                 if "next-hop-group" not in route:
                     continue
                 leaked = False
-                nh_ni = route.get("origin-network-instance", ni.get("name"))
-                if nh_ni != ni.get("name"):
+                orig_ni = route.get("origin-network-instance", ni.get("name"))
+                if orig_ni != ni.get("name"):
                     leaked = True
-                    route["_orig_vrf"] = nh_ni
-                resolved = nhgroup_mapping.get(nh_ni, {}).get(
+                    route["_orig_vrf"] = orig_ni
+                nhg_ni = route.get("next-hop-group-network-instance", orig_ni)
+                resolved = nhgroup_mapping.get(nhg_ni, {}).get(
                     route["next-hop-group"], []
                 )
                 route["_next-hop"] = [
@@ -813,18 +857,14 @@ class RoutingMixin:
                     )
                     for nh in resolved
                 ]
-                # The egress interface is the most useful thing to show; a tunnel
-                # or the route the next-hop resolves through stand in when the
-                # next-hop is not resolved down to an interface.
-                route["_nh_itf"] = []
-                for key in ("subinterface", "tunnel", "resolving-route"):
-                    hops = [nh[key] for nh in resolved if nh.get(key)]
-                    if not hops:
-                        continue
-                    if key == "subinterface" and leaked:
-                        hops = [f"{hop}@vrf:{nh_ni}" for hop in hops]
-                    route["_nh_itf"] = hops
-                    break
+                # In next-hop order, so the ports read alongside the addresses
+                # beside them - though one indirect next-hop can resolve onto
+                # several, and then there are more ports than addresses.
+                route["_nh_itf"] = [
+                    f"{hop}@vrf:{orig_ni}" if leaked and kind == "itf" else hop
+                    for nh in resolved
+                    for kind, hop in egress(nhg_ni, nh)
+                ]
 
         res = jmespath.search(path_spec["jmespath"], payload)
         return {"ip_rib": res}
