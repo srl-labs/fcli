@@ -677,6 +677,14 @@ th.filtered::after {
 
 .kpi-icon {
   font-size: 18px;
+  line-height: 1;
+}
+
+.kpi-switch-icon {
+  width: 1.125rem;
+  height: 1.125rem;
+  display: block;
+  color: var(--muted);
 }
 
 .kpi-value {
