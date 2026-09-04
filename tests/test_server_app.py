@@ -12,6 +12,7 @@ import yaml
 from nornir import InitNornir
 from starlette.testclient import TestClient
 
+from nornir_srl.checks import CHECKS_COLUMNS, REQUIRED_REPORTS
 from nornir_srl.reports import SERVER, get_report, reports_for
 from nornir_srl.rows import flatten, get_fields, is_scalar
 from nornir_srl.server.app import (
@@ -67,6 +68,10 @@ ES_ESI = "00:00:00:00:01:01:01:01:01:01"
 def _responses(name="leaf1"):
     return {
         LLDP_PATH: LLDP_RESPONSE,
+        # Reports gate the bridged and EVPN paths on this, as a node that does
+        # neither does not implement them.
+        "/system/features": [{"system/features": ["bridged", "evpn"]}],
+        "/tunnel-interface[name=*]/vxlan-interface": [{"tunnel-interface": []}],
         HOSTNAME_PATH: hostname_response(name),
         ES_PATH: es_response("mh-1", ES_ESI, "lag1"),
         IFSTATS_PATH: IFSTATS_RESPONSE,
@@ -134,9 +139,15 @@ def store(fabric):
 
 
 @pytest.fixture
-def client(fabric):
+def client(fabric, tmp_path):
     nornir, devices = fabric
-    app = create_app(nornir, resync_interval=0, refresh=0.5, restart_debounce=0.02)
+    app = create_app(
+        nornir,
+        resync_interval=0,
+        refresh=0.5,
+        restart_debounce=0.02,
+        snapshot_dir=tmp_path / "snapshots",
+    )
     with TestClient(app) as test_client:
         yield test_client, devices
 
@@ -661,6 +672,303 @@ def test_an_unreachable_node_is_not_retried_on_every_render(fabric, monkeypatch)
         assert len(attempts) == settled
     finally:
         fabric_store.stop()
+
+
+# --------------------------------------------------------------------------- #
+# checks
+# --------------------------------------------------------------------------- #
+
+
+def test_fabric_state_collects_what_the_checks_read(store):
+    fabric_store, _devices = store
+    state = fabric_store.fabric_state()
+    assert set(state.reports) == set(REQUIRED_REPORTS)
+    assert state.reports["lldp"]["leaf1"], "the LLDP payload is what the getter returned"
+    assert state.hostnames == {"leaf1": "leaf1", "spine1": "spine1"}
+    assert state.errors == {}
+
+
+def test_fabric_state_honours_the_inventory_filter(store):
+    fabric_store, _devices = store
+    state = fabric_store.fabric_state({"role": "leaf"})
+    assert list(state.hostnames) == ["leaf1"]
+    assert list(state.reports["lldp"]) == ["leaf1"]
+
+
+def test_fabric_state_records_a_node_it_could_not_read(store, monkeypatch):
+    fabric_store, devices = store
+    devices["spine1"].down = True
+    state = fabric_store.fabric_state(reports=("lldp",))
+    assert list(state.reports["lldp"]) == ["leaf1"]
+    assert [node for _report, node in state.errors] == ["spine1"]
+
+
+def test_the_checks_report_renders_as_an_ordinary_table(store):
+    """It is a table like any other, so the browser needs nothing new for it."""
+    fabric_store, _devices = store
+    table = fabric_store.table(get_report("checks"))
+    assert table["columns"] == list(CHECKS_COLUMNS)
+    assert table["report"] == "checks"
+    assert table["errors"] == []
+
+
+def test_the_checks_report_finds_the_fault_in_the_fake_fabric(store):
+    """Both fake nodes see spine1 and spine2, so nothing sees leaf1 back."""
+    fabric_store, _devices = store
+    rows = fabric_store.table(get_report("checks"))["rows"]
+    assert [(r["Check"], r["Node"], r["Subject"]) for r in rows] == [
+        ("lldp_one_sided", "leaf1", "ethernet-1/1")
+    ]
+
+
+def test_the_checks_report_is_served_over_http(client):
+    test_client, _devices = client
+    resp = test_client.get("/api/report/checks")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["columns"] == list(CHECKS_COLUMNS)
+    assert all(set(row) == set(CHECKS_COLUMNS) for row in body["rows"])
+
+
+def test_a_node_the_checks_could_not_read_is_a_finding(store):
+    fabric_store, devices = store
+    devices["spine1"].down = True
+    rows = fabric_store.table(get_report("checks"))["rows"]
+    collection = [r for r in rows if r["Check"] == "collection"]
+    assert collection, "an unread node is reported rather than passed over"
+    assert {r["Node"] for r in collection} == {"spine1"}
+
+
+# --------------------------------------------------------------------------- #
+# snapshots and comparison over HTTP
+# --------------------------------------------------------------------------- #
+
+
+def save_snapshot(test_client, report="lldp", label="before", **params):
+    query = {"label": label, **params}
+    return test_client.post(f"/api/snapshot/{report}", params=query)
+
+
+def test_no_snapshots_to_begin_with(client):
+    test_client, _devices = client
+    assert test_client.get("/api/snapshots").json() == {"snapshots": []}
+
+
+def test_saving_a_snapshot_renders_the_report_and_keeps_it(client):
+    test_client, _devices = client
+    resp = save_snapshot(test_client)
+    assert resp.status_code == 201
+    saved = resp.json()
+    assert saved["report"] == "lldp"
+    assert saved["label"] == "before"
+    assert saved["rows"] == 4
+    assert saved["nodes"] == ["leaf1", "spine1"]
+
+
+def test_a_saved_snapshot_is_listed(client):
+    test_client, _devices = client
+    saved = save_snapshot(test_client).json()
+    listed = test_client.get("/api/snapshots").json()["snapshots"]
+    assert [s["id"] for s in listed] == [saved["id"]]
+
+
+def test_the_list_can_be_narrowed_to_one_report(client):
+    test_client, _devices = client
+    save_snapshot(test_client, report="lldp")
+    save_snapshot(test_client, report="bgp_peers")
+    listed = test_client.get("/api/snapshots?report=bgp_peers").json()["snapshots"]
+    assert [s["report"] for s in listed] == ["bgp_peers"]
+
+
+def test_a_snapshot_can_be_deleted(client):
+    test_client, _devices = client
+    saved = save_snapshot(test_client).json()
+    assert test_client.delete(f"/api/snapshot/{saved['id']}").status_code == 200
+    assert test_client.get("/api/snapshots").json()["snapshots"] == []
+
+
+def test_deleting_a_snapshot_that_is_not_there_is_a_404(client):
+    test_client, _devices = client
+    assert test_client.delete("/api/snapshot/nope").status_code == 404
+
+
+def test_snapshotting_a_report_that_cannot_be_streamed_is_a_404(client):
+    test_client, _devices = client
+    assert test_client.post("/api/snapshot/routing_pol").status_code == 404
+
+
+def test_an_unchanged_fabric_differs_from_its_snapshot_in_nothing(client):
+    test_client, _devices = client
+    saved = save_snapshot(test_client).json()
+    body = test_client.get(f"/api/diff/lldp?against={saved['id']}").json()
+    assert body["rows"] == []
+    assert body["diff"]["counts"]["same"] == 4
+    assert body["diff"]["labels"] == ["before", "now"]
+
+
+def test_a_neighbour_that_went_away_since_the_snapshot(client):
+    test_client, devices = client
+    saved = save_snapshot(test_client).json()
+    devices["leaf1"].push("system/lldp", deletes=["interface[name=ethernet-1/2]"])
+    assert wait_for(
+        lambda: len(test_client.get("/api/report/lldp").json()["rows"]) == 3
+    )
+    body = test_client.get(f"/api/diff/lldp?against={saved['id']}").json()
+    assert body["diff"]["counts"] == {"added": 0, "removed": 1, "changed": 0, "same": 3}
+    removed = [row for row in body["rows"] if row["\u00b1"] == "removed"]
+    assert [(r["Node"], r["interface"]) for r in removed] == [("leaf1", "ethernet-1/2")]
+
+
+def test_a_neighbour_that_changed_since_the_snapshot(client):
+    """The row is the same row - same node, same port - saying something else."""
+    test_client, devices = client
+    saved = save_snapshot(test_client).json()
+    devices["leaf1"].push(
+        "system/lldp",
+        updates=[("interface[name=ethernet-1/1]/neighbor[id=1]/port-description", "to-spine1")],
+    )
+    assert wait_for(
+        lambda: any(
+            row["Nbr-port-desc"] == "to-spine1"
+            for row in test_client.get("/api/report/lldp").json()["rows"]
+        )
+    )
+    body = test_client.get(f"/api/diff/lldp?against={saved['id']}").json()
+    assert body["diff"]["counts"]["changed"] == 1
+    changed = [row for row in body["rows"] if row["\u00b1"] == "changed"][0]
+    assert changed["Nbr-port-desc"] == "to-leaf1 \u2192 to-spine1"
+    assert changed["_changes"] == {"Nbr-port-desc": ["to-leaf1", "to-spine1"]}
+
+
+def test_the_unchanged_rows_can_be_asked_for(client):
+    test_client, _devices = client
+    saved = save_snapshot(test_client).json()
+    body = test_client.get(f"/api/diff/lldp?against={saved['id']}&same=1").json()
+    assert len(body["rows"]) == 4
+    assert all(row["\u00b1"] == "same" for row in body["rows"])
+
+
+def test_two_nodes_are_compared_without_their_names(client):
+    test_client, _devices = client
+    body = test_client.get("/api/diff/lldp?nodes=leaf1,spine1").json()
+    assert body["columns"][0] == "\u00b1"
+    assert "Node" not in body["columns"]
+    # Both fake nodes report the same two neighbours, so they agree.
+    assert body["rows"] == []
+    assert body["diff"]["labels"] == ["leaf1", "spine1"]
+
+
+def test_a_node_the_report_has_no_rows_for_is_said_so(client):
+    test_client, _devices = client
+    body = test_client.get("/api/diff/lldp?nodes=leaf1,leaf9").json()
+    assert [e["node"] for e in body["errors"]] == ["leaf9"]
+
+
+def test_a_diff_needs_something_to_compare_against(client):
+    test_client, _devices = client
+    assert test_client.get("/api/diff/lldp").status_code == 400
+    assert test_client.get("/api/diff/lldp?against=x&nodes=a,b").status_code == 400
+
+
+def test_comparing_nodes_takes_exactly_two(client):
+    test_client, _devices = client
+    assert test_client.get("/api/diff/lldp?nodes=leaf1").status_code == 400
+
+
+def test_a_diff_against_a_snapshot_that_is_not_there_is_a_404(client):
+    test_client, _devices = client
+    assert test_client.get("/api/diff/lldp?against=nope").status_code == 404
+
+
+def test_a_snapshot_of_another_report_is_refused(client):
+    test_client, _devices = client
+    saved = save_snapshot(test_client, report="bgp_peers").json()
+    resp = test_client.get(f"/api/diff/lldp?against={saved['id']}")
+    assert resp.status_code == 400
+    assert "bgp_peers" in resp.json()["error"]
+
+
+def test_a_snapshot_of_a_different_slice_of_the_fabric_is_refused(client):
+    """Every node the two do not share would read as one that came or went."""
+    test_client, _devices = client
+    saved = save_snapshot(test_client, inv_filter="role=leaf").json()
+    resp = test_client.get(f"/api/diff/lldp?against={saved['id']}")
+    assert resp.status_code == 409
+    assert "inventory filter" in resp.json()["error"]
+
+
+def test_a_snapshot_of_the_same_slice_is_compared(client):
+    test_client, _devices = client
+    saved = save_snapshot(test_client, inv_filter="role=leaf").json()
+    resp = test_client.get(f"/api/diff/lldp?against={saved['id']}&inv_filter=role=leaf")
+    assert resp.status_code == 200
+    assert resp.json()["diff"]["counts"]["same"] == 2
+
+
+def test_a_diff_of_a_report_that_cannot_be_streamed_is_a_404(client):
+    test_client, _devices = client
+    assert test_client.get("/api/diff/routing_pol?nodes=a,b").status_code == 404
+
+
+def test_a_snapshot_records_the_fabric_and_the_whole_inventory(fabric, tmp_path):
+    nornir, _devices = fabric
+    app = create_app(
+        nornir, resync_interval=0, topo_name="dc1", snapshot_dir=tmp_path / "snap"
+    )
+    with TestClient(app) as test_client:
+        saved = save_snapshot(test_client).json()
+    assert saved["fabric"] == "dc1"
+    assert saved["inventory"] == sorted(HOSTS)
+
+
+def test_the_recorded_inventory_follows_the_filter(fabric, tmp_path):
+    nornir, _devices = fabric
+    app = create_app(
+        nornir, resync_interval=0, topo_name="dc1", snapshot_dir=tmp_path / "snap"
+    )
+    with TestClient(app) as test_client:
+        saved = save_snapshot(test_client, inv_filter="role=leaf").json()
+    assert saved["inventory"] == ["leaf1"]
+
+
+def test_a_snapshot_of_another_fabric_is_refused(fabric, tmp_path):
+    """One snapshot directory serves every lab, so the diff has to say no."""
+    nornir, _devices = fabric
+    shared = tmp_path / "snapshots"
+
+    dc1 = create_app(nornir, resync_interval=0, topo_name="dc1", snapshot_dir=shared)
+    with TestClient(dc1) as test_client:
+        saved = save_snapshot(test_client).json()
+
+    dc2 = create_app(nornir, resync_interval=0, topo_name="dc2", snapshot_dir=shared)
+    with TestClient(dc2) as test_client:
+        resp = test_client.get(f"/api/diff/lldp?against={saved['id']}")
+    assert resp.status_code == 409
+    assert "dc1" in resp.json()["error"] and "dc2" in resp.json()["error"]
+
+
+def test_the_same_fabric_under_another_name_is_still_compared(fabric, tmp_path):
+    nornir, _devices = fabric
+    shared = tmp_path / "snapshots"
+    app = create_app(nornir, resync_interval=0, topo_name="dc1", snapshot_dir=shared)
+    with TestClient(app) as test_client:
+        saved = save_snapshot(test_client).json()
+        resp = test_client.get(f"/api/diff/lldp?against={saved['id']}")
+    assert resp.status_code == 200
+
+
+def test_a_snapshot_taken_before_a_fabric_was_named_still_compares(client, tmp_path):
+    """The server without a topology name records none, and judges none."""
+    test_client, _devices = client
+    saved = save_snapshot(test_client).json()
+    assert saved["fabric"] == ""
+    assert test_client.get(f"/api/diff/lldp?against={saved['id']}").status_code == 200
+
+
+def test_a_report_says_what_identifies_its_rows(client):
+    test_client, _devices = client
+    reports = {r["name"]: r for r in test_client.get("/api/reports").json()["reports"]}
+    assert reports["bgp_peers"]["key_columns"] == ["Node", "NI", "peer"]
 
 
 # --------------------------------------------------------------------------- #

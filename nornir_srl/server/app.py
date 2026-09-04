@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -20,8 +21,10 @@ from starlette.routing import Mount, Route
 from starlette.staticfiles import StaticFiles
 
 from .. import __version__
+from ..diff import diff_nodes, diff_tables
 from ..reports import SERVER, ReportSpec, coerce_params, get_report, reports_for
 from .agent import NO_PROVIDER, ChatService
+from .snapshots import SnapshotStore, comparable
 from .store import FabricStore
 
 logger = logging.getLogger(__name__)
@@ -166,10 +169,12 @@ def create_app(
     restart_debounce: float = 1.0,
     connect_retry_interval: float = 30.0,
     topo_name: Optional[str] = None,
+    snapshot_dir: Optional[Path] = None,
     chat_client_factory: Optional[Callable[[], Any]] = None,
     jsonrpc_call: Optional[Callable[..., Any]] = None,
 ) -> Starlette:
     """Build the fcli server application around an initialized Nornir inventory."""
+    snapshot_store = SnapshotStore(snapshot_dir)
     store = FabricStore(
         nornir,
         sample_interval=sample_interval,
@@ -279,6 +284,116 @@ def create_app(
             headers=_SSE_HEADERS,
         )
 
+    # ------------------------------------------------------------------ #
+    # snapshots and comparison
+    # ------------------------------------------------------------------ #
+
+    async def snapshots(request: Request) -> Response:
+        report = request.query_params.get("report") or None
+        saved = await anyio.to_thread.run_sync(snapshot_store.list, report)
+        return JSONResponse({"snapshots": [s.as_dict() for s in saved]})
+
+    async def snapshot_save(request: Request) -> Response:
+        """Render *name* now, and keep it to compare against later."""
+        try:
+            report = streamable_report(request.path_params["name"])
+        except KeyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        inv_filter = parse_kv(request.query_params.get("inv_filter"))
+        try:
+            params = coerce_params(report, request.query_params)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        label = request.query_params.get("label", "")
+        table = await anyio.to_thread.run_sync(store.table, report, inv_filter, params)
+        saved = await anyio.to_thread.run_sync(
+            functools.partial(
+                snapshot_store.save,
+                report.name,
+                table,
+                label=label,
+                inv_filter=inv_filter,
+                params=params,
+                fabric=store.topo_name or "",
+                inventory=store.targets(inv_filter),
+            )
+        )
+        return JSONResponse(saved.as_dict(), status_code=201)
+
+    async def snapshot_delete(request: Request) -> Response:
+        removed = await anyio.to_thread.run_sync(
+            snapshot_store.delete, request.path_params["snapshot_id"]
+        )
+        if not removed:
+            return JSONResponse({"error": "no such snapshot"}, status_code=404)
+        return JSONResponse({"deleted": request.path_params["snapshot_id"]})
+
+    async def report_diff(request: Request) -> Response:
+        """Compare a report against a snapshot of it, or one node against another."""
+        try:
+            report = streamable_report(request.path_params["name"])
+        except KeyError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=404)
+        inv_filter = parse_kv(request.query_params.get("inv_filter"))
+        try:
+            params = coerce_params(report, request.query_params)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        include_same = request.query_params.get("same") in ("1", "true", "yes")
+
+        against = request.query_params.get("against")
+        nodes = request.query_params.get("nodes")
+        if bool(against) == bool(nodes):
+            return JSONResponse(
+                {"error": "give either 'against=<snapshot id>' or 'nodes=<a>,<b>'"},
+                status_code=400,
+            )
+
+        table = await anyio.to_thread.run_sync(store.table, report, inv_filter, params)
+
+        if nodes:
+            wanted = [n.strip() for n in nodes.split(",") if n.strip()]
+            if len(wanted) != 2:
+                return JSONResponse(
+                    {"error": "'nodes' takes exactly two node names"}, status_code=400
+                )
+            return JSONResponse(
+                diff_nodes(
+                    table,
+                    wanted[0],
+                    wanted[1],
+                    report.key_columns,
+                    include_same=include_same,
+                )
+            )
+
+        snapshot = await anyio.to_thread.run_sync(snapshot_store.get, str(against))
+        if snapshot is None:
+            return JSONResponse({"error": "no such snapshot"}, status_code=404)
+        if snapshot.report != report.name:
+            return JSONResponse(
+                {"error": f"that snapshot is of report '{snapshot.report}'"},
+                status_code=400,
+            )
+        mismatch = comparable(
+            snapshot,
+            inv_filter,
+            params,
+            fabric=store.topo_name or "",
+            inventory=store.targets(inv_filter),
+        )
+        if mismatch:
+            return JSONResponse({"error": mismatch}, status_code=409)
+        return JSONResponse(
+            diff_tables(
+                snapshot.table,
+                table,
+                report.key_columns,
+                labels=(snapshot.label, "now"),
+                include_same=include_same,
+            )
+        )
+
     async def chat_turn(request: Request) -> Response:
         if not chat.enabled():
             return JSONResponse({"error": NO_PROVIDER}, status_code=503)
@@ -329,6 +444,10 @@ def create_app(
         Route("/api/topology", topology),
         Route("/api/report/{name}", report_once),
         Route("/api/stream/{name}", report_stream),
+        Route("/api/diff/{name}", report_diff),
+        Route("/api/snapshots", snapshots),
+        Route("/api/snapshot/{name}", snapshot_save, methods=["POST"]),
+        Route("/api/snapshot/{snapshot_id}", snapshot_delete, methods=["DELETE"]),
         Route("/api/chat", chat_turn, methods=["POST"]),
         Mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static"),
     ]
@@ -360,6 +479,7 @@ def serve(
     idle_timeout: float = 900.0,
     log_level: str = "info",
     topo_name: Optional[str] = None,
+    snapshot_dir: Optional[Path] = None,
 ) -> None:
     """Run the fcli server with uvicorn (blocking)."""
     import uvicorn
@@ -372,6 +492,7 @@ def serve(
         workers=workers,
         idle_timeout=idle_timeout,
         topo_name=topo_name,
+        snapshot_dir=snapshot_dir,
     )
     store = app.store
     config = uvicorn.Config(

@@ -38,6 +38,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from ..aliases import alias_index, resolve, tail
 from ..connections.down_reason import STANDBY_STATE, is_intent, root_reason
 
 #: The tiers of a fabric, bottom up, as ``(layer, role, label)``.
@@ -859,42 +860,14 @@ def _port_rate(egress: Dict[str, Dict[str, int]], node: str, port: str) -> Optio
 
 
 def _alias_index(nodes: List[NodeFacts]) -> Dict[str, str]:
-    """Map every name a node may be known by onto its inventory name.
-
-    LLDP identifies a neighbour by the system-name it advertises, which is
-    rarely the name the inventory uses: containerlab prefixes the inventory with
-    the lab name while the node keeps its short hostname, and a real fabric
-    hands out FQDNs. An alias two nodes could both answer to is dropped rather
-    than guessed at.
-    """
-    direct: Dict[str, Set[str]] = {}
-    tails: Dict[str, Set[str]] = {}
-    for node in nodes:
-        for alias in (node.name, node.hostname, node.system_name):
-            if not alias:
-                continue
-            text = alias.strip().lower()
-            short = text.split(".")[0]
-            direct.setdefault(text, set()).add(node.name)
-            direct.setdefault(short, set()).add(node.name)
-            tails.setdefault(_tail(short), set()).add(node.name)
-    index = {alias: next(iter(owners)) for alias, owners in direct.items() if len(owners) == 1}
-    for alias, owners in tails.items():
-        if alias not in index and len(owners) == 1:
-            index[alias] = next(iter(owners))
-    return index
+    """Map every name a node may be known by onto its inventory name."""
+    return alias_index(
+        [(node.name, node.hostname, node.system_name) for node in nodes]
+    )
 
 
-def _resolve(advertised: str, index: Dict[str, str]) -> Optional[str]:
-    """The inventory name of an advertised system-name, if we have that node."""
-    text = advertised.strip().lower()
-    short = text.split(".")[0]
-    return index.get(text) or index.get(short) or index.get(_tail(short))
-
-
-def _tail(name: str) -> str:
-    """The last dash-separated segment: ``clab-dc1-leaf1`` is ``leaf1``."""
-    return name.rsplit("-", 1)[-1] or name
+_resolve = resolve
+_tail = tail
 
 
 # --------------------------------------------------------------------------- #

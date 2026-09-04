@@ -135,6 +135,15 @@ class ReportSpec:
     #: Arguments a user supplies, for the surfaces that can collect them.
     #: Every one is optional, and a report renders in full without them.
     params: Tuple[ParamSpec, ...] = ()
+    #: The columns that identify a row rather than describe it, which is what
+    #: comparing two renderings of this report keys on. Spelled as the rendered
+    #: table spells them: the ``<n>_`` that only orders a column is gone by
+    #: then, and so are the newlines that wrap a header.
+    #:
+    #: A report that declares none can still be compared - every difference
+    #: then reads as one row gone and another arrived, rather than as a row
+    #: that changed.
+    key_columns: Tuple[str, ...] = ()
 
     @property
     def tool_name(self) -> str:
@@ -152,6 +161,9 @@ class ReportSpec:
             "category": self.category,
             "sample_interval": self.sample_interval,
             "params": [p.as_dict() for p in self.params],
+            # The browser offers a comparison either way, and says which kind
+            # it can be: without keys, a change reads as an add and a remove.
+            "key_columns": list(self.key_columns),
         }
 
 
@@ -381,6 +393,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="sys_info",
         resource="sys_info",
+        key_columns=("Node",),
         title="System Info",
         description="Chassis type, serial, software version and last boot time.",
         getter=lambda d: d.get_info(),
@@ -394,6 +407,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="ifstats",
         resource="ifstats",
+        key_columns=("Node", "interface"),
         title="Interface Stats",
         description="Per-interface rates and error/discard counters, derived from "
         "streamed gNMI counter samples.",
@@ -409,6 +423,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="subif",
         resource="subinterface",
+        key_columns=("Node", "Subitf"),
         title="Sub-Interfaces",
         description="Sub-interfaces with their type, addresses and operational state.",
         getter=lambda d: d.get_sum_subitf(),
@@ -423,6 +438,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="lag",
         resource="lag",
+        key_columns=("Node", "lag", "member-itf"),
         title="LAGs",
         description="Link aggregation groups and their members.",
         getter=lambda d: d.get_lag(),
@@ -435,6 +451,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="ni",
         resource="nwi_itfs",
+        key_columns=("Node", "NI", "Subitf"),
         title="Network Instances",
         description="Network instances and the interfaces bound to them.",
         getter=lambda d: d.get_nwi_itf(),
@@ -449,6 +466,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="bgp_peers",
         resource="bgp_peers",
+        key_columns=("Node", "NI", "peer"),
         title="BGP Peers",
         description="BGP neighbors, their session state and per-AF route counters.",
         getter=lambda d: d.get_sum_bgp(),
@@ -471,6 +489,9 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="ipv4_rib",
         resource="ip_rib",
+        # A prefix can be offered by more than one protocol at once, so the
+        # route type is part of what names a route rather than of what it says.
+        key_columns=("Node", "NI", "Prefix", "type"),
         title="IPv4 RIB",
         description="IPv4 route table with resolved next-hops.",
         getter=lambda d, address=None: d.get_rib(
@@ -486,6 +507,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="ipv6_rib",
         resource="ip_rib",
+        key_columns=("Node", "NI", "Prefix", "type"),
         title="IPv6 RIB",
         description="IPv6 route table with resolved next-hops.",
         getter=lambda d, address=None: d.get_rib(
@@ -501,6 +523,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="static_routes",
         resource="static_routes",
+        key_columns=("Node", "NI", "route"),
         title="Static Routes",
         description="Configured static routes and their operational state.",
         getter=lambda d: d.get_static_routes(),
@@ -513,6 +536,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="tunnel_table",
         resource="tunnel_table",
+        key_columns=("Node", "NI", "Prefix", "type"),
         title="Tunnel Table",
         description="IP tunnel table (VXLAN, LDP, SR-ISIS, RSVP, ...).",
         getter=lambda d: d.get_tunnel_table(),
@@ -533,6 +557,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="services",
         resource="services",
+        key_columns=("Node", "Service Type", "MAC-VRF", "IP-VRF"),
         title="Services",
         description="EVPN Bridge Domains (MAC-VRF) and Routers (IP-VRF) grouped by "
         "Route-Target.",
@@ -545,6 +570,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="bridge_domains",
         resource="bridge_domains",
+        key_columns=("Node", "MAC-VRF"),
         title="Bridge Domains",
         description="EVPN Bridge Domains (MAC-VRF) grouped by Route-Target with bound "
         "access sub-interfaces, their ethernet-segments and VXLAN overlays.",
@@ -557,6 +583,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="routers",
         resource="routers",
+        key_columns=("Node", "IP-VRF"),
         title="Routers",
         description="EVPN Routers (IP-VRF) grouped by Route-Target with bound MAC-VRFs, "
         "routed sub-interfaces, virtual ethernet-segments and VXLAN overlays.",
@@ -569,6 +596,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="mac",
         resource="mac_table",
+        key_columns=("Node", "NI", "Address"),
         title="MAC Table",
         description="Bridge table MAC entries per network instance.",
         getter=lambda d: d.get_mac_table(),
@@ -579,6 +607,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="irb",
         resource="irb",
+        key_columns=("Node", "name"),
         title="IRB Interfaces",
         description="IRB sub-interfaces and their anycast gateway configuration.",
         getter=lambda d: d.get_irb(),
@@ -593,6 +622,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="es",
         resource="es",
+        key_columns=("Node", "name"),
         title="Ethernet Segments",
         description="EVPN ethernet segments, multi-homing mode and DF state.",
         getter=lambda d: d.get_es(),
@@ -603,6 +633,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="es_dest",
         resource="es_dest",
+        key_columns=("Node", "tunnel", "esi"),
         title="L2-ES Destinations",
         description="Ethernet segment destinations in the bridge table.",
         getter=lambda d: d.get_es_dest(),
@@ -613,6 +644,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="vxlan",
         resource="vxlan",
+        key_columns=("Node", "vxlan-itf"),
         title="VXLAN Tunnels",
         description="VXLAN tunnel interfaces and their unicast destinations.",
         getter=lambda d: d.get_vxlan(),
@@ -623,6 +655,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="lldp",
         resource="lldp_nbrs",
+        key_columns=("Node", "interface", "Nbr-System", "Nbr-port"),
         title="LLDP Neighbors",
         description="LLDP neighbors seen on each interface.",
         getter=lambda d: d.get_lldp_sum(),
@@ -636,6 +669,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="arp",
         resource="arp",
+        key_columns=("Node", "interface", "IPv4"),
         title="ARP Table",
         description="IPv4 ARP / neighbor entries per sub-interface.",
         getter=lambda d: d.get_arp(),
@@ -649,6 +683,7 @@ REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="nd",
         resource="nd",
+        key_columns=("Node", "interface", "IPv6"),
         title="IPv6 Neighbors",
         description="IPv6 neighbor discovery entries per sub-interface.",
         getter=lambda d: d.get_nd(),
@@ -658,6 +693,21 @@ REPORTS: List[ReportSpec] = [
             SubscriptionSpec("/interface[name=*]/subinterface[index=*]/ipv6/neighbor-discovery/neighbor", datatype="all"),
             SubscriptionSpec("/network-instance[name=*]", datatype="config"),
         ),
+    ),
+    ReportSpec(
+        name="checks",
+        resource="checks",
+        key_columns=("Node", "Check", "Subject"),
+        title="Checks",
+        description="Fabric sanity checks: BGP sessions, interfaces, LLDP adjacencies, "
+        "MTU, EVPN service consistency and ethernet-segment DF election.",
+        # A finding is about the fabric rather than about one node, so this is
+        # not collected per device. Each surface runs nornir_srl.checks over the
+        # reports the checks declare, which is where the gNMI work happens.
+        getter=lambda d: {},
+        category="Dashboard",
+        mcp_name="fabric_checks",
+        sample_interval=20,
     ),
 ]
 

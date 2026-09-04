@@ -139,12 +139,16 @@ def _cli_commands():
     return {c.callback.__name__: c for c in cli.app.registered_commands}
 
 
+#: Commands that are not reports: they run the fabric, or run over a report,
+#: rather than being one.
+NON_REPORT_COMMANDS = {"server", "diff"}
+
+
 def test_cli_exposes_exactly_the_cli_reports():
     commands = _cli_commands()
     expected = {r.name for r in reports_for(CLI)}
-    # 'server' is a command but not a report.
     assert expected <= set(commands)
-    assert set(commands) - expected == {"server"}
+    assert set(commands) - expected == NON_REPORT_COMMANDS
 
 
 def test_mcp_exposes_exactly_the_mcp_reports():

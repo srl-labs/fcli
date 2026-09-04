@@ -120,6 +120,22 @@ def clean_columns(columns: Iterable[str]) -> List[str]:
     return [clean_structured_key(c) for c in columns]
 
 
+def cell(value: Any) -> Any:
+    """Render one value into something JSON- and table-friendly.
+
+    Shared, because a table saved as a snapshot on one surface is compared
+    against one rendered on another, and two spellings of the same list would
+    read as a change.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, list):
+        return ", ".join(str(v) for v in value)
+    return str(value)
+
+
 def pass_filter(row: Dict[str, Any], filter: Optional[Dict[str, Any]]) -> bool:
     """True when *row* matches every ``field=regex`` pair in *filter*.
 
