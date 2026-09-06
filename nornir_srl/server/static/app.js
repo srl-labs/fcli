@@ -2111,15 +2111,29 @@
     return state.colWidths.get(column) || COL_WIDTH_DEFAULT;
   }
 
+  // An empty cell closing every row, under the filler column below.
+  function fillerCell(tag) {
+    const cell = document.createElement(tag);
+    cell.className = "col-filler-cell";
+    cell.setAttribute("aria-hidden", "true");
+    return cell;
+  }
+
   function renderColGroup(columns) {
-    dom.gridCols.replaceChildren(
-      ...columns.map((column) => {
-        const col = document.createElement("col");
-        col.style.width = `${columnWidth(column)}px`;
-        col.dataset.column = column;
-        return col;
-      })
-    );
+    const cols = columns.map((column) => {
+      const col = document.createElement("col");
+      col.style.width = `${columnWidth(column)}px`;
+      col.dataset.column = column;
+      return col;
+    });
+    // A trailing column with no width of its own, to soak up whatever space is
+    // left over. A table narrower than its pane is stretched to fill it, and the
+    // browser hands the slack back to the columns - which pins the last column's
+    // right edge to the table's own and leaves its grip nothing to drag.
+    const filler = document.createElement("col");
+    filler.className = "col-filler";
+    cols.push(filler);
+    dom.gridCols.replaceChildren(...cols);
   }
 
   let columnResize = null;
@@ -2232,6 +2246,9 @@
       filterCell.append(input);
       dom.filterRow.append(filterCell);
     }
+
+    dom.headRow.append(fillerCell("th"));
+    dom.filterRow.append(fillerCell("th"));
 
     if (activeColumn) {
       const newInput = dom.filterRow.querySelector(`input[data-column="${CSS.escape(activeColumn)}"]`);
@@ -3028,6 +3045,62 @@
     return section;
   }
 
+  /** Open or close every node block and detail section inside one card. */
+  function setCardContentsCollapsed(card, collapsed) {
+    card.querySelectorAll(".bd-node").forEach((node) => {
+      node.classList.toggle("is-collapsed", collapsed);
+      const content = node.querySelector(".bd-node-content");
+      if (content) content.hidden = collapsed;
+      const title = node.querySelector(".bd-node-title");
+      if (title) title.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      const nodeKey = node.dataset.nodeKey;
+      if (!nodeKey) return;
+      if (collapsed) state.collapsedNodes.add(nodeKey);
+      else state.collapsedNodes.delete(nodeKey);
+    });
+    card.querySelectorAll(".bd-detail-section").forEach((section) => {
+      section.classList.toggle("is-collapsed", collapsed);
+      const content = section.querySelector(".bd-detail-section-content");
+      if (content) content.hidden = collapsed;
+      const header = section.querySelector(".bd-detail-section-header");
+      if (header) header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      const sectionKey = section.dataset.sectionKey;
+      if (!sectionKey) return;
+      if (collapsed) state.collapsedSections.add(sectionKey);
+      else state.collapsedSections.delete(sectionKey);
+    });
+  }
+
+  // Expand/collapse for the levels *inside* one card. The card header already
+  // toggles the card itself, so these reach the per-node blocks and their
+  // fields, which is where a router spanning several nodes gets too deep to
+  // scan. Collapsing leaves the card open, so the result stays visible.
+  function cardScopeControls(card, expandCard) {
+    const group = document.createElement("div");
+    group.className = "bd-card-controls";
+
+    const makeButton = (label, title, collapsed) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "bd-card-control-btn";
+      button.textContent = label;
+      button.title = title;
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        expandCard();
+        setCardContentsCollapsed(card, collapsed);
+      });
+      return button;
+    };
+
+    group.append(
+      makeButton("⊞", "Expand every node and field in this card", false),
+      makeButton("⊟", "Collapse every node and field in this card", true),
+    );
+    return group;
+  }
+
   function renderBridgeDomainsCards(rows) {
     const bdMap = new Map();
     for (const row of rows) {
@@ -3462,7 +3535,13 @@
 
       topRow.append(chevron, icon, title);
       if (isDciService(rRows)) topRow.append(roleBadge("DCI", "bd-dci-badge"));
-      topRow.append(stateBadge, badge);
+      // ``expandCard`` is only read when a button is clicked, by which time the
+      // card is built and the binding below has been evaluated.
+      topRow.append(
+        stateBadge,
+        badge,
+        cardScopeControls(card, () => expandCard()),
+      );
       header.append(topRow);
 
       const subRow = document.createElement("div");
@@ -3554,6 +3633,10 @@
           toggleCard();
         }
       });
+
+      const expandCard = () => {
+        if (card.classList.contains("is-collapsed")) toggleCard();
+      };
 
       const nodeMap = new Map();
       for (const row of rRows) {
@@ -4026,6 +4109,7 @@
         }
         tr.append(td);
       }
+      tr.append(fillerCell("td"));
       fragment.append(tr);
     }
     // Remember every row of the payload, not just the ones on screen, so that

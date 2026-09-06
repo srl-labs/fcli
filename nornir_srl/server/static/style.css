@@ -635,6 +635,23 @@ tr.diff-same td {
   vertical-align: middle;
 }
 
+/* Takes whatever width the named columns leave, so each of them keeps the width
+   it was given and the last one still has room to be dragged. */
+.grid col.col-filler {
+  width: auto;
+}
+
+.grid thead tr:first-child th.col-filler-cell,
+.grid thead tr.filter-row th.col-filler-cell,
+.grid tbody td.col-filler-cell {
+  padding: 0;
+  cursor: default;
+}
+
+.grid thead tr:first-child th.col-filler-cell:hover {
+  color: inherit;
+}
+
 .col-resize {
   position: absolute;
   top: 0;
@@ -1118,6 +1135,37 @@ th.filtered::after {
 .bd-title {
   color: var(--text);
   font-family: var(--mono);
+}
+
+/* Per-card expand/collapse. Sits after the node count, which is what carries
+   the margin-left:auto that pushes this group to the end of the header row. */
+.bd-card-controls {
+  display: flex;
+  gap: 4px;
+  flex-shrink: 0;
+}
+
+.bd-card-control-btn {
+  background: var(--panel);
+  color: var(--muted);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 8px;
+  font-size: 13px;
+  line-height: 1.35;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+
+.bd-card-control-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.bd-card-control-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
 }
 
 .bd-badge-count {
