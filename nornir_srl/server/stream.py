@@ -30,6 +30,7 @@ from .tree import (
     join_path,
     materialize,
     parse_path,
+    prune,
     select_path,
 )
 
@@ -87,6 +88,19 @@ _SHARED_ROOTS: Tuple[str, ...] = ("interface", "network-instance")
 #: Healthy Gets (resync, bootstrap) finish well inside this; a Get that hangs
 #: against a dead route does not, and that is what the Nodes pane should show.
 GET_HANG_GRACE = 2.0
+
+#: How many sample intervals a list entry may go unrefreshed before it is taken
+#: to have gone away on the device. More than one tick of slack, so a sample
+#: that is late or lost does not blank out live state.
+STALE_ENTRY_TICKS = 3
+
+#: Floor under the above, for paths sampled so fast that a few ticks is no
+#: margin at all.
+MIN_STALE_TTL = 45.0
+
+#: Seconds between eviction sweeps. The sweep walks the whole tree, so it is
+#: kept well clear of the per-notification path.
+PRUNE_INTERVAL = 10.0
 
 
 @dataclass
@@ -228,6 +242,8 @@ class HostStream:
         self._get_started: Optional[float] = None
         #: Why the last Get failed, kept until one succeeds again.
         self._get_error: Optional[str] = None
+        #: When the last stale-entry sweep ran (monotonic).
+        self._last_prune = 0.0
         self.last_update: Optional[float] = None
         self.connected = False
         self.error: Optional[str] = None
@@ -616,12 +632,69 @@ class HostStream:
             # Gets, so one failure would have kept the node red indefinitely.
             self._failing_since = None
             self._get_error = None
+            self._evict_stale()
         self.last_update = time.time()
         if self.on_update is not None:
             try:
                 self.on_update()
             except Exception:  # noqa: BLE001
                 pass
+
+    def _evict_stale(self) -> None:
+        """Drop list entries the subscription has stopped refreshing.
+
+        SAMPLE mode re-sends every leaf of a subtree on each tick and never
+        reports a delete, while the tree merges rather than replaces so that
+        two subscriptions sharing an envelope cannot erase each other. An entry
+        that goes away on the device therefore lingers, and until this ran the
+        only thing that removed it was the resync sweep, minutes later: a
+        designated forwarder that moved rendered as two.
+
+        Caller holds ``self._lock``.
+        """
+        now = time.monotonic()
+        if now - self._last_prune < PRUNE_INTERVAL:
+            return
+        self._last_prune = now
+        # Nothing is refreshing the tree while the RPC is down, and a sweep then
+        # would read an outage as the whole fabric going away. The same applies
+        # right after reconnecting, until the subscription has had time to
+        # deliver a full tick of every path.
+        if not self.connected or self._subscribed_at is None:
+            return
+        uptime = time.time() - self._subscribed_at
+
+        # An envelope is what the tree merges into, so what survives under one
+        # is decided by the slowest path feeding it, not by whichever path the
+        # entry originally arrived on.
+        horizons: Dict[str, float] = {}
+        for state in self._paths.values():
+            if not (state.streamable and state.bootstrapped):
+                continue
+            if state.spec.mode != "sample":
+                continue
+            ttl = max(STALE_ENTRY_TICKS * state.spec.sample_interval, MIN_STALE_TTL)
+            for env in state.envelopes:
+                horizons[env] = max(horizons.get(env, 0.0), ttl)
+        if "" in horizons:  # the root envelope overlaps every other one
+            horizons[""] = max(horizons.values())
+
+        for env, ttl in horizons.items():
+            if uptime < ttl:
+                continue
+            node = self._tree if env == "" else get_node(self._tree, env)
+            if node is None:
+                continue
+            dropped = prune(node, now - ttl)
+            if dropped:
+                logger.debug(
+                    "%s: dropped %d stale entr%s under %s (unrefreshed for %.0fs)",
+                    self.name,
+                    dropped,
+                    "y" if dropped == 1 else "ies",
+                    env or "/",
+                    ttl,
+                )
 
     # ------------------------------------------------------------------ #
     # reads

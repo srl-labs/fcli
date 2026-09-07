@@ -2,14 +2,17 @@
 
 import threading
 import time
+from typing import Any, Dict, List
 
 import pytest
 
 from nornir_srl.server.devices import CachedDevice, RecordingDevice
 from nornir_srl.reports import SubscriptionSpec
+from nornir_srl.server import stream as stream_module
 from nornir_srl.server.stream import HostStream, RateTracker
 
 from .fakes import (
+    ES_PATH,
     IFSTATE_PATH,
     IFSTATE_RESPONSE,
     IFSTATS_PATH,
@@ -210,6 +213,170 @@ def test_paths_a_report_still_reads_are_not_retired(lldp_stream):
     assert stream.snapshot(LLDP_PATH) is not None
     assert stream._retire_idle_paths() is False
     assert stream.status()["paths"][0]["path"] == LLDP_PATH
+
+
+# --------------------------------------------------------------------------- #
+# ageing out entries the target stopped reporting
+# --------------------------------------------------------------------------- #
+
+#: An ethernet-segment whose DF election has two candidates, the second elected.
+ES_DF_RESPONSE: List[Dict[str, Any]] = [
+    {
+        "system/network-instance/protocols/evpn/ethernet-segments": {
+            "bgp-instance": [
+                {
+                    "id": 1,
+                    "ethernet-segment": [
+                        {
+                            "name": "ES-01",
+                            "association": {
+                                "network-instance": [
+                                    {
+                                        "name": "subnet-1",
+                                        "bgp-instance": [
+                                            {
+                                                "instance": 1,
+                                                "computed-designated-forwarder-candidates": {
+                                                    "designated-forwarder-candidate": [
+                                                        {
+                                                            "address": "192.168.255.1",
+                                                            "designated-forwarder": False,
+                                                        },
+                                                        {
+                                                            "address": "192.168.255.2",
+                                                            "designated-forwarder": True,
+                                                        },
+                                                    ]
+                                                },
+                                            }
+                                        ],
+                                    }
+                                ]
+                            },
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+]
+
+_ES_CANDIDATE = (
+    "system/network-instance/protocols/evpn/ethernet-segments"
+    "/bgp-instance[id=1]/ethernet-segment[name=ES-01]"
+    "/association/network-instance[name=subnet-1]/bgp-instance[instance=1]"
+    "/computed-designated-forwarder-candidates"
+    "/designated-forwarder-candidate[address={address}]/designated-forwarder"
+)
+
+
+def _df_candidates(stream) -> List[Dict[str, Any]]:
+    envelope = stream.snapshot(ES_PATH)[0][
+        "system/network-instance/protocols/evpn/ethernet-segments"
+    ]
+    segment = envelope["bgp-instance"][0]["ethernet-segment"][0]
+    association = segment["association"]["network-instance"][0]["bgp-instance"][0]
+    return association["computed-designated-forwarder-candidates"][
+        "designated-forwarder-candidate"
+    ]
+
+
+@pytest.fixture
+def es_stream(monkeypatch):
+    """An ES subscription whose entries go stale in a fraction of a second."""
+    monkeypatch.setattr(stream_module, "STALE_ENTRY_TICKS", 0)
+    monkeypatch.setattr(stream_module, "MIN_STALE_TTL", 0.2)
+    monkeypatch.setattr(stream_module, "PRUNE_INTERVAL", 0.0)
+    device = FakeDevice({ES_PATH: ES_DF_RESPONSE})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    stream.ensure_paths([SubscriptionSpec(ES_PATH, "all", sample_interval=20)])
+    assert wait_for(lambda: device.subscribe_requests)
+    assert wait_for(lambda: stream.connected)
+    # The sweep waits out one TTL of subscription uptime before trusting that a
+    # missing entry is really missing; the test has no time to sit through it.
+    stream._subscribed_at = time.time() - 60
+    yield stream, device
+    stream.stop()
+
+
+def _sample(device, *addresses: str) -> None:
+    """One SAMPLE tick, carrying exactly the candidates the node still has."""
+    device.push(
+        "", [(_ES_CANDIDATE.format(address=a), True) for a in addresses]
+    )
+
+
+def _sample_until(device, addresses, predicate, timeout: float = 3.0) -> bool:
+    """Keep sampling *addresses* until *predicate* holds. Eviction is driven by
+    arriving notifications, so a tree only ages while the node keeps talking."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        _sample(device, *addresses)
+        time.sleep(0.05)
+        if predicate():
+            return True
+    return predicate()
+
+
+def test_a_candidate_the_target_stopped_sending_is_dropped(es_stream):
+    """A DF that moved must not leave the old winner behind as a second DF.
+
+    SAMPLE mode re-sends every candidate each tick and never reports a delete,
+    so a candidate that stops arriving is one the node no longer has. Keeping it
+    rendered two designated forwarders for one segment until the next resync.
+    """
+    stream, device = es_stream
+    assert len(_df_candidates(stream)) == 2
+
+    assert _sample_until(
+        device, ["192.168.255.1"], lambda: len(_df_candidates(stream)) == 1
+    )
+    assert _df_candidates(stream) == [
+        {"address": "192.168.255.1", "designated-forwarder": True}
+    ]
+
+
+def test_candidates_the_target_keeps_sending_survive(es_stream):
+    stream, device = es_stream
+    both = ["192.168.255.1", "192.168.255.2"]
+    assert not _sample_until(
+        device, both, lambda: len(_df_candidates(stream)) != 2, timeout=1.0
+    )
+
+
+def test_nothing_is_dropped_while_the_subscription_is_down(es_stream):
+    """An outage is not the fabric going away, and must not empty the tree."""
+    stream, device = es_stream
+    stream.connected = False
+    assert not _sample_until(
+        device, ["192.168.255.1"], lambda: len(_df_candidates(stream)) != 2, timeout=1.0
+    )
+
+
+def test_nothing_is_dropped_before_the_subscription_has_run_a_full_ttl(
+    es_stream, monkeypatch
+):
+    """Entries go stale during an outage because nothing is arriving, not
+    because the node dropped them, so a reconnect starts the clock over."""
+    stream, device = es_stream
+    monkeypatch.setattr(stream_module, "MIN_STALE_TTL", 0.6)
+    applied = stream.last_update
+    _sample(device, "192.168.255.1")
+    assert wait_for(lambda: stream.last_update != applied)
+    time.sleep(0.8)  # .2 has gone unrefreshed for longer than the TTL
+
+    stream._subscribed_at = time.time()  # ...but the subscription just came up
+    assert not _sample_until(
+        device,
+        ["192.168.255.1"],
+        lambda: len(_df_candidates(stream)) != 2,
+        timeout=0.4,
+    )
+
+    stream._subscribed_at = time.time() - 60
+    assert _sample_until(
+        device, ["192.168.255.1"], lambda: len(_df_candidates(stream)) == 1
+    )
 
 
 # --------------------------------------------------------------------------- #

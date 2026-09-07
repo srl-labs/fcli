@@ -18,6 +18,7 @@ from __future__ import annotations
 import copy
 import fnmatch
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 __all__ = [
@@ -31,6 +32,7 @@ __all__ = [
     "get_node",
     "key_matches",
     "materialize",
+    "prune",
     "select_path",
     "strip_module",
     "strip_values",
@@ -47,20 +49,33 @@ def strip_module(name: str) -> str:
     return name
 
 
-class ListNode:
-    """A YANG list: an ordered mapping of key-tuple -> (keys, child node)."""
+def _now() -> float:
+    """Clock used to age list entries. Patched in tests."""
+    return time.monotonic()
 
-    __slots__ = ("entries",)
+
+class ListNode:
+    """A YANG list: an ordered mapping of key-tuple -> (keys, child node).
+
+    Each entry also carries the time it was last written to. A SAMPLE
+    subscription re-sends every leaf of its subtree on each tick but never
+    reports a delete, so an entry that stops being written to is one that has
+    gone away on the device; :func:`prune` is what acts on that.
+    """
+
+    __slots__ = ("entries", "seen")
 
     def __init__(self) -> None:
         # Key values keep the type the device reported them with where it is
         # known: a Get payload types them, a gNMI path can only spell them out.
         # Identity goes through _key_ident, so the two forms still collide.
         self.entries: Dict[str, Tuple[Dict[str, Any], Dict[str, Any]]] = {}
+        self.seen: Dict[str, float] = {}
 
     def entry(self, keys: Dict[str, Any]) -> Dict[str, Any]:
         """Return (creating if needed) the child node for *keys*."""
         ident = _key_ident(keys)
+        self.seen[ident] = _now()
         found = self.entries.get(ident)
         if found is None:
             child: Dict[str, Any] = {}
@@ -71,9 +86,12 @@ class ListNode:
     def put(self, ident: str, keys: Dict[str, Any], child: Dict[str, Any]) -> None:
         """Store *child* under an explicit identity (used when re-keying)."""
         self.entries[ident] = (dict(keys), child)
+        self.seen[ident] = _now()
 
     def pop(self, keys: Dict[str, Any]) -> None:
-        self.entries.pop(_key_ident(keys), None)
+        ident = _key_ident(keys)
+        self.entries.pop(ident, None)
+        self.seen.pop(ident, None)
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -359,6 +377,29 @@ def materialize(node: Any) -> Any:
     if isinstance(node, list):
         return copy.deepcopy(node)
     return node
+
+
+def prune(node: Any, cutoff: float) -> int:
+    """Drop every list entry not written to since *cutoff*, recursively.
+
+    Returns how many entries were removed. Writing to a keyed element refreshes
+    each keyed ancestor on the way down (see :func:`_descend`), so an entry that
+    still exists on the device stays fresh even when only a leaf deep inside it
+    is carried by the update.
+    """
+    removed = 0
+    if isinstance(node, ListNode):
+        for ident in [i for i, seen in node.seen.items() if seen < cutoff]:
+            node.entries.pop(ident, None)
+            node.seen.pop(ident, None)
+            removed += 1
+        for _keys, child in list(node.entries.values()):
+            removed += prune(child, cutoff)
+        return removed
+    if isinstance(node, dict):
+        for value in list(node.values()):
+            removed += prune(value, cutoff)
+    return removed
 
 
 def key_matches(pattern: str, value: str) -> bool:
