@@ -900,6 +900,63 @@ def test_get_bridge_domains():
     assert bd["System IPv6"] == ""
 
 
+def test_get_bridge_domains_lists_a_shared_subnet_once():
+    """Two IRB addresses in one subnet are one subnet of the service.
+
+    An EVPN gateway is commonly addressed twice on the same IRB - a per-node
+    address next to the anycast one - and both resolve to the same network, which
+    the MAC-VRF heading of a node card used to name twice.
+    """
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    data = [
+        {
+            "network-instance": [
+                {
+                    "name": "mac-vrf-104",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [
+                        {
+                            "name": "irb1.104",
+                            "ipv4": {
+                                "address": [
+                                    {"ip-prefix": "10.0.4.1/24"},
+                                    {"ip-prefix": "10.0.4.254/24", "anycast-gw": True},
+                                ]
+                            },
+                        },
+                    ],
+                },
+            ]
+        }
+    ]
+
+    dev = _FakeLayer2({"network-instance": data, "subinterface": [{}]})
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+    assert bd["Subnets"] == "10.0.4.0/24"
+    # Both addresses still belong on the interface itself.
+    assert bd["IRB Interface"] == (
+        "irb1.104 [up]: 10.0.4.1/24, 10.0.4.254/24 (anycast-gw: true)"
+    )
+
+
 def test_system0_addresses_skips_link_local_and_reads_system0():
     from nornir_srl.connections.layer2 import _system0_addresses
 

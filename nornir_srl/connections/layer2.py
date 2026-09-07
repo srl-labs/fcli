@@ -1219,7 +1219,12 @@ class Layer2Mixin:
                         assoc_vrfs = irb_to_ip_vrf.get(name, [])
                         irb_item_str, subnets, _st = _format_irb_item_and_subnets(name, i, assoc_vrfs)
                         irb_subitfs.append(irb_item_str)
-                        all_subnets.extend(subnets)
+                        # One subnet per entry: an IRB addressed more than once in
+                        # the same subnet - a gateway address alongside an
+                        # anycast one - is still a single subnet of the service.
+                        for subnet in subnets:
+                            if subnet not in all_subnets:
+                                all_subnets.append(subnet)
                     else:
                         vlan_info = _extract_vlan_encap(name, i)
                         label = _subinterface_state_label(name, i, details, parents)
