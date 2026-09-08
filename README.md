@@ -67,19 +67,28 @@ Run fcli against a live 3-stage EVPN-VXLAN fabric in the cloud — no local cont
 </div>
 ---
 
-The Codespace installs fcli immediately, then deploys the [demo lab](labs/demo/) (8 SR Linux nodes, 9 servers, EVPN-VXLAN) and starts `fcli server` on port **8080** in the background. First boot can take **15–30 minutes** while SR Linux images are pulled and the fabric converges — the Codespace is usable right away; watch progress with:
+Creating the Codespace hands the slow work to a background script, so the editor is usable immediately. [`.devcontainer/setup.sh`](.devcontainer/setup.sh) narrates five steps into `/tmp/fcli-codespace-setup.log`:
+
+1. wait for the Docker daemon
+2. install fcli from the sources in the repo (`uv sync`)
+3. deploy the [demo lab](labs/demo/) — 8 SR Linux nodes and 9 servers
+4. wait until every node answers gNMI, which is only once SR Linux has booted
+5. start `fcli server` on port 8080
+
+Step 3 is the long one: each SR Linux image is about 1 GB, so the first run usually takes **15–30 minutes**. Watch it work, or ask for a summary:
 
 ```bash
 tail -f /tmp/fcli-codespace-setup.log
+bash .devcontainer/status.sh
 ```
 
-If the lab did not start automatically, run:
+If the lab did not start at all, run it yourself — it is safe to repeat, and a second run does nothing while the first is still going:
 
 ```bash
 bash .devcontainer/launch-setup.sh
 ```
 
-Once ready, open port 8080 in the **Ports** tab for the live web UI (Overview, Topology, BGP, EVPN services, …).
+Once step 5 is reached, open port 8080 in the **Ports** tab for the live web UI (Overview, Topology, BGP, EVPN services, …).
 
 ```bash
 # CLI reports against the same fabric
