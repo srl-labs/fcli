@@ -611,6 +611,12 @@ def server(
         "--resync",
         help="Interval (seconds) for a full gNMI re-read per node; 0 disables it",
     ),
+    workers: int = typer.Option(
+        20,
+        "--workers",
+        "-W",
+        help="Thread pool size for parallel connect, activate and table render",
+    ),
     idle_timeout: int = typer.Option(
         900,
         "--idle-timeout",
@@ -642,6 +648,7 @@ def server(
         sample_interval=sample_interval,
         resync_interval=resync,
         refresh=refresh,
+        workers=workers,
         idle_timeout=idle_timeout,
         log_level=ctx.obj["log_level"],
         topo_name=ctx.obj.get("topo_name"),

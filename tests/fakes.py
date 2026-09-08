@@ -244,30 +244,51 @@ RIB_PATH = (
     "/network-instance[name=*]/bgp-rib/afi-safi[afi-safi-name=evpn]/evpn/"
     "rib-in-out/rib-in-post/mac-ip-route"
 )
-RIB_RESPONSE: List[Dict[str, Any]] = [
+BGP_ATTR_PATH = "/network-instance[name=*]/bgp-rib/attr-sets/attr-set"
+
+
+def rib_flag_response(**flags: Any) -> List[Dict[str, Any]]:
+    route = {"path-id": 0, "attr-id": 1, **flags}
+    return [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "bgp-rib": {
+                        "afi-safi": [
+                            {
+                                "afi-safi-name": "evpn",
+                                "evpn": {
+                                    "rib-in-out": {
+                                        "rib-in-post": {"mac-ip-route": [route]}
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    ]
+
+
+RIB_RESPONSE: List[Dict[str, Any]] = rib_flag_response(
+    **{"used-route": True, "valid-route": True, "best-route": False}
+)
+BGP_ATTR_RESPONSE: List[Dict[str, Any]] = [
     {
         "network-instance": [
             {
                 "name": "default",
                 "bgp-rib": {
-                    "afi-safi": [
-                        {
-                            "afi-safi-name": "evpn",
-                            "evpn": {
-                                "rib-in-out": {
-                                    "rib-in-post": {
-                                        "mac-ip-route": [
-                                            {
-                                                "path-id": 0,
-                                                "attr-id": 1,
-                                                "used-route": True,
-                                            }
-                                        ]
-                                    }
-                                }
-                            },
-                        }
-                    ]
+                    "attr-sets": {
+                        "attr-set": [
+                            {
+                                "index": 1,
+                                "as-path": {"segment": [{"member": [65001]}]},
+                            }
+                        ]
+                    }
                 },
             }
         ]

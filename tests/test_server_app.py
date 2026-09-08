@@ -27,6 +27,8 @@ from nornir_srl.server.app import (
 from nornir_srl.server.store import FabricStore
 
 from .fakes import (
+    BGP_ATTR_PATH,
+    BGP_ATTR_RESPONSE,
     ES_PATH,
     HOSTNAME_PATH,
     IFADMIN_PATH,
@@ -37,6 +39,8 @@ from .fakes import (
     IFSTATS_RESPONSE,
     IPV4_RIB_PATH,
     IPV4_RIB_RESPONSE,
+    RIB_PATH,
+    RIB_RESPONSE,
     LLDP_PATH,
     LLDP_RESPONSE,
     NH_PATH,
@@ -77,6 +81,8 @@ def _responses(name="leaf1"):
         IFSTATS_PATH: IFSTATS_RESPONSE,
         IFSTATE_PATH: IFSTATE_RESPONSE,
         IFADMIN_PATH: IFADMIN_RESPONSE,
+        RIB_PATH: RIB_RESPONSE,
+        BGP_ATTR_PATH: BGP_ATTR_RESPONSE,
         IPV4_RIB_PATH: IPV4_RIB_RESPONSE,
         NHGROUP_PATH: NHGROUP_RESPONSE,
         NH_PATH: NH_RESPONSE,
@@ -277,6 +283,30 @@ def test_table_subscribes_to_the_paths_the_report_needs(store):
     for device in devices.values():
         paths = [s["path"] for s in device.subscribe_requests[-1]["subscription"]]
         assert paths == [LLDP_PATH]
+
+
+def test_bgp_rib_reflects_streamed_best_route_changes(store):
+    fabric_store, devices = store
+    fabric_store.table(get_report("bgp_rib_evpn_2"))
+    assert wait_for(lambda: devices["leaf1"].subscribe_requests)
+
+    def route_state():
+        rows = fabric_store.table(get_report("bgp_rib_evpn_2"))["rows"]
+        leaf_rows = [r for r in rows if r["Node"] == "leaf1"]
+        return leaf_rows[0]["st"] if leaf_rows else None
+
+    assert route_state() == "u*"
+    devices["leaf1"].push(
+        "",
+        [
+            (
+                "network-instance[name=default]/bgp-rib/afi-safi[afi-safi-name=evpn]/evpn/"
+                "rib-in-out/rib-in-post/mac-ip-route[path-id=0]/best-route",
+                True,
+            )
+        ],
+    )
+    assert wait_for(lambda: route_state() == "u*>")
 
 
 def test_paths_are_discovered_once_per_node_and_report(store):
