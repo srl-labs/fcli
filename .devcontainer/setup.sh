@@ -25,6 +25,10 @@ if [ -f "${LOCKFILE}" ]; then
 fi
 echo $$ >"${LOCKFILE}"
 
+# shellcheck source=lib.sh
+source "${REPO_ROOT}/.devcontainer/lib.sh"
+ensure_uv || exit 1
+
 export PATH="${REPO_ROOT}/.venv/bin:${HOME}/.local/bin:${PATH}"
 
 wait_for_docker() {
