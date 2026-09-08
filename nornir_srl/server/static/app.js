@@ -3,6 +3,8 @@
   "use strict";
 
   const WINDOW_STEP = 250; // rows appended per scroll batch
+  const COL_WIDTH_MIN = 56;
+  const COL_WIDTH_DEFAULT = 150;
 
   // An interface an ethernet-segment holds down on purpose. It reports both
   // halves of the truth - the port is down, and standby is why - so it is
@@ -57,7 +59,8 @@
     diffExit: el("diff-exit"),
     columnsBtn: el("columns-btn"),
     columnsMenu: el("columns-menu"),
-    exportBtn: el("export"),
+    exportBtn: el("export-btn"),
+    exportMenu: el("export-menu"),
     errors: el("errors"),
     tableWrap: el("table-wrap"),
     overviewDashboard: el("overview-dashboard"),
@@ -75,10 +78,12 @@
     topoZoomOut: el("topo-zoom-out"),
     topoZoomLevel: el("topo-zoom-level"),
     topoZoomFit: el("topo-zoom-fit"),
+    topoExportDrawio: el("topo-export-drawio"),
     servicesTreeView: el("services-tree-view"),
     viewModeBtn: el("view-mode-btn"),
     headRow: el("head-row"),
     filterRow: el("filter-row"),
+    gridCols: el("grid-cols"),
     body: el("grid-body"),
     empty: el("empty"),
     rowCount: el("row-count"),
@@ -135,6 +140,7 @@
     errors: [],
     hidden: new Set(),
     colFilters: new Map(),
+    colWidths: new Map(),
     reportParams: new Map(), // the selected report's own arguments, e.g. the RIB LPM address
     sort: { column: null, dir: 1 },
     windowSize: WINDOW_STEP,
@@ -153,6 +159,7 @@
     topoFabric: null, // the fabric being drawn, or "all"
     collapsedCards: new Set(),
     collapsedNodes: new Set(),
+    collapsedSections: new Set(),
     navStack: [],
     navIndex: -1,
     chatEnabled: false,
@@ -232,6 +239,10 @@
         `fcli-filters-${state.report.name}`,
         JSON.stringify([...state.colFilters.entries()])
       );
+      localStorage.setItem(
+        `fcli-colwidths-${state.report.name}`,
+        JSON.stringify(Object.fromEntries(state.colWidths))
+      );
       localStorage.setItem("fcli-global-search", dom.globalSearch.value);
       localStorage.setItem("fcli-inv-filter", dom.invFilter.value);
       localStorage.setItem("fcli-refresh", dom.refresh.value);
@@ -244,17 +255,28 @@
     if (!state.report || isPanelReport(state.report.name)) return;
     state.hidden.clear();
     state.colFilters.clear();
+    state.colWidths.clear();
     try {
       const hiddenData = localStorage.getItem(`fcli-hidden-${state.report.name}`);
       if (hiddenData) {
         JSON.parse(hiddenData).forEach((col) => state.hidden.add(col));
       } else if (["bridge_domains", "services", "routers"].includes(state.report.name)) {
         // Node identifiers shown next to the name in the tree, not as table columns.
-        ["System IPv4", "System IPv6", "Gateway", "BGP Instance", "Underlay Hosts", "Site"].forEach((c) => state.hidden.add(c));
+        ["System IPv4", "System IPv6", "Gateway", "BGP Instance", "BGP Peers", "Underlay Hosts", "Site"].forEach((c) => state.hidden.add(c));
       }
       const filtersData = localStorage.getItem(`fcli-filters-${state.report.name}`);
       if (filtersData) {
         JSON.parse(filtersData).forEach(([col, val]) => state.colFilters.set(col, val));
+      }
+      const widthsData = localStorage.getItem(`fcli-colwidths-${state.report.name}`);
+      if (widthsData) {
+        const parsed = JSON.parse(widthsData);
+        if (parsed && typeof parsed === "object") {
+          for (const [col, width] of Object.entries(parsed)) {
+            const px = Number(width);
+            if (px >= COL_WIDTH_MIN) state.colWidths.set(col, px);
+          }
+        }
       }
     } catch (_err) {
       /* storage unavailable */
@@ -678,6 +700,7 @@
     renderTopoHeatLegend();
     dom.topoStats.textContent = topoSummary(graph);
     dom.rowCount.textContent = `${graph.nodes.length} node(s), ${graph.links.length} link(s)`;
+    if (dom.topoExportDrawio) dom.topoExportDrawio.disabled = !graph.nodes.length;
     if (!graph.nodes.length) {
       const empty = document.createElement("p");
       empty.className = "empty";
@@ -1310,6 +1333,248 @@
     return parts.join(" · ");
   }
 
+  const escapeXml = (text) =>
+    String(text)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+
+  const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+
+  const parseHex = (hex) => {
+    const raw = String(hex || "").replace("#", "");
+    if (raw.length === 3) {
+      return raw.split("").map((ch) => parseInt(ch + ch, 16));
+    }
+    if (raw.length !== 6) return [238, 241, 245];
+    return [raw.slice(0, 2), raw.slice(2, 4), raw.slice(4, 6)].map((part) => parseInt(part, 16));
+  };
+
+  const toHex = ([r, g, b]) =>
+    `#${[r, g, b].map((value) => Math.max(0, Math.min(255, value)).toString(16).padStart(2, "0")).join("")}`;
+
+  /** A light tint of *hex*, for draw.io fills that stay readable with dark text. */
+  const tintHex = (hex, white = 0.9) => {
+    const [r, g, b] = parseHex(hex);
+    const color = 1 - white;
+    return toHex([
+      Math.round(r * color + 255 * white),
+      Math.round(g * color + 255 * white),
+      Math.round(b * color + 255 * white),
+    ]);
+  };
+
+  function topoRoleStroke(role) {
+    return cssVar(`--role-${role}`) || cssVar("--role-unknown") || "#667085";
+  }
+
+  function topoRoleFill(role) {
+    return tintHex(topoRoleStroke(role));
+  }
+
+  function topoLinkStroke(link) {
+    const kind = stateKind(link.state);
+    if (kind === "down") return cssVar("--err") || "#b42318";
+    if (kind === "standby") return cssVar("--warn") || "#a35b00";
+    const bps = Math.max(Number(link.a_out_bps) || 0, Number(link.b_out_bps) || 0);
+    const cls = topoBwClass(bps || null);
+    const byClass = {
+      "bw-green": "--ok",
+      "bw-yellow": "--warn",
+      "bw-orange": "--heat",
+      "bw-red": "--err",
+      "bw-none": "--muted",
+    };
+    return cssVar(byClass[cls] || "--muted") || "#667085";
+  }
+
+  function topoNodeDrawioLabel(node) {
+    const lines = [
+      `<b><font color="#1c2128">${escapeXml(node.label)}</font></b>`,
+      `<font color="#667085" style="font-size:10px">${escapeXml(topoNodeSub(node))}</font>`,
+    ];
+    if (node.platform) {
+      lines.push(
+        `<font color="#667085" style="font-size:9px">${escapeXml(node.platform)}</font>`
+      );
+    }
+    return lines.join("<br>");
+  }
+
+  function topoNodeDrawioStyle(node) {
+    const stroke = !node.connected ? cssVar("--err") || "#b42318" : topoRoleStroke(node.role);
+    const fill = topoRoleFill(node.role);
+    const parts = [
+      "rounded=1",
+      "whiteSpace=wrap",
+      "html=1",
+      `fillColor=${fill}`,
+      `strokeColor=${stroke}`,
+      "fontColor=#1c2128",
+      "align=center",
+      "verticalAlign=middle",
+      "fontSize=11",
+      "spacing=6",
+    ];
+    if (!node.connected || node.role === "external") parts.push("dashed=1");
+    if (node.role === "dcgw") parts.push("strokeWidth=2");
+    return parts.join(";");
+  }
+
+  function topoEdgeDrawioStyle(link, aIsTop) {
+    const stroke = topoLinkStroke(link);
+    const parts = [
+      "html=1",
+      "endArrow=none",
+      "startArrow=none",
+      `strokeColor=${stroke}`,
+      "strokeWidth=2",
+      "rounded=1",
+    ];
+    if (link.access) parts.push("dashed=1");
+    if (link.intra_layer) {
+      parts.push("exitX=0.5", "exitY=1", "entryX=0.5", "entryY=1", "curved=1");
+    } else {
+      parts.push(
+        aIsTop ? "exitX=0.5;exitY=1;entryX=0.5;entryY=0" : "exitX=0.5;exitY=0;entryX=0.5;entryY=1"
+      );
+    }
+    return parts.join(";");
+  }
+
+  function buildDrawioXml(graph, layout) {
+    let nextId = 2;
+    const cells = [
+      '<mxCell id="0"/>',
+      '<mxCell id="1" parent="0"/>',
+    ];
+    const nodeIds = new Map();
+
+    const addCell = (attrs, geometry) => {
+      const id = String(nextId++);
+      const parts = [`<mxCell id="${id}"`];
+      for (const [key, value] of Object.entries(attrs)) {
+        if (value != null && value !== "") parts.push(`${key}="${escapeXml(value)}"`);
+      }
+      parts.push(">");
+      if (geometry) parts.push(geometry);
+      parts.push("</mxCell>");
+      cells.push(parts.join(" "));
+      return id;
+    };
+
+    const bandFill = "#f6f7f9";
+    for (const row of layout.rows) {
+      addCell(
+        {
+          parent: "1",
+          vertex: "1",
+          style: `rounded=1;whiteSpace=wrap;html=1;fillColor=${bandFill};strokeColor=none;opacity=60;`,
+        },
+        `<mxGeometry x="8" y="${row.y - 18}" width="${layout.width - 16}" height="${
+          TOPO.nodeHeight + 36
+        }" as="geometry"/>`
+      );
+      addCell(
+        {
+          value: row.layer.label,
+          parent: "1",
+          vertex: "1",
+          style: "text;html=1;strokeColor=none;fillColor=none;align=left;verticalAlign=middle;fontSize=11;fontStyle=1;fontColor=#1c2128;",
+        },
+        `<mxGeometry x="20" y="${row.y + TOPO.nodeHeight / 2 - 8}" width="100" height="16" as="geometry"/>`
+      );
+    }
+
+    for (const node of graph.nodes) {
+      const box = layout.positions.get(node.name);
+      if (!box) continue;
+      const id = addCell(
+        {
+          value: topoNodeDrawioLabel(node),
+          parent: "1",
+          vertex: "1",
+          style: topoNodeDrawioStyle(node),
+        },
+        `<mxGeometry x="${box.x}" y="${box.y}" width="${box.w}" height="${box.h}" as="geometry"/>`
+      );
+      nodeIds.set(node.name, id);
+    }
+
+    for (const link of graph.links) {
+      const a = layout.positions.get(link.a);
+      const b = layout.positions.get(link.b);
+      const source = nodeIds.get(link.a);
+      const target = nodeIds.get(link.b);
+      if (!a || !b || !source || !target) continue;
+      const { aIsTop } = linkAnchors(a, b);
+      let geometry = '<mxGeometry relative="1" as="geometry"/>';
+      if (link.intra_layer) {
+        const p0 = { x: a.cx, y: a.y + a.h };
+        const p2 = { x: b.cx, y: b.y + b.h };
+        const p1 = { x: (a.cx + b.cx) / 2, y: a.y + a.h + 46 };
+        geometry = `<mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="${p1.x}" y="${p1.y}"/></Array></mxGeometry>`;
+      }
+      const value =
+        dom.topoPortLabels.checked && !link.intra_layer && link.count === 1
+          ? escapeXml(
+              `${shortPort(link.ports[0].a_port)} ↔ ${shortPort(link.ports[0].b_port)}`
+            )
+          : link.count > 1
+            ? `${link.count}×`
+            : "";
+      addCell(
+        {
+          value,
+          parent: "1",
+          edge: "1",
+          source,
+          target,
+          style: topoEdgeDrawioStyle(link, aIsTop),
+        },
+        geometry
+      );
+    }
+
+    const fabricId = currentTopoFabric(graph);
+    const fabric =
+      fabricId === "all"
+        ? "All fabrics"
+        : (topoFabrics(graph).find((entry) => entry.id === fabricId) || {}).label || fabricId;
+    const diagramName = escapeXml(fabric);
+
+    return (
+      `<mxfile host="fcli" agent="fcli topology export" version="22.1.0">` +
+      `<diagram id="topology" name="${diagramName}">` +
+      `<mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="0" arrows="1" fold="1" page="0" pageScale="1" pageWidth="${layout.width}" pageHeight="${layout.height}" math="0" shadow="0">` +
+      `<root>${cells.join("")}</root>` +
+      `</mxGraphModel>` +
+      `</diagram>` +
+      `</mxfile>`
+    );
+  }
+
+  function exportTopologyDrawio() {
+    if (!state.topology || !state.topology.nodes.length) return;
+    const graph = topoFabricView(state.topology);
+    const layout = layoutTopology(graph);
+    const xml = buildDrawioXml(graph, layout);
+    const blob = new Blob([xml], { type: "application/xml" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    const fabricId = currentTopoFabric(state.topology);
+    const fabricLabel =
+      fabricId === "all"
+        ? "all"
+        : (topoFabrics(state.topology).find((entry) => entry.id === fabricId) || {}).label ||
+          fabricId;
+    link.href = url;
+    link.download = `topology-${String(fabricLabel).replace(/[^\w.-]+/g, "-")}.drawio`;
+    link.click();
+    URL.revokeObjectURL(url);
+  }
+
   function renderTopoLegend(graph) {
     dom.topoLegend.replaceChildren();
     const order = ["client", "segment", "leaf", "spine", "dcgw", "core", "unknown", "external"];
@@ -1698,6 +1963,7 @@
     dom.body.replaceChildren();
     dom.headRow.replaceChildren();
     dom.filterRow.replaceChildren();
+    dom.gridCols.replaceChildren();
 
     if (overviewTimer) {
       clearInterval(overviewTimer);
@@ -1841,6 +2107,80 @@
     return state.columns.filter((c) => !state.hidden.has(c));
   }
 
+  function columnWidth(column) {
+    return state.colWidths.get(column) || COL_WIDTH_DEFAULT;
+  }
+
+  // An empty cell closing every row, under the filler column below.
+  function fillerCell(tag) {
+    const cell = document.createElement(tag);
+    cell.className = "col-filler-cell";
+    cell.setAttribute("aria-hidden", "true");
+    return cell;
+  }
+
+  function renderColGroup(columns) {
+    const cols = columns.map((column) => {
+      const col = document.createElement("col");
+      col.style.width = `${columnWidth(column)}px`;
+      col.dataset.column = column;
+      return col;
+    });
+    // A trailing column with no width of its own, to soak up whatever space is
+    // left over. A table narrower than its pane is stretched to fill it, and the
+    // browser hands the slack back to the columns - which pins the last column's
+    // right edge to the table's own and leaves its grip nothing to drag.
+    const filler = document.createElement("col");
+    filler.className = "col-filler";
+    cols.push(filler);
+    dom.gridCols.replaceChildren(...cols);
+  }
+
+  let columnResize = null;
+
+  function startColumnResize(event, column) {
+    event.preventDefault();
+    event.stopPropagation();
+    columnResize = {
+      column,
+      startX: event.clientX,
+      startWidth: columnWidth(column),
+    };
+    document.body.classList.add("col-resizing");
+    const onMove = (moveEvent) => {
+      if (!columnResize) return;
+      const delta = moveEvent.clientX - columnResize.startX;
+      const width = Math.max(
+        COL_WIDTH_MIN,
+        Math.round(columnResize.startWidth + delta)
+      );
+      state.colWidths.set(columnResize.column, width);
+      const col = dom.gridCols.querySelector(
+        `col[data-column="${CSS.escape(columnResize.column)}"]`
+      );
+      if (col) col.style.width = `${width}px`;
+    };
+    const onUp = () => {
+      columnResize = null;
+      document.body.classList.remove("col-resizing");
+      saveReportPreferences();
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.removeEventListener("pointercancel", onUp);
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    document.addEventListener("pointercancel", onUp);
+  }
+
+  function resetColumnWidth(event, column) {
+    event.preventDefault();
+    event.stopPropagation();
+    state.colWidths.delete(column);
+    renderColGroup(visibleColumns());
+    saveReportPreferences();
+  }
+
   function renderHead() {
     const activeEl = document.activeElement;
     const activeColumn = activeEl && activeEl.dataset ? activeEl.dataset.column : null;
@@ -1849,9 +2189,13 @@
 
     dom.headRow.replaceChildren();
     dom.filterRow.replaceChildren();
-    for (const column of visibleColumns()) {
+    const columns = visibleColumns();
+    renderColGroup(columns);
+    for (const column of columns) {
       const th = document.createElement("th");
-      th.textContent = column;
+      const label = document.createElement("span");
+      label.className = "col-label";
+      label.textContent = column;
       if (state.colFilters.has(column)) {
         th.classList.add("filtered");
       }
@@ -1859,9 +2203,16 @@
         const arrow = document.createElement("span");
         arrow.className = "sort-arrow";
         arrow.textContent = state.sort.dir === 1 ? "▲" : "▼";
-        th.append(arrow);
+        label.append(arrow);
       }
-      th.addEventListener("click", () => {
+      const grip = document.createElement("span");
+      grip.className = "col-resize";
+      grip.title = "Drag to resize · double-click to reset";
+      grip.addEventListener("pointerdown", (event) => startColumnResize(event, column));
+      grip.addEventListener("dblclick", (event) => resetColumnWidth(event, column));
+      th.append(label, grip);
+      th.addEventListener("click", (event) => {
+        if (event.target.closest(".col-resize")) return;
         if (state.sort.column === column) {
           state.sort.dir = -state.sort.dir;
         } else {
@@ -1895,6 +2246,9 @@
       filterCell.append(input);
       dom.filterRow.append(filterCell);
     }
+
+    dom.headRow.append(fillerCell("th"));
+    dom.filterRow.append(fillerCell("th"));
 
     if (activeColumn) {
       const newInput = dom.filterRow.querySelector(`input[data-column="${CSS.escape(activeColumn)}"]`);
@@ -2356,6 +2710,12 @@
     jumpToFilteredReport(report, niName ? [niName] : [], [], { "next-hop": nh });
   }
 
+  function jumpToBgpPeer(nodeName, niName, peerAddress) {
+    jumpToFilteredReport("bgp_peers", [niName], [nodeName], {
+      peer: exactMatchPattern([peerAddress]),
+    });
+  }
+
   // A virtual-ES label with its next-hop(s) turned into RIB jumps. The rest of
   // the label stays text; only `nh: <ip>` is a control, because that address
   // being active in this IP-VRF is what the segment tracks.
@@ -2466,6 +2826,19 @@
         if (title) title.setAttribute("aria-expanded", "true");
         const nodeKey = parentNode.dataset.nodeKey;
         if (nodeKey) state.collapsedNodes.delete(nodeKey);
+      }
+
+      const parentVrf = targetEl.closest(".bd-vrf");
+      if (parentVrf) {
+        parentVrf.querySelectorAll(".bd-detail-section.is-collapsed").forEach((section) => {
+          section.classList.remove("is-collapsed");
+          const sectionContent = section.querySelector(".bd-detail-section-content");
+          if (sectionContent) sectionContent.hidden = false;
+          const sectionHeader = section.querySelector(".bd-detail-section-header");
+          if (sectionHeader) sectionHeader.setAttribute("aria-expanded", "true");
+          const sectionKey = section.dataset.sectionKey;
+          if (sectionKey) state.collapsedSections.delete(sectionKey);
+        });
       }
 
       targetEl.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -2613,6 +2986,119 @@
       jumpToVrf(report, target, node);
     });
     return button;
+  }
+
+  function makeCollapsibleDetailSection(sectionKey, labelText, contentEl) {
+    const isCollapsed = state.collapsedSections.has(sectionKey);
+
+    const section = document.createElement("div");
+    section.className = "bd-detail-section";
+    section.dataset.sectionKey = sectionKey;
+    if (isCollapsed) section.classList.add("is-collapsed");
+
+    const header = document.createElement("div");
+    header.className = "bd-detail-section-header";
+    header.setAttribute("role", "button");
+    header.setAttribute("tabindex", "0");
+    header.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
+
+    const chevron = document.createElement("span");
+    chevron.className = "bd-detail-section-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    chevron.textContent = "▼";
+
+    const label = document.createElement("strong");
+    label.className = "bd-detail-label";
+    label.textContent = labelText;
+
+    header.append(chevron, label);
+
+    const content = document.createElement("div");
+    content.className = "bd-detail-section-content";
+    if (isCollapsed) content.hidden = true;
+    content.append(contentEl);
+
+    const toggle = () => {
+      const collapsed = section.classList.toggle("is-collapsed");
+      content.hidden = collapsed;
+      header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      if (collapsed) {
+        state.collapsedSections.add(sectionKey);
+      } else {
+        state.collapsedSections.delete(sectionKey);
+      }
+    };
+
+    header.addEventListener("click", (e) => {
+      if (e.target.closest("a, button")) return;
+      toggle();
+    });
+
+    header.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggle();
+      }
+    });
+
+    section.append(header, content);
+    return section;
+  }
+
+  /** Open or close every node block and detail section inside one card. */
+  function setCardContentsCollapsed(card, collapsed) {
+    card.querySelectorAll(".bd-node").forEach((node) => {
+      node.classList.toggle("is-collapsed", collapsed);
+      const content = node.querySelector(".bd-node-content");
+      if (content) content.hidden = collapsed;
+      const title = node.querySelector(".bd-node-title");
+      if (title) title.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      const nodeKey = node.dataset.nodeKey;
+      if (!nodeKey) return;
+      if (collapsed) state.collapsedNodes.add(nodeKey);
+      else state.collapsedNodes.delete(nodeKey);
+    });
+    card.querySelectorAll(".bd-detail-section").forEach((section) => {
+      section.classList.toggle("is-collapsed", collapsed);
+      const content = section.querySelector(".bd-detail-section-content");
+      if (content) content.hidden = collapsed;
+      const header = section.querySelector(".bd-detail-section-header");
+      if (header) header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+      const sectionKey = section.dataset.sectionKey;
+      if (!sectionKey) return;
+      if (collapsed) state.collapsedSections.add(sectionKey);
+      else state.collapsedSections.delete(sectionKey);
+    });
+  }
+
+  // Expand/collapse for the levels *inside* one card. The card header already
+  // toggles the card itself, so these reach the per-node blocks and their
+  // fields, which is where a router spanning several nodes gets too deep to
+  // scan. Collapsing leaves the card open, so the result stays visible.
+  function cardScopeControls(card, expandCard) {
+    const group = document.createElement("div");
+    group.className = "bd-card-controls";
+
+    const makeButton = (label, title, collapsed) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "bd-card-control-btn";
+      button.textContent = label;
+      button.title = title;
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        expandCard();
+        setCardContentsCollapsed(card, collapsed);
+      });
+      return button;
+    };
+
+    group.append(
+      makeButton("⊞", "Expand every node and field in this card", false),
+      makeButton("⊟", "Collapse every node and field in this card", true),
+    );
+    return group;
   }
 
   function renderBridgeDomainsCards(rows) {
@@ -3049,7 +3535,13 @@
 
       topRow.append(chevron, icon, title);
       if (isDciService(rRows)) topRow.append(roleBadge("DCI", "bd-dci-badge"));
-      topRow.append(stateBadge, badge);
+      // ``expandCard`` is only read when a button is clicked, by which time the
+      // card is built and the binding below has been evaluated.
+      topRow.append(
+        stateBadge,
+        badge,
+        cardScopeControls(card, () => expandCard()),
+      );
       header.append(topRow);
 
       const subRow = document.createElement("div");
@@ -3142,6 +3634,10 @@
         }
       });
 
+      const expandCard = () => {
+        if (card.classList.contains("is-collapsed")) toggleCard();
+      };
+
       const nodeMap = new Map();
       for (const row of rRows) {
         const nodeName = row.Node || "unknown";
@@ -3227,6 +3723,13 @@
           const vrfTitle = document.createElement("span");
           vrfTitle.className = "bd-vrf-title";
           vrfTitle.append(vrfName);
+
+          const stateSpan = document.createElement("span");
+          const instanceAgg = aggregateServiceState([row]);
+          stateSpan.className = instanceAgg.className;
+          stateSpan.textContent = row["Oper State"] || instanceAgg.badgeText;
+          vrfTitle.append(stateSpan);
+
           if (row["BGP Instance"]) {
             const instBadge = document.createElement("span");
             instBadge.className = "bd-bgp-inst-badge";
@@ -3240,32 +3743,24 @@
             vrfTitle.append(eviBadge);
           }
 
-          const stateSpan = document.createElement("span");
-          const instanceAgg = aggregateServiceState([row]);
-          stateSpan.className = instanceAgg.className;
-          stateSpan.textContent = row["Oper State"] || instanceAgg.badgeText;
-
-          vrfHeader.append(vrfTitle, stateSpan);
+          vrfHeader.append(vrfTitle);
           vrfDiv.append(vrfHeader);
 
           const details = document.createElement("div");
           details.className = "bd-details";
+          const ipVrfName = row["IP-VRF"] || "-";
+          const sectionPrefix = `${nodeKey}:${ipVrfName}`;
 
           // 1. MAC-VRF's
           const macVrfsStr = row["MAC-VRFs"] || "-";
           if (macVrfsStr !== "-") {
-            const macRowDiv = document.createElement("div");
-            macRowDiv.className = "bd-detail-row";
-
-            const label = document.createElement("strong");
-            label.className = "bd-detail-label";
-            label.textContent = "MAC-VRF's:";
-            macRowDiv.append(label);
-
-            const pillGroup = document.createElement("div");
-            pillGroup.className = "pill-group";
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
             const items = macVrfsStr.split(/,\s*(?=[^\s(]+\s*\()/g);
             items.forEach((itemStr) => {
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
               const p = document.createElement("span");
               p.className = "pill pill-macvrf";
               applyPillState(p, itemStr);
@@ -3289,51 +3784,92 @@
               } else {
                 p.textContent = itemStr.trim();
               }
-              pillGroup.append(p);
+              line.append(p);
+              lines.append(line);
             });
-            macRowDiv.append(pillGroup);
-            details.append(macRowDiv);
+            details.append(
+              makeCollapsibleDetailSection(`${sectionPrefix}:mac-vrfs`, "MAC-VRF's:", lines),
+            );
           }
 
           // 2. Routed interfaces
           const routedStr = row["Routed Interfaces"] || "-";
           if (routedStr !== "-") {
-            const routedRowDiv = document.createElement("div");
-            routedRowDiv.className = "bd-detail-row";
-
-            const label = document.createElement("strong");
-            label.className = "bd-detail-label";
-            label.textContent = "Routed interfaces:";
-            routedRowDiv.append(label);
-
-            const pillGroup = document.createElement("div");
-            pillGroup.className = "pill-group";
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
             // Split only where a new interface starts - the state label is what
             // says one does. An interface addressed in both families lists its
             // addresses with a comma between them, and splitting on those left
             // the second address as a pill of its own, with no state to colour.
             routedStr.split(/,\s*(?=[^\s,]+\s\[)/).forEach((s) => {
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
               const p = document.createElement("span");
               p.className = "pill";
               applyPillState(p, s);
               p.textContent = s.trim();
-              pillGroup.append(p);
+              line.append(p);
+              lines.append(line);
             });
-            routedRowDiv.append(pillGroup);
-            details.append(routedRowDiv);
+            details.append(
+              makeCollapsibleDetailSection(
+                `${sectionPrefix}:routed-interfaces`,
+                "Routed interfaces:",
+                lines,
+              ),
+            );
           }
 
-          // 3. Virtual ethernet-segments, matched to this router on its EVI
+          // 3. BGP peers
+          const bgpPeersStr = row["BGP Peers"] || "-";
+          if (bgpPeersStr !== "-") {
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
+            bgpPeersStr.split(/,\s*/).forEach((itemStr) => {
+              const match = itemStr.trim().match(/^(\S+)\s->\s(\S+)\s+(UP|DOWN)$/);
+              if (!match) return;
+              const [, localAddr, peerAddr, peerState] = match;
+
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
+              const localPill = document.createElement("span");
+              localPill.className = "pill";
+              localPill.textContent = localAddr;
+
+              const arrow = document.createElement("span");
+              arrow.className = "pill-arrow";
+              arrow.textContent = "→";
+
+              const peerPill = document.createElement("span");
+              peerPill.className = "pill";
+              const kind = stateKind(peerState);
+              if (kind) peerPill.classList.add(`pill-${kind}`);
+
+              const link = document.createElement("a");
+              link.className = "vrf-link";
+              link.textContent = peerAddr;
+              link.href = "#";
+              link.title = `Show BGP peer ${peerAddr} in ${row["IP-VRF"]} on ${nodeName}`;
+              link.addEventListener("click", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                jumpToBgpPeer(nodeName, row["IP-VRF"], peerAddr);
+              });
+
+              peerPill.append(link, document.createTextNode(` ${peerState}`));
+              line.append(localPill, arrow, peerPill);
+              lines.append(line);
+            });
+            details.append(
+              makeCollapsibleDetailSection(`${sectionPrefix}:bgp-peers`, "BGP peers:", lines),
+            );
+          }
+
+          // 4. Virtual ethernet-segments, matched to this router on its EVI
           const vesStr = row["Virtual ES"] || "-";
           if (vesStr !== "-") {
-            const vesRowDiv = document.createElement("div");
-            vesRowDiv.className = "bd-detail-row";
-
-            const label = document.createElement("strong");
-            label.className = "bd-detail-label";
-            label.textContent = "Virtual ES:";
-            vesRowDiv.append(label);
-
             const lines = document.createElement("div");
             lines.className = "pill-lines";
             vesStr.split(";").forEach((entry) => {
@@ -3353,31 +3889,33 @@
               line.append(esPill);
               lines.append(line);
             });
-            vesRowDiv.append(lines);
-            details.append(vesRowDiv);
+            details.append(
+              makeCollapsibleDetailSection(`${sectionPrefix}:virtual-es`, "Virtual ES:", lines),
+            );
           }
 
-          // 4. VXLAN-interface
+          // 5. VXLAN-interface
           const vxlanStr = row["VXLAN Interface"] || "-";
           if (vxlanStr !== "-") {
-            const vxRowDiv = document.createElement("div");
-            vxRowDiv.className = "bd-detail-row";
-
-            const label = document.createElement("strong");
-            label.className = "bd-detail-label";
-            label.textContent = "VXLAN-interface:";
-            vxRowDiv.append(label);
-
-            const pillGroup = document.createElement("div");
-            pillGroup.className = "pill-group";
+            const lines = document.createElement("div");
+            lines.className = "pill-lines";
             vxlanStr.split(",").forEach((v) => {
+              const line = document.createElement("div");
+              line.className = "pill-group";
+
               const p = document.createElement("span");
               p.className = "pill pill-vxlan";
               p.textContent = v.trim();
-              pillGroup.append(p);
+              line.append(p);
+              lines.append(line);
             });
-            vxRowDiv.append(pillGroup);
-            details.append(vxRowDiv);
+            details.append(
+              makeCollapsibleDetailSection(
+                `${sectionPrefix}:vxlan-interface`,
+                "VXLAN-interface:",
+                lines,
+              ),
+            );
           }
 
           vrfDiv.append(details);
@@ -3402,6 +3940,7 @@
     expandBtn.addEventListener("click", () => {
       state.collapsedCards.clear();
       state.collapsedNodes.clear();
+      state.collapsedSections.clear();
       dom.servicesTreeView.querySelectorAll(".bd-card.is-collapsed").forEach((card) => {
         card.classList.remove("is-collapsed");
         const body = card.querySelector(".bd-body");
@@ -3415,6 +3954,13 @@
         if (content) content.hidden = false;
         const title = node.querySelector(".bd-node-title");
         if (title) title.setAttribute("aria-expanded", "true");
+      });
+      dom.servicesTreeView.querySelectorAll(".bd-detail-section.is-collapsed").forEach((section) => {
+        section.classList.remove("is-collapsed");
+        const content = section.querySelector(".bd-detail-section-content");
+        if (content) content.hidden = false;
+        const header = section.querySelector(".bd-detail-section-header");
+        if (header) header.setAttribute("aria-expanded", "true");
       });
     });
 
@@ -3440,6 +3986,15 @@
         if (content) content.hidden = true;
         const title = node.querySelector(".bd-node-title");
         if (title) title.setAttribute("aria-expanded", "false");
+      });
+      dom.servicesTreeView.querySelectorAll(".bd-detail-section").forEach((section) => {
+        const sectionKey = section.dataset.sectionKey;
+        if (sectionKey) state.collapsedSections.add(sectionKey);
+        section.classList.add("is-collapsed");
+        const content = section.querySelector(".bd-detail-section-content");
+        if (content) content.hidden = true;
+        const header = section.querySelector(".bd-detail-section-header");
+        if (header) header.setAttribute("aria-expanded", "false");
       });
     });
 
@@ -3554,6 +4109,7 @@
         }
         tr.append(td);
       }
+      tr.append(fillerCell("td"));
       fragment.append(tr);
     }
     // Remember every row of the payload, not just the ones on screen, so that
@@ -3571,23 +4127,71 @@
     dom.rowCount.textContent = `${rows.length} row${plural}${suffix}${windowed}`;
   }
 
-  /* ------------------------------------------------------------- export */
+  async function exportPayload() {
+    return { columns: visibleColumns(), rows: filteredRows() };
+  }
 
-  function exportCsv() {
-    const columns = visibleColumns();
-    const rows = filteredRows();
-    const escape = (value) => {
-      const text = String(value ?? "");
-      return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
-    };
-    const lines = [columns.join(",")];
-    for (const row of rows) lines.push(columns.map((c) => escape(row[c])).join(","));
-    const blob = new Blob([lines.join("\n")], { type: "text/csv" });
+  function downloadText(filename, mime, text) {
+    const blob = new Blob([text], { type: mime });
     const link = document.createElement("a");
     link.href = URL.createObjectURL(blob);
-    link.download = (state.report ? state.report.name : "fcli") + ".csv";
+    link.download = filename;
     link.click();
     URL.revokeObjectURL(link.href);
+  }
+
+  function exportMenuButton(text, onClick) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "menu-item";
+    button.textContent = text;
+    button.addEventListener("click", () => {
+      dom.exportMenu.hidden = true;
+      onClick();
+    });
+    return button;
+  }
+
+  function renderExportMenu() {
+    dom.exportMenu.replaceChildren(
+      exportMenuButton("CSV", () => exportReport("csv")),
+      exportMenuButton("JSON", () => exportReport("json")),
+      exportMenuButton("YAML", () => exportReport("yaml"))
+    );
+  }
+
+  async function exportReport(format) {
+    if (!state.report) return;
+    try {
+      const { columns, rows } = await exportPayload();
+      const base = state.report.name;
+      if (format === "csv") {
+        const escape = (value) => {
+          const text = String(value ?? "");
+          return /[",\n]/.test(text) ? '"' + text.replace(/"/g, '""') + '"' : text;
+        };
+        const lines = [columns.join(",")];
+        for (const row of rows) lines.push(columns.map((c) => escape(row[c])).join(","));
+        downloadText(`${base}.csv`, "text/csv", lines.join("\n"));
+      } else if (format === "json") {
+        downloadText(`${base}.json`, "application/json", JSON.stringify(rows, null, 2));
+      } else {
+        const yaml = rows
+          .map((row) => {
+            const lines = ["-"];
+            for (const column of columns) {
+              const value = row[column];
+              if (value === undefined || value === "") continue;
+              lines.push(`  ${column}: ${JSON.stringify(String(value))}`);
+            }
+            return lines.join("\n");
+          })
+          .join("\n");
+        downloadText(`${base}.yaml`, "text/yaml", yaml);
+      }
+    } catch (err) {
+      showErrors([{ node: "export", error: String(err.message || err) }]);
+    }
   }
 
   /* ---------------------------------------------------------- inventory */
@@ -3974,6 +4578,9 @@
     if (!dom.compareMenu.hidden && !event.target.closest(".menu")) {
       dom.compareMenu.hidden = true;
     }
+    if (!dom.exportMenu.hidden && !event.target.closest(".menu")) {
+      dom.exportMenu.hidden = true;
+    }
   });
 
   dom.compareBtn.addEventListener("click", () => {
@@ -3981,13 +4588,18 @@
     dom.compareMenu.hidden = !opening;
     if (opening) renderCompareMenu();
   });
+  dom.exportBtn.addEventListener("click", () => {
+    const opening = dom.exportMenu.hidden;
+    dom.exportMenu.hidden = !opening;
+    if (opening) renderExportMenu();
+  });
   dom.diffExit.addEventListener("click", () => exitDiff());
   dom.diffSame.addEventListener("change", () => {
     // Same comparison, asked again for the rows it left out.
     if (state.diff) showDiff({ against: state.diff.against, nodes: state.diff.nodes });
   });
 
-  dom.exportBtn.addEventListener("click", exportCsv);
+  dom.topoExportDrawio.addEventListener("click", exportTopologyDrawio);
 
   dom.tableWrap.addEventListener("scroll", () => {
     const { scrollTop, scrollHeight, clientHeight } = dom.tableWrap;

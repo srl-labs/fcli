@@ -245,13 +245,17 @@ class RoutingMixin:
                             if "bgp-tunnel-encap:" in c
                         ]
                     )
-                    # Standard + large communities (RT/SoO/encap live in ext-comm)
+                    # Standard, large and extended communities (RT/SoO/encap also
+                    # have dedicated columns when detail=True).
                     std_comms = d.get("communities", {}).get("community", []) or []
                     large_comms = (
                         d.get("communities", {}).get("large-community", []) or []
                     )
                     d["_communities"] = ", ".join(
-                        [str(c) for c in list(std_comms) + list(large_comms)]
+                        [
+                            str(c)
+                            for c in list(std_comms) + list(large_comms) + list(ext_comms)
+                        ]
                     )
                     # D-PATH (BGP domain-path) - collect all domain-ids in order
                     dpath_ids: List[str] = []
@@ -308,11 +312,11 @@ class RoutingMixin:
                 + ROUTE_TYPE_VERSIONS[evpn_route_type_version][route_type]  # type: ignore
                 + '"[]',
                 "RIB_EVPN_JMESPATH_ATTRS": {
-                    "1": '.{RD:"route-distinguisher", peer:neighbor, ESI:esi, Tag:"ethernet-tag-id",vni:vni, "NextHop":"next-hop", RT:"_rt", "esi-lbl":"_esi_lbl", "0_st":"_r_state", "as-path":"as-path".segment[0].member}}',
-                    "2": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "MAC":"mac-address", "IP":"ip-address",vni:vni,L1:"_label1",L2:"_label2","next-hop":"next-hop", "0_st":"_r_state", "as-path":"as-path".segment[0].member}}',
-                    "3": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, Tag:"ethernet-tag-id", "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member}}',
-                    "4": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member}}',
-                    "5": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, lpref:"local-pref", "IP-Pfx":"ip-prefix",vni:vni, med:med, "next-hop":"next-hop", GW:"gateway-ip",origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member}}',
+                    "1": '.{RD:"route-distinguisher", peer:neighbor, ESI:esi, Tag:"ethernet-tag-id",vni:vni, "NextHop":"next-hop", RT:"_rt", "esi-lbl":"_esi_lbl", "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
+                    "2": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "MAC":"mac-address", "IP":"ip-address",vni:vni,L1:"_label1",L2:"_label2","next-hop":"next-hop", "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
+                    "3": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, Tag:"ethernet-tag-id", "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
+                    "4": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
+                    "5": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, lpref:"local-pref", "IP-Pfx":"ip-prefix",vni:vni, med:med, "next-hop":"next-hop", GW:"gateway-ip",origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
                 },
             },
             2: {
@@ -327,11 +331,11 @@ class RoutingMixin:
                 + ROUTE_TYPE_VERSIONS[evpn_route_type_version][route_type]  # type: ignore
                 + '"[]',
                 "RIB_EVPN_JMESPATH_ATTRS": {
-                    "1": '.{RD:"route-distinguisher", peer:neighbor, ESI:esi, Tag:"ethernet-tag-id",vni:vni, "NextHop":"next-hop", RT:"_rt", "esi-lbl":"_esi_lbl", "0_st":"_r_state", "as-path":"as-path".segment[0].member}}',
-                    "2": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "MAC":"mac-address", "IP":"ip-address",vni:vni,L1:"_label1",L2:"_label2","next-hop":"next-hop", "0_st":"_r_state", "as-path":"as-path".segment[0].member}}',
-                    "3": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, Tag:"ethernet-tag-id", "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member}}',
-                    "4": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member}}',
-                    "5": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, lpref:"local-pref", "IP-Pfx":"ip-prefix",vni:vni, med:med, "next-hop":"next-hop", GW:"gateway-ip",origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member}}',
+                    "1": '.{RD:"route-distinguisher", peer:neighbor, ESI:esi, Tag:"ethernet-tag-id",vni:vni, "NextHop":"next-hop", RT:"_rt", "esi-lbl":"_esi_lbl", "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
+                    "2": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "MAC":"mac-address", "IP":"ip-address",vni:vni,L1:"_label1",L2:"_label2","next-hop":"next-hop", "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
+                    "3": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, Tag:"ethernet-tag-id", "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
+                    "4": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
+                    "5": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, lpref:"local-pref", "IP-Pfx":"ip-prefix",vni:vni, med:med, "next-hop":"next-hop", GW:"gateway-ip",origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
                 },
             },
         }
@@ -348,36 +352,32 @@ class RoutingMixin:
                 1: (
                     f'.{{neighbor:neighbor, "0_st":"_r_state", "RD":"route-distinguisher", '
                     f'"Pfx":{_pfx_expr}, "lpref":"local-pref", med:med, "next-hop":"next-hop",'
-                    f'"as-path":"as-path".segment[0].member}}'
+                    f'"as-path":"as-path".segment[0].member, communities:"_communities"}}}}'
                 ),
                 2: (
                     f'.{{neighbor:neighbor, "0_st":"_r_state", "RD":"route-distinguisher", '
                     f'"Pfx":{_pfx_expr}, "lpref":"local-pref", med:med, "next-hop":"next-hop",'
-                    f'"as-path":"as-path".segment[0].member,'
-                    '"communities":[communities.community, communities."large-community"][]|join(\', \',@)}}'
+                    f'"as-path":"as-path".segment[0].member, communities:"_communities"}}}}'
                 ),
                 3: (
                     f'.{{neighbor:neighbor, "0_st":"_r_state", "RD":"route-distinguisher", '
                     f'"Pfx":{_pfx_expr}, "lpref":"local-pref", med:med, "next-hop":"next-hop",'
-                    f'"as-path":"as-path".segment[0].member,'
-                    '"communities":[communities.community, communities."large-community"][]|join(\',\',@)}}'
+                    f'"as-path":"as-path".segment[0].member, communities:"_communities"}}}}'
                 ),
             }
         else:
             ip_rib_jmespath_tail = {
                 1: (
                     '.{neighbor:neighbor, "0_st":"_r_state", "Prefix":prefix, "lpref":"local-pref", med:med, '
-                    '"next-hop":"next-hop","as-path":"as-path".segment[0].member}}'
+                    '"next-hop":"next-hop","as-path":"as-path".segment[0].member, communities:"_communities"}}'
                 ),
                 2: (
                     '.{neighbor:neighbor, "0_st":"_r_state", "Prefix":prefix, "lpref":"local-pref", med:med, '
-                    '"next-hop":"next-hop","as-path":"as-path".segment[0].member,'
-                    '"communities":[communities.community, communities."large-community"][]|join(\', \',@)}}'
+                    '"next-hop":"next-hop","as-path":"as-path".segment[0].member, communities:"_communities"}}'
                 ),
                 3: (
                     '.{neighbor:neighbor, "0_st":"_r_state", "Prefix":prefix, "lpref":"local-pref", med:med, '
-                    '"next-hop":"next-hop","as-path":"as-path".segment[0].member,'
-                    '"communities":[communities.community, communities."large-community"][]|join(\',\',@)}}'
+                    '"next-hop":"next-hop","as-path":"as-path".segment[0].member, communities:"_communities"}}'
                 ),
             }
 
@@ -414,11 +414,11 @@ class RoutingMixin:
             },
         }
 
-        # Extra path-attribute fields appended to the per-route projection when
-        # detail=True. These are only added to structured (json/yaml) output so
-        # the table report stays lean. Keys are unique vs. the lean projections.
+        # Extra path-attribute fields appended when detail=True (CLI/MCP json and
+        # the server's export menu). Communities are always in the lean projection
+        # so live server tables carry them; the CLI table omits that column.
         EXTRA_ATTRS_EVPN = (
-            'communities:"_communities", soo:"_soo", '
+            'soo:"_soo", '
             '"tunnel-encap":"_tunnel_encap", dpath:"_dpath", '
             'valid:"valid-route", best:"best-route", used:"used-route", '
             '"tie-break":"tie-break-reason", "internal-tags":"internal-tags", '
@@ -681,10 +681,14 @@ class RoutingMixin:
                                 peer["_l3vpn6"] = "disabled"
                         else:
                             peer["_l3vpn6"] = "-"
+                        transport = peer.get("transport") or {}
+                        peer["_local-address"] = transport.get("local-address", "")
+                        peer["_local-port"] = transport.get("local-port", "")
 
         path_spec = {
             "path": f"/network-instance[name={network_instance}]/protocols/bgp/neighbor",
             "jmespath": '"network-instance"[].{NI:name, Neighbors: protocols.bgp.neighbor[].{"1_peer":"peer-address",\
+                    "2_local-address":"_local-address", "3_local-port":"_local-port",\
                     "peer-as":"peer-as", state:"session-state","local-as":"_local-asn",flags:"_flags",\
                     "group":"peer-group", "export-policy":"export-policy", "import-policy":"import-policy",\
                     "U4\\nR/A/T":"_ipv4", "U6\\nR/A/T":"_ipv6", "EVPN\\nR/A/T":"_evpn",\

@@ -519,8 +519,9 @@ class ChatService:
         spec: ReportSpec,
         inv_filter: Optional[str],
         field_filter: Optional[str],
+        params: Optional[Dict[str, Any]] = None,
     ) -> str:
-        table = self.store.table(spec, parse_kv(inv_filter))
+        table = self.store.table(spec, parse_kv(inv_filter), params)
         rows = table.get("rows") or []
         f_filter = parse_kv(field_filter)
         if f_filter:
@@ -553,7 +554,9 @@ class ChatService:
                 arguments.get("route_type"),
             )
             return self._run_table(
-                spec, arguments.get("inv_filter"), arguments.get("field_filter")
+                spec,
+                arguments.get("inv_filter"),
+                arguments.get("field_filter"),
             )
         if name == "node_cli":
             return self._node_cli(

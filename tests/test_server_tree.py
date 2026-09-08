@@ -2,6 +2,9 @@
 
 import copy
 
+import pytest
+
+from nornir_srl.server import tree
 from nornir_srl.server.tree import (
     ListNode,
     delete,
@@ -12,6 +15,7 @@ from nornir_srl.server.tree import (
     materialize,
     parse_elem,
     parse_path,
+    prune,
     select_path,
     split_path,
     strip_module,
@@ -182,6 +186,91 @@ def test_list_node_len_tracks_entries():
     node.entry({"name": "e2"})
     node.entry({"name": "e1"})
     assert len(node) == 2
+
+
+# --------------------------------------------------------------------------- #
+# ageing out entries that stopped being refreshed
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """Drive the timestamps list entries are aged by."""
+    current = {"t": 100.0}
+    monkeypatch.setattr(tree, "_now", lambda: current["t"])
+    return current
+
+
+def test_prune_drops_entries_that_stopped_being_refreshed(clock):
+    root = {}
+    insert(root, "candidate[address=10.0.0.1]/designated-forwarder", True)
+    insert(root, "candidate[address=10.0.0.2]/designated-forwarder", False)
+
+    clock["t"] = 130.0
+    insert(root, "candidate[address=10.0.0.2]/designated-forwarder", True)
+
+    assert prune(root, 120.0) == 1
+    assert materialize(root)["candidate"] == [
+        {"address": "10.0.0.2", "designated-forwarder": True}
+    ]
+
+
+def test_prune_keeps_entries_still_being_refreshed(clock):
+    root = {}
+    insert(root, "candidate[address=10.0.0.1]/designated-forwarder", True)
+
+    clock["t"] = 130.0
+    insert(root, "candidate[address=10.0.0.1]/designated-forwarder", True)
+
+    assert prune(root, 120.0) == 0
+    assert len(materialize(root)["candidate"]) == 1
+
+
+def test_refreshing_a_nested_leaf_keeps_its_keyed_ancestors(clock):
+    """An update deep inside an entry is what proves the entry still exists."""
+    root = {}
+    insert(root, "segment[name=ES-01]/candidate[address=10.0.0.1]/df", True)
+
+    clock["t"] = 130.0
+    insert(root, "segment[name=ES-01]/candidate[address=10.0.0.1]/df", False)
+
+    assert prune(root, 120.0) == 0
+    assert materialize(root)["segment"][0]["name"] == "ES-01"
+
+
+def test_prune_removes_a_stale_entry_from_within_a_fresh_one(clock):
+    root = {}
+    insert(root, "segment[name=ES-01]/candidate[address=10.0.0.1]/df", True)
+    insert(root, "segment[name=ES-01]/candidate[address=10.0.0.2]/df", True)
+
+    clock["t"] = 130.0
+    insert(root, "segment[name=ES-01]/candidate[address=10.0.0.2]/df", True)
+
+    assert prune(root, 120.0) == 1
+    segment = materialize(root)["segment"][0]
+    assert segment["candidate"] == [{"address": "10.0.0.2", "df": True}]
+
+
+def test_prune_leaves_opaque_lists_alone(clock):
+    """Unpromoted lists are replaced wholesale by each update, so never stale."""
+    root = {}
+    insert(root, "system", {"routes": [{"prefix": "10.0.0.0/8"}]})
+
+    clock["t"] = 130.0
+    assert prune(root, 120.0) == 0
+    assert materialize(root)["system"]["routes"] == [{"prefix": "10.0.0.0/8"}]
+
+
+def test_pruned_entry_can_come_back(clock):
+    root = {}
+    insert(root, "candidate[address=10.0.0.1]/df", True)
+
+    clock["t"] = 130.0
+    prune(root, 120.0)
+    insert(root, "candidate[address=10.0.0.1]/df", False)
+
+    assert prune(root, 120.0) == 0
+    assert materialize(root)["candidate"] == [{"address": "10.0.0.1", "df": False}]
 
 
 # --------------------------------------------------------------------------- #

@@ -116,7 +116,10 @@
             <button id="columns-btn" class="btn" type="button">⚙ Columns</button>
             <div id="columns-menu" class="menu-panel" hidden></div>
           </div>
-          <button id="export" class="btn" type="button">⭳ CSV</button>
+          <div class="menu">
+            <button id="export-btn" class="btn" type="button">⭳ Export</button>
+            <div id="export-menu" class="menu-panel" hidden></div>
+          </div>
         </section>
 
         <!-- Shown in place of the live table while a comparison is on screen. -->
@@ -278,6 +281,14 @@
                 ⤢ fit
               </button>
             </div>
+            <button
+              id="topo-export-drawio"
+              class="btn btn-ghost"
+              type="button"
+              title="Export diagram to draw.io"
+            >
+              ⭳ draw.io
+            </button>
             <span id="topo-stats" class="muted"></span>
           </div>
           <div id="topo-tabs" class="topo-tabs" role="tablist" aria-label="Fabrics" hidden></div>
@@ -291,6 +302,7 @@
 
         <div class="table-wrap" id="table-wrap">
           <table class="grid" id="grid">
+            <colgroup id="grid-cols"></colgroup>
             <thead>
               <tr id="head-row"></tr>
               <tr id="filter-row" class="filter-row"></tr>

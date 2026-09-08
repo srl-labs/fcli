@@ -111,6 +111,40 @@ def _service_oper_state(ni_oper: str, member_states: List[str]) -> str:
     return "degraded"
 
 
+def _peer_address_sort_key(address: str) -> Tuple[int, Any]:
+    """Order peer addresses with IPv4 before IPv6, then numerically."""
+    try:
+        parsed = ipaddress.ip_address(address)
+        return (1 if isinstance(parsed, ipaddress.IPv6Address) else 0, parsed)
+    except ValueError:
+        return (2, address)
+
+
+def _bgp_peers_for_ni(ni: Dict[str, Any]) -> str:
+    """BGP neighbors of one network-instance, as ``<local> -> <addr> UP|DOWN`` tokens."""
+    protocols = ni.get("protocols")
+    if not isinstance(protocols, dict):
+        return "-"
+    bgp = protocols.get("bgp")
+    if not isinstance(bgp, dict):
+        return "-"
+    items: List[Tuple[str, str]] = []
+    for neighbor in as_list(bgp.get("neighbor")):
+        if not isinstance(neighbor, dict):
+            continue
+        addr = neighbor.get("peer-address")
+        if not addr:
+            continue
+        transport = neighbor.get("transport") or {}
+        local_addr = transport.get("local-address") or "-"
+        up = _clean_state(neighbor.get("session-state")) == "established"
+        items.append((addr, f"{local_addr} -> {addr} {'UP' if up else 'DOWN'}"))
+    if not items:
+        return "-"
+    items.sort(key=lambda item: _peer_address_sort_key(item[0]))
+    return ", ".join(label for _, label in items)
+
+
 #: Where a node's ethernet-segments live. Read by the ES report, and by the
 #: bridge-domain report for the segment a member's port sits on.
 _ES_PATH = "/system/network-instance/protocols/evpn/ethernet-segments"
@@ -1185,7 +1219,12 @@ class Layer2Mixin:
                         assoc_vrfs = irb_to_ip_vrf.get(name, [])
                         irb_item_str, subnets, _st = _format_irb_item_and_subnets(name, i, assoc_vrfs)
                         irb_subitfs.append(irb_item_str)
-                        all_subnets.extend(subnets)
+                        # One subnet per entry: an IRB addressed more than once in
+                        # the same subnet - a gateway address alongside an
+                        # anycast one - is still a single subnet of the service.
+                        for subnet in subnets:
+                            if subnet not in all_subnets:
+                                all_subnets.append(subnet)
                     else:
                         vlan_info = _extract_vlan_encap(name, i)
                         label = _subinterface_state_label(name, i, details, parents)
@@ -1377,6 +1416,7 @@ class Layer2Mixin:
                         "EVI": ", ".join(evis),
                         "MAC-VRFs": ", ".join(mac_vrfs_items) if mac_vrfs_items else "-",
                         "Routed Interfaces": ", ".join(routed_itfs_items) if routed_itfs_items else "-",
+                        "BGP Peers": _bgp_peers_for_ni(ni),
                         # Virtual segments only: a router has no access port for
                         # a segment to be on, so there is nothing else here.
                         "Virtual ES": "; ".join(ves_items) if ves_items else "-",

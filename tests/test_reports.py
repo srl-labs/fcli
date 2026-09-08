@@ -6,6 +6,8 @@ without a live device.
 
 from typing import Any, Dict, List, Optional
 
+import pytest
+
 from nornir_srl.connections.helpers import clean_structured_key
 from nornir_srl.connections.interfaces import NetworkInstanceMixin
 from nornir_srl.connections.routing import RoutingMixin
@@ -85,6 +87,76 @@ class _FakeInterfaces(NetworkInstanceMixin):
             if key in path:
                 return resp
         raise KeyError(f"no scripted response for path {path}")
+
+
+# --------------------------------------------------------------------------- #
+# get_sum_bgp local endpoint fields
+# --------------------------------------------------------------------------- #
+
+
+class _FakeBgpPeers(RoutingMixin):
+    def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+        self._responses = responses
+        self.capabilities = {
+            "supported_models": [
+                {"name": "urn:srl_nokia/bgp:srl_nokia-bgp", "version": "2023-3-1"},
+            ]
+        }
+
+    def get(
+        self,
+        paths: List[str],
+        datatype: Optional[str] = "config",
+        strip_mod: Optional[bool] = True,
+    ) -> List[Dict[str, Any]]:
+        path = paths[0]
+        for key, resp in self._responses.items():
+            if key in path:
+                return resp
+        raise KeyError(f"no scripted response for path {path}")
+
+
+def test_get_sum_bgp_includes_local_address_and_port():
+    neighbors = [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "protocols": {
+                        "bgp": {
+                            "neighbor": [
+                                {
+                                    "peer-address": "10.0.0.2",
+                                    "transport": {
+                                        "local-address": "10.0.0.1",
+                                        "local-port": 179,
+                                    },
+                                    "peer-as": 65002,
+                                    "session-state": "established",
+                                    "local-as": {"as-number": 65001},
+                                    "afi-safi": [
+                                        {
+                                            "afi-safi-name": "ipv4-unicast",
+                                            "admin-state": "enable",
+                                            "received-routes": 10,
+                                            "active-routes": 8,
+                                            "sent-routes": 5,
+                                            "oper-state": "up",
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+    ]
+    dev = _FakeBgpPeers({"protocols/bgp/neighbor": neighbors})
+    peer = dev.get_sum_bgp()["bgp_peers"][0]["Neighbors"][0]
+    assert peer["1_peer"] == "10.0.0.2"
+    assert peer["2_local-address"] == "10.0.0.1"
+    assert peer["3_local-port"] == 179
 
 
 # --------------------------------------------------------------------------- #
@@ -177,15 +249,17 @@ def test_get_bgp_rib_evpn_detail_attributes():
     assert route["soo"] == "65000:1"
     assert route["tunnel-encap"] == "MPLS"
     assert route["dpath"] == "65000:1"
-    assert route["communities"] == "65000:1"
+    assert route["communities"] == (
+        "65000:1, target:65000:100, origin:65000:1, bgp-tunnel-encap:MPLS"
+    )
     assert route["valid"] is True and route["best"] is True and route["used"] is True
     assert route["tie-break"] == "none"
     assert route["internal-tags"] == ["tag-value = 0x1"]
     assert route["neighbor-as"] == 65002
 
 
-def test_get_bgp_rib_evpn_lean_has_no_extra_attrs():
-    """Without detail, the lean projection must not include the extra fields."""
+def test_get_bgp_rib_evpn_lean_has_communities_not_detail_attrs():
+    """Lean projection carries communities; other detail-only fields stay out."""
     attr_sets = [
         {
             "network-instance": [
@@ -235,9 +309,72 @@ def test_get_bgp_rib_evpn_lean_has_no_extra_attrs():
     dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "mac-ip-route": routes})
     out = dev.get_bgp_rib(route_fam="evpn", route_type="2", detail=False)
     route = out["bgp_rib"][0]["Rib"][0]
+    assert route["communities"] == ""
     assert "soo" not in route
     assert "dpath" not in route
-    assert "communities" not in route
+
+
+def test_get_bgp_rib_evpn_type5_reports_the_esi():
+    """An RT-5 prefix carries an ESI, so the type 5 report has to show it.
+
+    RFC 9136 pairs the ESI with the gateway address as the overlay index of the
+    prefix, which is what says whether a route came in over a multi-homed segment.
+    """
+    attr_sets = [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "bgp-rib": {"attr-sets": {"attr-set": [{"index": 1}]}},
+                }
+            ]
+        }
+    ]
+    routes = [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "bgp-rib": {
+                        "afi-safi": [
+                            {
+                                "evpn": {
+                                    "rib-in-out": {
+                                        "rib-in-post": {
+                                            "ip-prefix-route": [
+                                                {
+                                                    "attr-id": 1,
+                                                    "used-route": True,
+                                                    "valid-route": True,
+                                                    "best-route": True,
+                                                    "neighbor": "192.0.2.2",
+                                                    "route-distinguisher": "192.0.2.2:100",
+                                                    "esi": "01:24:00:00:00:00:00:00:00:01",
+                                                    "ip-prefix": "10.0.1.0/24",
+                                                    "gateway-ip": "0.0.0.0",
+                                                    "next-hop": "192.0.2.2",
+                                                    "vni": 2001,
+                                                    "local-pref": 100,
+                                                    "origin": "igp",
+                                                }
+                                            ]
+                                        }
+                                    }
+                                }
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    ]
+    dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "ip-prefix-route": routes})
+    route = dev.get_bgp_rib(route_fam="evpn", route_type="5", detail=False)["bgp_rib"][
+        0
+    ]["Rib"][0]
+    assert route["ESI"] == "01:24:00:00:00:00:00:00:00:01"
+    assert route["IP-Pfx"] == "10.0.1.0/24"
+    assert route["GW"] == "0.0.0.0"
 
 
 def test_get_bgp_rib_l3vpn_ipv4_alias_and_columns():
@@ -306,6 +443,170 @@ def test_get_bgp_rib_l3vpn_ipv4_alias_and_columns():
     assert route["Pfx"] == "172.16.1.0/24"
     assert route["neighbor"] == "10.0.0.6"
     assert route["0_st"] == "u*>"
+    assert route["communities"] == ""
+
+
+def test_get_bgp_rib_l3vpn_detail_includes_communities():
+    attr_sets = [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "bgp-rib": {
+                        "attr-sets": {
+                            "attr-set": [
+                                {
+                                    "index": 1,
+                                    "communities": {
+                                        "community": ["65000:100"],
+                                        "large-community": ["65000:1:2"],
+                                        "ext-community": ["target:65000:200"],
+                                    },
+                                }
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+    ]
+    routes = [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "bgp-rib": {
+                        "afi-safi": [
+                            {
+                                "afi-safi-name": "l3vpn-ipv4-unicast",
+                                "l3vpn-ipv4-unicast": {
+                                    "local-rib": {
+                                        "route": [
+                                            {
+                                                "attr-id": 1,
+                                                "used-route": True,
+                                                "valid-route": True,
+                                                "best-route": True,
+                                                "neighbor": "10.0.0.6",
+                                                "route-distinguisher": "65000:1",
+                                                "ipv4-prefix": "172.16.1.0/24",
+                                                "next-hop": "10.0.0.6",
+                                            }
+                                        ]
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    ]
+    dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "local-rib/route": routes})
+    route = dev.get_bgp_rib(route_fam="l3vpn-v4", detail=True)["bgp_rib"][0]["Rib"][0]
+    assert route["communities"] == "65000:100, 65000:1:2, target:65000:200"
+
+
+def _ip_rib_payloads(afi: str, prefix: str, communities: Dict[str, Any]):
+    """An ``attr-sets`` and a ``local-rib`` response for one IP-family route."""
+    attr_sets = [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "bgp-rib": {
+                        "attr-sets": {
+                            "attr-set": [
+                                {
+                                    "index": 1,
+                                    "as-path": {"segment": [{"member": [65002, "i"]}]},
+                                    "communities": communities,
+                                }
+                            ]
+                        }
+                    },
+                }
+            ]
+        }
+    ]
+    routes = [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "bgp-rib": {
+                        "afi-safi": [
+                            {
+                                "afi-safi-name": afi,
+                                afi: {
+                                    "local-rib": {
+                                        "route": [
+                                            {
+                                                "attr-id": 1,
+                                                "used-route": True,
+                                                "valid-route": True,
+                                                "best-route": True,
+                                                "neighbor": "10.0.0.6",
+                                                "prefix": prefix,
+                                                "next-hop": "10.0.0.6",
+                                                "local-pref": 100,
+                                                "med": 0,
+                                            }
+                                        ]
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    ]
+    return attr_sets, routes
+
+
+@pytest.mark.parametrize(
+    "route_fam,afi,prefix",
+    [
+        ("ipv4", "ipv4-unicast", "10.10.0.0/24"),
+        ("ipv6", "ipv6-unicast", "2001:db8:10::/64"),
+    ],
+)
+def test_get_bgp_rib_ip_lean_has_communities(route_fam, afi, prefix):
+    """The IP-family lean projection carries communities, as EVPN and L3VPN do.
+
+    Guards the JMESPath itself as much as the field: these projections are built
+    as plain strings rather than f-strings, so a brace count copied from the
+    f-string variants makes the whole expression unparseable.
+    """
+    attr_sets, routes = _ip_rib_payloads(
+        afi,
+        prefix,
+        {
+            "community": ["65000:100"],
+            "large-community": ["65000:1:2"],
+            "ext-community": ["target:65000:200"],
+        },
+    )
+    dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "local-rib/route": routes})
+    route = dev.get_bgp_rib(route_fam=route_fam, detail=False)["bgp_rib"][0]["Rib"][0]
+    assert route["Prefix"] == prefix
+    assert route["communities"] == "65000:100, 65000:1:2, target:65000:200"
+    # Lean means lean: the detail-only path attributes stay out.
+    assert "valid" not in route
+    assert "soo" not in route
+
+
+def test_get_bgp_rib_ip_detail_keeps_communities_and_adds_attrs():
+    """``detail=True`` extends the IP projection without displacing communities."""
+    attr_sets, routes = _ip_rib_payloads(
+        "ipv4-unicast", "10.10.0.0/24", {"community": ["65000:100"]}
+    )
+    dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "local-rib/route": routes})
+    route = dev.get_bgp_rib(route_fam="ipv4", detail=True)["bgp_rib"][0]["Rib"][0]
+    assert route["communities"] == "65000:100"
+    assert route["valid"] is True
+    assert route["best"] is True
 
 
 def test_get_bgp_rib_l3vpn_returns_empty_when_rib_path_absent():
@@ -597,6 +898,63 @@ def test_get_bridge_domains():
     assert bd["BGP Instance"] == ""
     assert bd["System IPv4"] == ""
     assert bd["System IPv6"] == ""
+
+
+def test_get_bridge_domains_lists_a_shared_subnet_once():
+    """Two IRB addresses in one subnet are one subnet of the service.
+
+    An EVPN gateway is commonly addressed twice on the same IRB - a per-node
+    address next to the anycast one - and both resolve to the same network, which
+    the MAC-VRF heading of a node card used to name twice.
+    """
+    from nornir_srl.connections.layer2 import Layer2Mixin
+
+    class _FakeLayer2(Layer2Mixin):
+        def __init__(self, responses: Dict[str, List[Dict[str, Any]]]):
+            self._responses = responses
+
+        def get(
+            self,
+            paths: List[str],
+            datatype: Optional[str] = "config",
+            strip_mod: Optional[bool] = True,
+        ) -> List[Dict[str, Any]]:
+            path = paths[0]
+            for key, resp in self._responses.items():
+                if key in path:
+                    return resp
+            raise KeyError(f"no scripted response for path {path}")
+
+    data = [
+        {
+            "network-instance": [
+                {
+                    "name": "mac-vrf-104",
+                    "type": "mac-vrf",
+                    "oper-state": "up",
+                    "interface": [
+                        {
+                            "name": "irb1.104",
+                            "ipv4": {
+                                "address": [
+                                    {"ip-prefix": "10.0.4.1/24"},
+                                    {"ip-prefix": "10.0.4.254/24", "anycast-gw": True},
+                                ]
+                            },
+                        },
+                    ],
+                },
+            ]
+        }
+    ]
+
+    dev = _FakeLayer2({"network-instance": data, "subinterface": [{}]})
+    bd = dev.get_bridge_domains()["bridge_domains"][0]
+    assert bd["Subnets"] == "10.0.4.0/24"
+    # Both addresses still belong on the interface itself.
+    assert bd["IRB Interface"] == (
+        "irb1.104 [up]: 10.0.4.1/24, 10.0.4.254/24 (anycast-gw: true)"
+    )
 
 
 def test_system0_addresses_skips_link_local_and_reads_system0():
@@ -1658,7 +2016,21 @@ def test_get_routers():
                                     }
                                 }
                             ]
-                        }
+                        },
+                        "bgp": {
+                            "neighbor": [
+                                {
+                                    "peer-address": "10.0.0.2",
+                                    "session-state": "established",
+                                    "transport": {"local-address": "10.0.0.1"},
+                                },
+                                {
+                                    "peer-address": "2001:db8::2",
+                                    "session-state": "idle",
+                                    "transport": {"local-address": "2001:db8::1"},
+                                },
+                            ]
+                        },
                     },
                     "interface": [
                         {
@@ -1701,6 +2073,7 @@ def test_get_routers():
         "mac-vrf-100 (irb1.100 [up]: 10.1.100.1/24, 2001:db8:100::1/64, fe80::1/64)"
     )
     assert r["Routed Interfaces"] == "ethernet-1/10.0 [up] (192.168.1.1/30)"
+    assert r["BGP Peers"] == "10.0.0.1 -> 10.0.0.2 UP, 2001:db8::1 -> 2001:db8::2 DOWN"
     assert r["VXLAN Interface"] == "vxlan1.1"
     assert r["Subnets"] == "10.1.100.0/24, 2001:db8:100::/64"
     assert r["Gateway"] == ""
@@ -1724,6 +2097,7 @@ def test_get_routers():
     assert r2["Route Targets"] == "none (isolated)"
     assert r2["Router"] == "none (isolated) - isolated-vrf"
     assert r2["Gateway"] == ""
+    assert r2["BGP Peers"] == "-"
 
     # Test that mgmt ip-vrf is excluded
     mgmt_data = [

@@ -3,7 +3,7 @@ import io
 import json
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Callable
+from typing import Any, Dict, FrozenSet, List, Optional, Callable
 from enum import Enum
 import logging
 import os
@@ -143,6 +143,30 @@ TABLE_THEME = Theme(
     {"ok": "green", "warn": "orange3", "info": "blue", "err": "bold red"}
 )
 
+#: Wide or server-oriented columns shown in live/structured output but not CLI tables.
+CLI_TABLE_OMIT: Dict[str, FrozenSet[str]] = {
+    "bgp_rib": frozenset({"communities"}),
+    "bgp_peers": frozenset({"local-address", "local-port"}),
+}
+
+
+def _cli_table_omit(name: Optional[str]) -> FrozenSet[str]:
+    if not name:
+        return frozenset()
+    if name == "bgp_rib" or name.startswith("bgp_rib_"):
+        return CLI_TABLE_OMIT["bgp_rib"]
+    if name == "bgp_peers":
+        return CLI_TABLE_OMIT["bgp_peers"]
+    return frozenset()
+
+
+def _cli_table_columns(name: str, columns: List[str]) -> List[str]:
+    omit = _cli_table_omit(name)
+    if not omit:
+        return columns
+    return [column for column in columns if column not in omit]
+
+
 #: Values worth colouring wherever they turn up in a table.
 STYLE_MAP = {
     "up": "[ok]",
@@ -224,6 +248,7 @@ def print_report(
         on_error=_report_failure(result.name),
     )
     if output == OutputFormat.TABLE:
+        columns = _cli_table_columns(result.name, columns)
         title = "[bold]" + name + "[/bold]"
         if f_filter:
             title += "\nFields filter:" + str(f_filter)
@@ -478,6 +503,8 @@ def print_table_shape(
     # two are guaranteed to disagree about, so it is dropped from the table.
     grouped = "Node" in table["columns"]
     columns = [c for c in table["columns"] if c != "Node"]
+    if output == OutputFormat.TABLE:
+        columns = _cli_table_columns(table.get("report", ""), columns)
     rows = table["rows"]
     for error in table.get("errors") or []:
         typer.echo(f"{error['node']}: {error['error']}", err=True)
