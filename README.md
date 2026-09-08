@@ -73,6 +73,12 @@ The Codespace installs fcli immediately, then deploys the [demo lab](labs/demo/)
 tail -f /tmp/fcli-codespace-setup.log
 ```
 
+If the lab did not start automatically, run:
+
+```bash
+bash .devcontainer/launch-setup.sh
+```
+
 Once ready, open port 8080 in the **Ports** tab for the live web UI (Overview, Topology, BGP, EVPN services, …).
 
 ```bash

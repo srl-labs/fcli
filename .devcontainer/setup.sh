@@ -14,7 +14,7 @@ SERVER_LOG="/tmp/fcli-server.log"
 
 exec >>"${LOGFILE}" 2>&1
 echo ""
-echo "=== $(date -Is) fcli codespace setup starting (pid $$) ==="
+echo "=== $(date -Is) fcli codespace setup starting (pid $$, cwd ${PWD}) ==="
 
 if [ -f "${LOCKFILE}" ]; then
     old_pid="$(cat "${LOCKFILE}")"

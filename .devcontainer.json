@@ -13,8 +13,9 @@
             "onAutoForward": "openBrowser"
         }
     },
-    "postCreateCommand": "bash .devcontainer/post-create.sh",
-    "postStartCommand": "bash .devcontainer/post-start.sh",
+    "postCreateCommand": "bash ${containerWorkspaceFolder}/.devcontainer/post-create.sh",
+    "postStartCommand": "bash ${containerWorkspaceFolder}/.devcontainer/post-start.sh",
+    "postAttachCommand": "bash ${containerWorkspaceFolder}/.devcontainer/post-start.sh",
     "customizations": {
         "vscode": {
             "extensions": [

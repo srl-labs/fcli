@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fast post-create: install fcli only.  Lab deploy runs in the background.
+# Fast post-create: install fcli, then kick off background lab deploy.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,4 +14,5 @@ export PATH="${REPO_ROOT}/.venv/bin:${HOME}/.local/bin:${PATH}"
 echo "== Installing fcli from local sources"
 uv sync --extra dev
 
-echo "== fcli installed; lab deploy will start via post-start"
+echo "== fcli installed; starting lab deploy"
+bash "${REPO_ROOT}/.devcontainer/launch-setup.sh"
