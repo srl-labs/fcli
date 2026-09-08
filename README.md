@@ -67,7 +67,11 @@ Run fcli against a live 3-stage EVPN-VXLAN fabric in the cloud — no local cont
 </div>
 ---
 
-The Codespace auto-deploys the [demo lab](labs/demo/) (8 SR Linux nodes, 9 servers, EVPN-VXLAN) and starts `fcli server` on port **8080**. First boot can take **15–25 minutes** while SR Linux images are pulled and the fabric converges.
+The Codespace installs fcli immediately, then deploys the [demo lab](labs/demo/) (8 SR Linux nodes, 9 servers, EVPN-VXLAN) and starts `fcli server` on port **8080** in the background. First boot can take **15–30 minutes** while SR Linux images are pulled and the fabric converges — the Codespace is usable right away; watch progress with:
+
+```bash
+tail -f /tmp/fcli-codespace-setup.log
+```
 
 Once ready, open port 8080 in the **Ports** tab for the live web UI (Overview, Topology, BGP, EVPN services, …).
 
