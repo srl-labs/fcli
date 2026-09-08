@@ -15,6 +15,7 @@ Inventory comes from a [containerlab](https://containerlab.dev/) topology file o
 ## Table of contents
 
 - [Quick start](#quick-start)
+- [GitHub Codespaces](#github-codespaces)
 - [Installation](#installation)
 - [Inventory](#inventory)
 - [Live server](#live-server)
@@ -50,6 +51,33 @@ fcli -t topo.clab.yml bgp-peers
 fcli -t topo.clab.yml -i role=leaf mac -f NI=macvrf-202
 fcli-mcp --topo-file topo.clab.yml
 ```
+
+## GitHub Codespaces
+
+Run fcli against a live 3-stage EVPN-VXLAN fabric in the cloud — no local containerlab setup required.
+
+---
+<div align=center>
+<a href="https://codespaces.new/srl-labs/fcli?quickstart=1">
+<img src="https://gitlab.com/rdodin/pics/-/wikis/uploads/d78a6f9f6869b3ac3c286928dd52fa08/run_in_codespaces-v1.svg?sanitize=true" style="width:50%"/></a>
+
+**[Run](https://codespaces.new/srl-labs/fcli?quickstart=1) fcli in GitHub Codespaces for free**.  
+[Learn more](https://containerlab.dev/manual/codespaces/) about Containerlab for Codespaces.  
+<small>Machine type: 8 vCPU · 16 GB RAM</small>
+</div>
+---
+
+The Codespace auto-deploys the [demo lab](labs/demo/) (8 SR Linux nodes, 9 servers, EVPN-VXLAN) and starts `fcli server` on port **8080**. First boot can take **15–25 minutes** while SR Linux images are pulled and the fabric converges.
+
+Once ready, open port 8080 in the **Ports** tab for the live web UI (Overview, Topology, BGP, EVPN services, …).
+
+```bash
+# CLI reports against the same fabric
+fcli -t labs/demo/demo.clab.yaml bgp-peers
+fcli -t labs/demo/demo.clab.yaml -i hostname=leaf1 mac
+```
+
+Optional: set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `XAI_API_KEY` as [Codespaces secrets](https://docs.github.com/en/codespaces/managing-your-codespaces/managing-your-account-specific-secrets-for-github-codespaces) to enable the **Ask** troubleshooting chat.
 
 ## Installation
 
