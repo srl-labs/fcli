@@ -10,13 +10,20 @@ The columns are the union of the fields of every item of every node, because
 which fields an item carries depends on its state: a route table holds
 ``orig-vrf`` only on a leaked route, and a node with no routes at all carries
 no route fields to name them after.
+
+A report whose getter returns records (:mod:`nornir_srl.records`) rather than
+items has nothing to derive: its :class:`Table` says which columns there are
+and how a record fills each, so the columns are the same on every node and a
+column name lives in exactly one place. Both kinds go through :func:`extract`
+and :func:`flatten`; a spec that declares a table is routed through it.
 """
 
 from __future__ import annotations
 
+import datetime
 import re
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
 
 from .connections.helpers import clean_structured_key
 
@@ -25,10 +32,13 @@ from .connections.helpers import clean_structured_key
 ErrorHandler = Callable[[str, Optional[BaseException]], Optional[Dict[str, Any]]]
 
 __all__ = [
+    "Column",
     "ErrorHandler",
     "Row",
     "NodeRows",
+    "Table",
     "clean_columns",
+    "countdown",
     "extract",
     "flatten",
     "get_fields",
@@ -136,6 +146,14 @@ def cell(value: Any) -> Any:
     return str(value)
 
 
+def countdown(seconds: Optional[int]) -> str:
+    """Seconds left as ``3:58:52s``, the way a table has always written an expiry.
+
+    A dash where there is no time - a static ARP entry never ages out.
+    """
+    return "-" if seconds is None else f"{datetime.timedelta(seconds=seconds)}s"
+
+
 def pass_filter(row: Dict[str, Any], filter: Optional[Dict[str, Any]]) -> bool:
     """True when *row* matches every ``field=regex`` pair in *filter*.
 
@@ -178,6 +196,90 @@ class NodeRows:
 
     node: str
     rows: List[Row] = field(default_factory=list)
+    #: The records the rows were made of, for a report that has them - what a
+    #: surface emits where it wants the objects rather than the table.
+    records: List[Any] = field(default_factory=list)
+
+
+# --------------------------------------------------------------------------- #
+# records as rows
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Column:
+    """One table column: what it is called, and how a record fills it."""
+
+    name: str
+    #: The record field to show, or a function of the record for a cell that
+    #: is composed rather than copied.
+    cell: Union[str, Callable[[Any], Any]]
+
+    def of(self, record: Any) -> Any:
+        value = getattr(record, self.cell) if isinstance(self.cell, str) else self.cell(record)
+        # A cell is never None: the table shows nothing, and CSV would show
+        # the word.
+        return "" if value is None else value
+
+
+@dataclass(frozen=True)
+class Table:
+    """How a report's records read as rows.
+
+    A record is one row, unless the table names a field of it holding
+    sub-records - the subinterfaces of a network-instance, the neighbours of
+    a BGP instance. Each of those is then a row of its own filling
+    :attr:`each_columns`, with the record's own columns inherited the way an
+    item's fields are inherited by its sub-items, and blanked on the rows
+    that continue it.
+    """
+
+    columns: Tuple[Column, ...]
+    #: The field holding the sub-records, and the columns those fill.
+    each: str = ""
+    each_columns: Tuple[Column, ...] = ()
+
+    @property
+    def column_names(self) -> List[str]:
+        return [c.name for c in self.columns] + [c.name for c in self.each_columns]
+
+    def rows(self, record: Any) -> List[Row]:
+        own = {c.name: c.of(record) for c in self.columns}
+        children = getattr(record, self.each, ()) if self.each else ()
+        if not children:
+            return [Row(own)]
+        return [
+            Row(
+                {**own, **{c.name: c.of(child) for c in self.each_columns}},
+                inherited=tuple(own),
+                continues=index > 0,
+            )
+            for index, child in enumerate(children)
+        ]
+
+    def filter(self, records: Iterable[Any], field_filter: Optional[Dict[str, Any]]) -> List[Any]:
+        """The records whose rows pass *field_filter*.
+
+        A filter names columns, so it is applied to the rows a record makes;
+        a record with sub-records keeps only the ones whose row passed, and is
+        dropped when none did.
+        """
+        if not field_filter:
+            return list(records)
+        kept: List[Any] = []
+        for record in records:
+            children = getattr(record, self.each, ()) if self.each else ()
+            if not children:
+                if pass_filter(self.rows(record)[0].values, field_filter):
+                    kept.append(record)
+                continue
+            rows = self.rows(record)
+            passing = tuple(
+                child for child, row in zip(children, rows) if pass_filter(row.values, field_filter)
+            )
+            if passing:
+                kept.append(replace(record, **{self.each: passing}))
+        return kept
 
 
 def _expand(item: Dict[str, Any], filter: Optional[Dict[str, Any]]) -> List[Row]:
@@ -209,6 +311,7 @@ def extract(
     *,
     field_filter: Optional[Dict[str, Any]] = None,
     on_error: Optional[ErrorHandler] = None,
+    table: Optional[Table] = None,
 ) -> Tuple[List[str], List[NodeRows]]:
     """Flatten a Nornir ``AggregatedResult`` into ``(columns, rows per node)``.
 
@@ -217,6 +320,9 @@ def extract(
     to be first has no row carrying it. Failed hosts are handed to *on_error*,
     which either returns the fields to show for them or ``None`` to leave them
     out.
+
+    With a *table* the items are records and the columns are the table's; as
+    without one, a report that answered nothing has no columns either.
     """
     columns: List[str] = []
     containers: Set[str] = set()
@@ -234,7 +340,14 @@ def extract(
         items = (result.result or {}).get(resource)
         if not items:
             continue
-        rows: List[Row] = []
+        if table is not None:
+            records = table.filter(items, field_filter)
+            rows = [row for record in records for row in table.rows(record)]
+            if rows:
+                merge_fields(columns, table.column_names)
+            per_node.append(NodeRows(name, rows, records))
+            continue
+        rows = []
         containers |= sub_item_keys(items)
         for item in items:
             if not isinstance(item, dict):
@@ -246,17 +359,25 @@ def extract(
     return [c for c in columns if c not in containers], per_node
 
 
-def flatten(node: str, items: List[Any]) -> Tuple[List[str], List[Dict[str, Any]]]:
+def flatten(
+    node: str, items: List[Any], table: Optional[Table] = None
+) -> Tuple[List[str], List[Dict[str, Any]]]:
     """Turn one node's report result into ``(columns, rows)``.
 
     Used by the streaming server, which already has the result for a single node
     rather than an ``AggregatedResult``, and merges the columns of every node
     itself. The sub-item keys this node cannot recognise as such are left in the
     columns for the server to drop once it has heard from every node - see
-    :func:`sub_item_keys`.
+    :func:`sub_item_keys`. With a *table* the items are records and there is
+    nothing to recognise.
     """
     columns: List[str] = []
     rows: List[Dict[str, Any]] = []
+    if table is not None:
+        for record in items or []:
+            for row in table.rows(record):
+                rows.append({"Node": node, **row.values})
+        return (table.column_names if rows else []), rows
     containers = sub_item_keys(items or [])
     for item in items or []:
         if not isinstance(item, dict):

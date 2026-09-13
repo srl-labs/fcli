@@ -8,7 +8,8 @@ disagree about the VNI of a service.
 The payloads, not the rendered tables, are what a check reads. A table exists to
 be looked at: its column names carry newlines and sort prefixes, and they are
 free to change when the display does. ``spec.getter(device)`` returns the same
-structure on every surface, so a check written against it holds on all three.
+structure on every surface - the records of :mod:`nornir_srl.records` where a
+report has them - so a check written against it holds on all three.
 
 Adding one means writing a function that takes a :class:`FabricState` and yields
 :class:`Finding` objects, then listing it in :data:`CHECKS` with the reports it
@@ -18,8 +19,7 @@ driven from that list.
 
 from __future__ import annotations
 
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -30,10 +30,20 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 
-from .aliases import alias_index, resolve
+from .aliases import resolve
+from .fabric import (
+    FabricState,
+    collect_fabric_state as _collect,
+    index as _index,
+    out_of_band as _out_of_band,
+    text as _text,
+)
+
+from .records import Neighbor, SubinterfaceState
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime, types only
     from nornir.core import Nornir
@@ -50,10 +60,6 @@ ERROR = "error"
 WARNING = "warning"
 
 _SEVERITY_ORDER = {ERROR: 0, WARNING: 1}
-
-#: Ports that carry management rather than fabric traffic. A management link is
-#: not part of the topology and its neighbour is usually not in the inventory.
-_OUT_OF_BAND = ("mgmt", "eth0")
 
 
 @dataclass(frozen=True)
@@ -87,77 +93,6 @@ class Check:
     run: Callable[["FabricState"], List[Finding]]
 
 
-@dataclass
-class FabricState:
-    """What the checks see: one report payload per node.
-
-    ``reports[report_name][node]`` is the list a getter returned under its
-    resource key, already unwrapped. A node missing from a report is a node the
-    report could not be collected from, and :attr:`errors` says why.
-    """
-
-    reports: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    #: Inventory node name -> the hostname it is reached on.
-    hostnames: Dict[str, str] = field(default_factory=dict)
-    #: (report, node) -> why that payload is missing.
-    errors: Dict[Tuple[str, str], str] = field(default_factory=dict)
-
-    def nodes(self, report: str) -> List[str]:
-        """The nodes *report* was collected from, in inventory order."""
-        return list(self.reports.get(report, {}))
-
-    def items(self, report: str) -> Iterator[Tuple[str, Dict[str, Any]]]:
-        """Every top-level entry of *report*, paired with the node it is from."""
-        for node, payload in self.reports.get(report, {}).items():
-            for entry in _as_list(payload):
-                if isinstance(entry, dict):
-                    yield node, entry
-
-    def alias_index(self) -> Dict[str, str]:
-        """Resolver from an advertised system-name to an inventory node."""
-        names = dict.fromkeys(
-            [node for report in self.reports.values() for node in report]
-            + list(self.hostnames)
-        )
-        return alias_index([(node, self.hostnames.get(node, "")) for node in names])
-
-
-# --------------------------------------------------------------------------- #
-# small shared helpers
-# --------------------------------------------------------------------------- #
-
-
-def _as_list(value: Any) -> List[Any]:
-    if value is None:
-        return []
-    return value if isinstance(value, list) else [value]
-
-
-def _text(value: Any) -> str:
-    """*value* as the lowercase string a state comparison wants."""
-    return str(value if value is not None else "").strip().lower()
-
-
-def _out_of_band(port: str) -> bool:
-    return port.strip().lower().startswith(_OUT_OF_BAND)
-
-
-def _parent(subinterface: str) -> str:
-    """``ethernet-1/1.0`` is a subinterface of ``ethernet-1/1``."""
-    return subinterface.rsplit(".", 1)[0]
-
-
-def _index(subinterface: str) -> str:
-    return subinterface.rsplit(".", 1)[-1] if "." in subinterface else ""
-
-
-def _int(value: Any) -> Optional[int]:
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-
-
 # --------------------------------------------------------------------------- #
 # BGP
 # --------------------------------------------------------------------------- #
@@ -167,46 +102,30 @@ def _int(value: Any) -> Optional[int]:
 #: no admin-state of its own to tell it apart by.
 _BGP_NOT_A_FAULT = {"", "disabled", "-"}
 
-#: The address-family columns of the peers report, and what they are called in
-#: a sentence.
-_BGP_FAMILIES = {
-    "U4\nR/A/T": "ipv4-unicast",
-    "U6\nR/A/T": "ipv6-unicast",
-    "EVPN\nR/A/T": "evpn",
-    "VPNv4\nR/A/T": "l3vpn-ipv4",
-    "VPNv6\nR/A/T": "l3vpn-ipv6",
-}
 
-#: An address family reads as "received/active/sent" when it is carrying
-#: routes, and as a single word when it is not.
-_ROUTE_COUNTS = re.compile(r"^(\d+)/(\d+)/(\d+)$")
-
-
-def _bgp_neighbors(state: FabricState) -> Iterator[Tuple[str, str, Dict[str, Any]]]:
+def _bgp_neighbors(state: FabricState) -> Iterator[Tuple[str, str, Neighbor]]:
     """Every BGP neighbour in the fabric, as (node, network-instance, peer)."""
-    for node, entry in state.items("bgp_peers"):
-        ni = str(entry.get("NI", ""))
-        for peer in _as_list(entry.get("Neighbors")):
-            if isinstance(peer, dict):
-                yield node, ni, peer
+    for node, entry, peer in state.sub_items("bgp_peers", "neighbors"):
+        yield node, entry.ni, peer
 
 
 def check_bgp_down(state: FabricState) -> List[Finding]:
     """A configured BGP session that is not established."""
     findings = []
     for node, ni, peer in _bgp_neighbors(state):
-        session = _text(peer.get("state"))
+        session = _text(peer.state)
         if session == "established" or session in _BGP_NOT_A_FAULT:
             continue
-        address = peer.get("1_peer", "?")
-        group = peer.get("group") or "-"
         findings.append(
             Finding(
                 check="bgp_down",
                 severity=ERROR,
                 node=node,
-                subject=f"{ni}/{address}",
-                detail=f"session is {session}, peer-group {group}, AS {peer.get('peer-as', '?')}",
+                subject=f"{ni}/{peer.peer or '?'}",
+                detail=(
+                    f"session is {session}, peer-group {peer.group or '-'}, "
+                    f"AS {peer.peer_as if peer.peer_as is not None else '?'}"
+                ),
             )
         )
     return findings
@@ -220,18 +139,18 @@ def check_bgp_af_down(state: FabricState) -> List[Finding]:
     """
     findings = []
     for node, ni, peer in _bgp_neighbors(state):
-        if _text(peer.get("state")) != "established":
+        if _text(peer.state) != "established":
             continue
-        for column, family in _BGP_FAMILIES.items():
-            if _text(peer.get(column)) != "down":
+        for family in peer.families:
+            if not family.enabled or _text(family.oper) != "down":
                 continue
             findings.append(
                 Finding(
                     check="bgp_af_down",
                     severity=ERROR,
                     node=node,
-                    subject=f"{ni}/{peer.get('1_peer', '?')}",
-                    detail=f"session established but {family} is down",
+                    subject=f"{ni}/{peer.peer or '?'}",
+                    detail=f"session established but {family.name} is down",
                 )
             )
     return findings
@@ -247,19 +166,18 @@ def check_bgp_no_routes(state: FabricState) -> List[Finding]:
     """
     findings = []
     for node, ni, peer in _bgp_neighbors(state):
-        if _text(peer.get("state")) != "established":
+        if _text(peer.state) != "established":
             continue
-        for column, family in _BGP_FAMILIES.items():
-            counts = _ROUTE_COUNTS.match(_text(peer.get(column)))
-            if not counts or counts.group(1) != "0":
+        for family in peer.families:
+            if not family.enabled or _text(family.oper) == "down" or family.received:
                 continue
             findings.append(
                 Finding(
                     check="bgp_no_routes",
                     severity=WARNING,
                     node=node,
-                    subject=f"{ni}/{peer.get('1_peer', '?')}",
-                    detail=f"{family} is up but has received no routes",
+                    subject=f"{ni}/{peer.peer or '?'}",
+                    detail=f"{family.name} is up but has received no routes",
                 )
             )
     return findings
@@ -270,15 +188,11 @@ def check_bgp_no_routes(state: FabricState) -> List[Finding]:
 # --------------------------------------------------------------------------- #
 
 
-def _subinterfaces(state: FabricState) -> Iterator[Tuple[str, str, Dict[str, Any]]]:
+def _subinterfaces(state: FabricState) -> Iterator[Tuple[str, str, SubinterfaceState]]:
     """Every subinterface in the fabric, as (node, parent interface, subif)."""
-    for node, entry in state.items("subif"):
-        parent = str(entry.get("Itf", ""))
-        if _out_of_band(parent):
-            continue
-        for subif in _as_list(entry.get("subitfs")):
-            if isinstance(subif, dict):
-                yield node, parent, subif
+    for node, itf, subif in state.sub_items("subif", "subinterfaces"):
+        if not _out_of_band(itf.name):
+            yield node, itf.name, subif
 
 
 def check_itf_down(state: FabricState) -> List[Finding]:
@@ -290,17 +204,17 @@ def check_itf_down(state: FabricState) -> List[Finding]:
     """
     findings = []
     for node, _parent_itf, subif in _subinterfaces(state):
-        if _text(subif.get("oper")) != "down":
+        if _text(subif.oper) != "down":
             continue
-        if _text(subif.get("admin")) not in ("enable", "", "up"):
+        if _text(subif.admin) not in ("enable", "", "up"):
             continue
-        reason = str(subif.get("down-reason") or "no reason reported")
+        reason = subif.down_reason or "no reason reported"
         findings.append(
             Finding(
                 check="itf_down",
                 severity=ERROR,
                 node=node,
-                subject=str(subif.get("Subitf", "?")),
+                subject=subif.name or "?",
                 detail=f"admin enabled but oper down: {reason}",
             )
         )
@@ -314,34 +228,31 @@ def check_itf_errors(state: FabricState) -> List[Finding]:
     a finding means it is happening now rather than that it once did.
     """
     findings = []
-    for node, entry in state.items("ifstats"):
-        interface = str(entry.get("interface", ""))
-        if _out_of_band(interface):
+    for node, stats in state.items("ifstats"):
+        if _out_of_band(stats.name):
             continue
-        errors = (_int(entry.get("in-err")) or 0) + (_int(entry.get("out-err")) or 0)
-        discards = (_int(entry.get("in-disc")) or 0) + (_int(entry.get("out-disc")) or 0)
-        if errors:
+        if stats.in_errors or stats.out_errors:
             findings.append(
                 Finding(
                     check="itf_errors",
                     severity=ERROR,
                     node=node,
-                    subject=interface,
+                    subject=stats.name,
                     detail=(
-                        f"{entry.get('in-err', 0)} in / {entry.get('out-err', 0)} out "
+                        f"{stats.in_errors} in / {stats.out_errors} out "
                         "error packets during the sample"
                     ),
                 )
             )
-        if discards:
+        if stats.in_discards or stats.out_discards:
             findings.append(
                 Finding(
                     check="itf_errors",
                     severity=WARNING,
                     node=node,
-                    subject=interface,
+                    subject=stats.name,
                     detail=(
-                        f"{entry.get('in-disc', 0)} in / {entry.get('out-disc', 0)} out "
+                        f"{stats.in_discards} in / {stats.out_discards} out "
                         "discarded packets during the sample"
                     ),
                 )
@@ -368,20 +279,14 @@ def _adjacencies(state: FabricState) -> List[_Link]:
     """Every LLDP adjacency whose neighbour is a node we also have."""
     index = state.alias_index()
     links = []
-    for node, entry in state.items("lldp"):
-        port = str(entry.get("interface", ""))
-        if _out_of_band(port):
+    for node, itf, neighbor in state.sub_items("lldp", "neighbors"):
+        if _out_of_band(itf.name):
             continue
-        for neighbor in _as_list(entry.get("Neighbors")):
-            if not isinstance(neighbor, dict):
-                continue
-            peer_port = str(neighbor.get("Nbr-port") or "")
-            advertised = str(neighbor.get("Nbr-System") or "")
-            if not advertised or _out_of_band(peer_port):
-                continue
-            peer = resolve(advertised, index)
-            if peer and peer != node:
-                links.append(_Link(node, port, peer, peer_port))
+        if not neighbor.system_name or _out_of_band(neighbor.port_id):
+            continue
+        peer = resolve(neighbor.system_name, index)
+        if peer and peer != node:
+            links.append(_Link(node, itf.name, peer, neighbor.port_id))
     return links
 
 
@@ -417,10 +322,8 @@ def check_mtu_mismatch(state: FabricState) -> List[Finding]:
     """
     mtus: Dict[Tuple[str, str], Dict[str, int]] = {}
     for node, parent, subif in _subinterfaces(state):
-        mtu = _int(subif.get("ip-mtu"))
-        if mtu is not None:
-            index = _index(str(subif.get("Subitf", "")))
-            mtus.setdefault((node, parent), {})[index] = mtu
+        if subif.ip_mtu is not None:
+            mtus.setdefault((node, parent), {})[_index(subif.name)] = subif.ip_mtu
 
     findings = []
     compared = set()
@@ -450,74 +353,304 @@ def check_mtu_mismatch(state: FabricState) -> List[Finding]:
 
 
 # --------------------------------------------------------------------------- #
+# fabric-wide consistency
+# --------------------------------------------------------------------------- #
+
+
+def outliers(values: Mapping[str, Any], floor: int = 3) -> Dict[str, Tuple[Any, Any]]:
+    """The entries of *values* that disagree with what most of them say.
+
+    The fault this catches is the one nothing reports as down: every leaf
+    configured the same way except one, which works right up until traffic
+    takes the path through it. Nothing in a per-node table shows that, because
+    each node on its own looks fine - only the fabric read sideways does.
+
+    Returns ``subject -> (its value, the majority value)`` for every subject
+    that is in the minority. *floor* is how many subjects have to agree before
+    a majority means anything: two nodes differing are two opinions, not an
+    outlier and a norm.
+    """
+    counts: Dict[Any, int] = {}
+    for value in values.values():
+        counts[value] = counts.get(value, 0) + 1
+    if len(values) < floor or len(counts) < 2:
+        return {}
+    majority, agreeing = max(counts.items(), key=lambda kv: (kv[1], str(kv[0])))
+    # A plurality is not a norm: with 2/2/1 there is nothing to be an outlier
+    # from, and saying so would be inventing a convention the fabric has not.
+    if agreeing * 2 <= len(values):
+        return {}
+    return {
+        subject: (value, majority)
+        for subject, value in values.items()
+        if value != majority
+    }
+
+
+def check_mtu_outlier(state: FabricState) -> List[Finding]:
+    """A node whose fabric-facing MTU is not the one the rest of the fabric uses.
+
+    ``mtu_mismatch`` compares the two ends of a cable, so it only sees a
+    disagreement where LLDP sees a link. This reads the same values down the
+    whole fabric instead, which catches the leaf configured at the default MTU
+    on a link whose far end has not been brought up yet - before it is carrying
+    anything, rather than after.
+    """
+    # The MTU a node uses on its fabric ports, when it uses just one. A node
+    # with a deliberate mix is not making a claim this check can read.
+    per_node: Dict[str, int] = {}
+    for node, _parent_itf, subif in _subinterfaces(state):
+        mtu = subif.ip_mtu
+        if mtu is None or subif.name.startswith(("irb", "system", "lo")):
+            continue
+        seen = per_node.setdefault(node, mtu)
+        if seen != mtu:
+            per_node[node] = -1  # mixed, so not comparable
+    comparable = {node: mtu for node, mtu in per_node.items() if mtu > 0}
+
+    return [
+        Finding(
+            check="mtu_outlier",
+            severity=WARNING,
+            node=node,
+            subject="ip-mtu",
+            detail=(
+                f"fabric interfaces use ip-mtu {mine}, where {majority} is what "
+                f"{len(comparable) - len(outliers(comparable))} of "
+                f"{len(comparable)} nodes use"
+            ),
+        )
+        for node, (mine, majority) in sorted(outliers(comparable).items())
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # EVPN services
 # --------------------------------------------------------------------------- #
+
+
+def service_facts(vni: str, instances: Sequence[Any]) -> Dict[str, Any]:
+    """What one node thinks a service looks like, by the name of each fact.
+
+    The route-targets are one fact per bgp-vpn instance: a gateway carries a
+    second instance for its WAN side, with route-targets the leaves never
+    see, and that is not the two of them disagreeing.
+    """
+    facts: Dict[str, Any] = {"VNI": vni}
+    for inst in instances:
+        which = f" of bgp-instance {inst.id}" if inst.id != 1 else ""
+        facts[f"import route-target{which}"] = _rt_set(inst.import_rts)
+        facts[f"export route-target{which}"] = _rt_set(inst.export_rts)
+    return facts
+
+
+def service_disagreements(by_node: Mapping[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+    """The facts the nodes carrying one service do not agree on.
+
+    Each fact is compared among the nodes that have it: a fact only a
+    gateway's second instance has is compared between the gateways.
+    """
+    disagreements = []
+    for fact in dict.fromkeys(name for facts in by_node.values() for name in facts):
+        values = {node: facts[fact] for node, facts in by_node.items() if fact in facts}
+        if len(values) < 2 or len({_describe(v) for v in values.values()}) < 2:
+            continue
+        disagreements.append((fact, values))
+    return disagreements
+
+
+def system_addresses(state: FabricState) -> Dict[str, Set[str]]:
+    """Each node's own loopback addresses: what the others see it as in the underlay."""
+    found: Dict[str, Set[str]] = {}
+    for node, instance, itf in state.sub_items("ni", "interfaces"):
+        if instance.name != "default" or not itf.name.startswith(("system0", "lo")):
+            continue
+        for prefix in itf.prefixes:
+            found.setdefault(node, set()).add(prefix.split("/", 1)[0])
+    return found
+
+
+def underlay_hosts(state: FabricState) -> Dict[str, Set[str]]:
+    """The host routes in each node's default instance: the loopbacks it can reach."""
+    hosts: Dict[str, Set[str]] = {}
+    for report in ("ipv4_rib", "ipv6_rib"):
+        for node, table, route in state.sub_items(report, "routes"):
+            if table.ni != "default":
+                continue
+            address, _, length = route.prefix.partition("/")
+            if length in ("32", "128"):
+                hosts.setdefault(node, set()).add(address)
+    return hosts
+
+
+def underlay_domains(
+    nodes: Sequence[str],
+    system: Mapping[str, Set[str]],
+    hosts: Mapping[str, Set[str]],
+    gateways: Set[str] = frozenset(),
+) -> List[List[str]]:
+    """*nodes* grouped by the underlay they share, as the services page tells sites apart.
+
+    Two nodes share an underlay when each has the other's system address as a
+    host route in ``default``: that is what lets their VTEPs reach each other,
+    and nodes that cannot are never one service however they are named.
+    Gateways learn each other's loopbacks over the WAN, so between two of
+    them that says nothing while the set has other nodes in it; a set of
+    gateways alone is the WAN side itself and keeps those edges. Without any
+    route table to go on - a state collected without the RIBs - every node is
+    taken to be in one underlay, which is what the question used to assume.
+    """
+    names = sorted(nodes)
+    if not any(hosts.get(name) for name in names):
+        return [names] if names else []
+    skip_gateway_pairs = any(name not in gateways for name in names)
+
+    def sees(observer: str, other: str) -> bool:
+        return any(ip in hosts.get(observer, ()) for ip in system.get(other, ()))
+
+    parent = {name: name for name in names}
+
+    def find(name: str) -> str:
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    for index, a in enumerate(names):
+        for b in names[index + 1 :]:
+            if skip_gateway_pairs and a in gateways and b in gateways:
+                continue
+            if sees(a, b) and sees(b, a):
+                parent[find(b)] = find(a)
+    domains: Dict[str, List[str]] = {}
+    for name in names:
+        domains.setdefault(find(name), []).append(name)
+    return sorted(domains.values())
+
+
+def service_groups(by_node: Mapping[str, Dict[str, Any]]) -> List[List[str]]:
+    """The nodes carrying one name, grouped into the services they actually are.
+
+    Two nodes carry the same service when they import a common route-target
+    on it: that is what lets their routes reach each other. A name that
+    splits into several such groups is one service per site - a bridge
+    domain each datacenter has its own of, stitched through an ip-vrf - or
+    one node with a mistyped target; either way the groups are compared
+    within themselves, not against each other. Nodes with no route-target
+    at all are one group of their own.
+    """
+    targets = {node: set(facts.get("import route-target") or ()) for node, facts in by_node.items()}
+    groups: List[List[str]] = []
+    for node in sorted(targets):
+        mine = targets[node]
+        joined = [
+            group
+            for group in groups
+            if any(mine & targets[other] or (not mine and not targets[other]) for other in group)
+        ]
+        members = [node] + [member for group in joined for member in group]
+        groups = [group for group in groups if group not in joined] + [sorted(members)]
+    return sorted(groups)
 
 
 def check_evpn_service_mismatch(state: FabricState) -> List[Finding]:
     """Nodes that disagree about a service they both carry.
 
     A mac-vrf stretched across two leaves has to use the same VNI and the same
-    route-targets on both, or the two halves quietly never join up.
+    route-targets on both, or the two halves quietly never join up. Compared
+    among the nodes that share an underlay, because nodes that cannot reach
+    each other's VTEPs are never one service whatever they are named; per
+    bgp-vpn instance, so a gateway's WAN-side instance is held against the
+    other gateways rather than against the leaves; and among the nodes that
+    share a route-target, so two services under one name in one underlay is
+    a warning about the split rather than an error about every node.
     """
     # vxlan-interface -> the VNI it sends on, per node.
     vnis: Dict[Tuple[str, str], Any] = {}
-    for node, entry in state.items("vxlan"):
-        vnis[(node, str(entry.get("vxlan-itf", "")))] = entry.get("ing-vni")
+    for node, vxlan in state.items("vxlan"):
+        vnis[(node, vxlan.name)] = vxlan.vni
 
-    # Service name -> {node: what that node thinks the service looks like}.
+    # Service name -> {node: what that node thinks the service looks like},
+    # and which nodes carry it as a gateway, with a WAN-side instance too.
     services: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for node, entry in state.items("ni"):
-        name = str(entry.get("NI", ""))
-        kind = _text(entry.get("type"))
-        if kind not in ("mac-vrf", "ip-vrf"):
+    gateways: Dict[str, Set[str]] = {}
+    for node, instance in state.items("ni"):
+        if _text(instance.type) not in ("mac-vrf", "ip-vrf"):
             continue
-        interfaces = [
-            itf.strip() for itf in str(entry.get("vxlan-itf") or "").split(",") if itf.strip()
-        ]
-        services.setdefault(name, {})[node] = {
-            "vni": ", ".join(str(vnis.get((node, itf), "?")) for itf in interfaces),
-            "import-rt": _rt_set(entry.get("In-RT")),
-            "export-rt": _rt_set(entry.get("Out-RT")),
-        }
+        services.setdefault(instance.name, {})[node] = service_facts(
+            ", ".join(str(vnis.get((node, overlay), "?")) for overlay in instance.overlays),
+            instance.instances,
+        )
+        if len(instance.instances) > 1:
+            gateways.setdefault(instance.name, set()).add(node)
+    system, hosts = system_addresses(state), underlay_hosts(state)
 
-    findings = []
-    for name, by_node in sorted(services.items()):
-        if len(by_node) < 2:
-            continue
-        for attribute, label in (
-            ("vni", "VNI"),
-            ("import-rt", "import route-target"),
-            ("export-rt", "export route-target"),
-        ):
-            values = {node: facts[attribute] for node, facts in by_node.items()}
-            distinct = {_describe(value) for value in values.values()}
-            if len(distinct) < 2:
-                continue
+    def disagree(name: str, nodes: Sequence[str], facts_of: Callable[[str], Dict[str, Any]]) -> Iterator[Finding]:
+        by_node = {node: facts_of(node) for node in nodes}
+        for fact, values in service_disagreements(by_node):
             for node in sorted(values):
-                others = sorted(set(by_node) - {node})
-                findings.append(
-                    Finding(
-                        check="evpn_service_mismatch",
-                        severity=ERROR,
-                        node=node,
-                        subject=name,
-                        detail=(
-                            f"{label} {_describe(values[node])}, against "
-                            + ", ".join(
-                                f"{other} {_describe(values[other])}" for other in others
+                others = sorted(set(values) - {node})
+                yield Finding(
+                    check="evpn_service_mismatch",
+                    severity=ERROR,
+                    node=node,
+                    subject=name,
+                    detail=(
+                        f"{fact} {_describe(values[node])}, against "
+                        + ", ".join(f"{other} {_describe(values[other])}" for other in others)
+                    ),
+                )
+
+    findings: List[Finding] = []
+    for name, by_node in sorted(services.items()):
+        wan = gateways.get(name, set())
+        for domain in underlay_domains(list(by_node), system, hosts, wan):
+            local = {node: by_node[node] for node in domain}
+            groups = service_groups(local)
+            if len(groups) > 1:
+                targets = {node: local[node].get("import route-target") for node in local}
+                for group in groups:
+                    elsewhere = sorted(set(local) - set(group))
+                    for node in group:
+                        findings.append(
+                            Finding(
+                                check="evpn_service_mismatch",
+                                severity=WARNING,
+                                node=node,
+                                subject=name,
+                                detail=(
+                                    f"import route-target {_describe(targets[node])}, while "
+                                    + ", ".join(f"{other} {_describe(targets[other])}" for other in elsewhere)
+                                    + " in the same underlay: two services under one name, or a mistyped target"
+                                ),
                             )
-                        ),
+                        )
+            for group in groups:
+                # The DC side: everything but what a gateway's other instances carry.
+                findings.extend(
+                    disagree(
+                        name,
+                        group,
+                        lambda node: {f: v for f, v in local[node].items() if "bgp-instance" not in f},
+                    )
+                )
+        # The WAN side is a service among the gateways of every underlay,
+        # reached over the WAN, so they are one domain of their own for it.
+        if len(wan) > 1:
+            for domain in underlay_domains(sorted(wan), system, hosts, wan):
+                findings.extend(
+                    disagree(
+                        name,
+                        domain,
+                        lambda node: {f: v for f, v in by_node[node].items() if "bgp-instance" in f},
                     )
                 )
     return findings
 
 
-def _rt_set(value: Any) -> Sequence[str]:
+def _rt_set(targets: Sequence[str]) -> Sequence[str]:
     """Route-targets as a comparable set, however they were written."""
-    return sorted(
-        {rt.strip().removeprefix("target:") for rt in str(value or "").split(",") if rt.strip()}
-    )
+    return sorted({rt.strip().removeprefix("target:") for rt in targets if rt.strip()})
 
 
 def _describe(value: Any) -> str:
@@ -530,13 +663,6 @@ def _describe(value: Any) -> str:
 # ethernet segments
 # --------------------------------------------------------------------------- #
 
-#: How the ES report writes the designated-forwarder candidates of one
-#: network-instance, joined by ", " when a segment is in several:
-#: ``macvrf-101:[10.0.0.1 10.0.0.2(DF)], macvrf-202:[10.0.0.1(DF)]``. The comma
-#: is excluded from the name so the separator does not read as part of it.
-_ES_ASSOCIATION = re.compile(r"(?P<ni>[^:\[\],]+):\[(?P<peers>[^\]]*)\]")
-
-
 def check_es_df(state: FabricState) -> List[Finding]:
     """Ethernet segments without a working designated-forwarder election.
 
@@ -547,36 +673,39 @@ def check_es_df(state: FabricState) -> List[Finding]:
     findings = []
     modes: Dict[str, Dict[str, str]] = {}
 
-    for node, entry in state.items("es"):
-        name = str(entry.get("name", "?"))
-        esi = str(entry.get("esi", ""))
-        if esi:
-            modes.setdefault(esi, {})[node] = _text(entry.get("mh-mode"))
+    for node, segment in state.items("es"):
+        if segment.esi:
+            modes.setdefault(segment.esi, {})[node] = _text(segment.mh_mode)
 
-        if _text(entry.get("oper")) not in ("up", ""):
+        if _text(segment.oper) not in ("up", ""):
+            attached = " ".join(segment.interfaces) or " ".join(
+                nh.address for nh in segment.next_hops
+            )
             findings.append(
                 Finding(
                     check="es_df",
                     severity=ERROR,
                     node=node,
-                    subject=name,
-                    detail=f"segment is {_text(entry.get('oper'))} on {entry.get('itf/nh') or 'no interface'}",
+                    subject=segment.name or "?",
+                    detail=f"segment is {_text(segment.oper)} on {attached or 'no interface'}",
                 )
             )
 
-        for association in _ES_ASSOCIATION.finditer(str(entry.get("ni-peers") or "")):
-            peers = association.group("peers").split()
-            if any(peer.endswith("(DF)") for peer in peers):
+        for association in segment.associations:
+            if association.designated is not None:
                 continue
             findings.append(
                 Finding(
                     check="es_df",
                     severity=ERROR,
                     node=node,
-                    subject=f"{name}/{association.group('ni').strip()}",
+                    subject=f"{segment.name or '?'}/{association.ni}",
                     detail=(
                         "no designated forwarder elected among "
-                        + (" ".join(peers) if peers else "no candidates")
+                        + (
+                            " ".join(c.address for c in association.candidates)
+                            or "no candidates"
+                        )
                     ),
                 )
             )
@@ -651,9 +780,16 @@ CHECKS: Tuple[Check, ...] = (
         run=check_mtu_mismatch,
     ),
     Check(
+        name="mtu_outlier",
+        title="Nodes whose fabric MTU differs from the rest of the fabric",
+        requires=("subif",),
+        run=check_mtu_outlier,
+    ),
+    Check(
         name="evpn_service_mismatch",
         title="Services whose nodes disagree about VNI or route-targets",
-        requires=("ni", "vxlan"),
+        # The RIBs say which nodes share an underlay, and so can disagree at all.
+        requires=("ni", "vxlan", "ipv4_rib", "ipv6_rib"),
         run=check_evpn_service_mismatch,
     ),
     Check(
@@ -677,36 +813,11 @@ def collect_fabric_state(
 ) -> FabricState:
     """Run the reports the checks read over a Nornir inventory.
 
-    One pass over the fabric per report, each threaded the way a single report
-    is. A node that fails one report is still checked against the others. The
-    live server does not use this - it has the state already, and builds a
-    :class:`FabricState` from its streams instead.
+    A thin default over :func:`nornir_srl.fabric.collect_fabric_state`: the
+    checks read a fixed set of reports, so the caller does not have to name
+    them. A lens names its own.
     """
-    from nornir.core.task import Result, Task  # noqa: PLC0415 - optional at import
-
-    from .connections.srlinux import CONNECTION_NAME
-    from .reports import get_report
-
-    state = FabricState()
-    state.hostnames = {
-        name: (host.hostname or name) for name, host in target.inventory.hosts.items()
-    }
-    for report_name in reports:
-        spec = get_report(report_name)
-
-        def task_func(task: "Task", spec=spec) -> "Result":
-            device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-            return Result(host=task.host, result=spec.getter(device))
-
-        result = target.run(task=task_func, name=spec.resource, raise_on_error=False)
-        payloads: Dict[str, Any] = {}
-        for node, multi in result.items():
-            if multi.failed:
-                state.errors[(report_name, node)] = str(multi[0].exception)
-                continue
-            payloads[node] = (multi[0].result or {}).get(spec.resource) or []
-        state.reports[report_name] = payloads
-    return state
+    return _collect(target, reports)
 
 
 def run_checks(

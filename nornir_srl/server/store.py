@@ -15,6 +15,8 @@ from ..checks import CHECKS_COLUMNS, CHECKS_REPORT, FabricState, REQUIRED_REPORT
 from ..connections.down_reason import STANDBY_STATE, is_intent
 from ..connections.srlinux import CONNECTION_NAME
 from ..connections.layer2 import stamp_underlay_sites
+from ..lenses import LensSpec
+from ..records import as_dict
 from ..reports import ReportSpec, SubscriptionSpec, get_report
 from ..rows import cell, clean_columns, flatten, merge_fields, sub_item_keys
 from .devices import CachedDevice, RecordingDevice
@@ -636,7 +638,7 @@ class FabricStore:
             return name, [], [], error, set()
         host = self.nornir.inventory.hosts.get(name)
         node = (host.hostname if host and host.hostname else name) or name
-        columns, rows = flatten(node, items)
+        columns, rows = flatten(node, items, report.table_for(params))
         return name, columns, rows, None, sub_item_keys(items)
 
     # ------------------------------------------------------------------ #
@@ -680,6 +682,52 @@ class FabricStore:
     ) -> List[Dict[str, Any]]:
         """The findings of every check, as the rows of a table."""
         return [f.as_row() for f in run_checks(self.fabric_state(inv_filter))]
+
+    # ------------------------------------------------------------------ #
+    # lenses
+    # ------------------------------------------------------------------ #
+
+    def lens_table(
+        self,
+        lens: LensSpec,
+        inv_filter: Optional[Dict[str, str]] = None,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Ask *lens* its question of the streamed state.
+
+        The same shape :meth:`table` renders a report into, with the records
+        and the hierarchy the browser draws them as alongside the rows. A
+        lens is run rather than streamed: the reports it reads are what is
+        streamed, and are activated here the way the checks activate theirs.
+        A question it cannot answer - an address that is not one, a service
+        that matches nothing - raises :class:`ValueError` for the caller to
+        show.
+        """
+        started = time.time()
+        state = self.fabric_state(inv_filter, reports=lens.requires)
+        records = lens.run(state, **(params or {}))
+        rows = lens.rows(records)
+        if lens.group_by_node:
+            rows.sort(key=lambda r: str(r.get("Node", "")))
+        errors = [
+            {"node": node, "error": f"{report} not collected: {error}"}
+            for (report, node), error in sorted(state.errors.items())
+        ]
+        names = self._targets(inv_filter)
+        return {
+            "report": lens.name,
+            "title": lens.title,
+            "columns": ["Node", *lens.column_names],
+            "rows": [{k: cell(v) for k, v in row.items()} for row in rows],
+            "records": [as_dict(record) for record in records],
+            "tree": [as_dict(card) for card in lens.tree(records)],
+            "graph": lens.graph(records) if lens.graph else None,
+            "errors": errors,
+            "nodes": len(names),
+            "generated": started,
+            "render_ms": round((time.time() - started) * 1000, 1),
+            "oldest_update": _oldest_update(self._streams_for(names)),
+        }
 
     # ------------------------------------------------------------------ #
     # introspection

@@ -17,14 +17,16 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from unittest import mock
 
 from nornir_srl.connections import ifstats as ifstats_module
 from nornir_srl.connections import neighbor_discovery as nd_module
 from nornir_srl.reports import REPORTS_BY_NAME, ReportSpec
+from nornir_srl.connections.helpers import clean_structured_key
 from nornir_srl.rows import clean_columns, flatten
 from nornir_srl.server.devices import MixinDevice
+from nornir_srl.server.tree import select_path, split_path
 
 FIXTURE_ROOT = Path(__file__).resolve().parent.parent / "fixtures" / "releases"
 
@@ -315,8 +317,15 @@ class ReplayDevice(MixinDevice):
             key = (path, datatype or "config")
             self.requested.append(key)
             recorded = self._calls.get(key)
+            narrow = None
             if not recorded:
-                raise ReplayError(path, datatype or "config")
+                # A getter that has since learned to ask for less than it used
+                # to is answered from what the device gave for the wider path,
+                # cut down the way the device would have cut it.
+                narrow = self._recorded_ancestor(path, datatype or "config")
+                if narrow is None:
+                    raise ReplayError(path, datatype or "config")
+                key, recorded = narrow, self._calls[narrow]
             index = min(self._cursor.get(key, 0), len(recorded) - 1)
             self._cursor[key] = index + 1
             call = recorded[index]
@@ -324,8 +333,23 @@ class ReplayDevice(MixinDevice):
                 raise RecordedGnmiError(call.error or "", call.grpc_code)
             # A copy, because several getters enrich the response in place and a
             # recording is replayed by more than one test.
-            response.extend(copy.deepcopy(call.response or []))
+            payload = copy.deepcopy(call.response or [])
+            if narrow is not None:
+                payload = [
+                    {env: select_path(value, path, env) for env, value in notification.items()}
+                    for notification in payload
+                ]
+            response.extend(payload)
         return response
+
+    def _recorded_ancestor(self, path: str, datatype: str) -> Optional[Tuple[str, str]]:
+        """The longest recorded path *path* lies under, with the same datatype."""
+        elems = split_path(path)
+        for cut in range(len(elems) - 1, 0, -1):
+            candidate = ("/" + "/".join(elems[:cut]), datatype)
+            if candidate in self._calls:
+                return candidate
+        return None
 
 
 def flatten_report(
@@ -334,13 +358,36 @@ def flatten_report(
     """A getter's result as the ``(columns, rows)`` a user of the report sees.
 
     Capture and replay both go through here, so a recorded table and a replayed
-    one are comparable by construction.
+    one are comparable by construction. Rows are keyed the way the columns are
+    named - see :func:`comparable_rows` for what that leaves out.
     """
-    raw_columns, rows = flatten("", (result or {}).get(spec.resource))
+    raw_columns, rows = flatten("", (result or {}).get(spec.resource), spec.table_for({}))
     # ``flatten`` labels each row with the node it came from; the recording
     # already names the node, so it would only be noise repeated on every row.
-    return clean_columns(raw_columns), [
+    return clean_columns(raw_columns), comparable_rows(
         {k: v for k, v in row.items() if k != "Node"} for row in rows
+    )
+
+
+def comparable_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """*rows* as what they render as, so two ways of producing one compare.
+
+    A cell renders the same whether its key carried a ``<n>_`` ordering
+    prefix or a newline, and whether an empty cell was left out of the row,
+    given as ``None``, as ``""``, as an empty list or as a list of nothing
+    but those - the ``[None]`` a host route's next-hop used to flatten to.
+    Recordings made before a report returned records keep the raw keys and
+    the gaps, so both sides are brought to this shape.
+    """
+
+    def cell(value: Any) -> Any:
+        if isinstance(value, list):
+            value = [v for v in value if v is not None and v != ""]
+        return None if value is None or value == "" or value == [] else value
+
+    return [
+        {clean_structured_key(k): cell(v) for k, v in row.items() if cell(v) is not None}
+        for row in rows
     ]
 
 

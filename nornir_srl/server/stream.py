@@ -24,6 +24,7 @@ from ..connections.helpers import strip_modules
 from ..connections.routing import _gnmi_path_missing
 from ..reports import SubscriptionSpec
 from .tree import (
+    ListNode,
     delete,
     get_node,
     insert,
@@ -117,11 +118,18 @@ class PathState:
 
 
 class RateTracker:
-    """Derives per-interface rates from consecutive streamed counter samples."""
+    """Derives per-interface rates from consecutive streamed counter samples.
+
+    Alongside each rate it keeps the raw change over the same interval, which
+    is what an error or discard count is reported as: how many during the
+    last sample, the way the CLI's two-sample report counts them, rather than
+    a total that never goes back to zero.
+    """
 
     def __init__(self) -> None:
         self._last: Dict[str, Tuple[float, Dict[str, int]]] = {}
         self._rates: Dict[str, Dict[str, float]] = {}
+        self._deltas: Dict[str, Dict[str, int]] = {}
 
     def observe(self, itf: str, counters: Dict[str, Any], ts_ns: int) -> None:
         now = ts_ns / 1e9 if ts_ns else time.time()
@@ -137,12 +145,15 @@ class RateTracker:
             dt = now - prev_ts
             if dt >= _MIN_RATE_INTERVAL:
                 rates = {}
+                deltas = {}
                 for name in IFSTATS_COUNTERS:
                     delta = current[name] - prev_counters.get(name, 0)
                     if delta < 0:  # counter reset/wrap
                         delta = 0
                     rates[name] = delta / dt
+                    deltas[name] = delta
                 self._rates[itf] = rates
+                self._deltas[itf] = deltas
                 self._last[itf] = (now, current)
             return
         self._last[itf] = (now, current)
@@ -150,6 +161,10 @@ class RateTracker:
     def rates(self, itf: str) -> Dict[str, float]:
         # Copied: read by report renders while the subscription thread observes.
         return dict(self._rates.get(itf, {}))
+
+    def deltas(self, itf: str) -> Dict[str, int]:
+        """How much each counter moved between the last two samples."""
+        return dict(self._deltas.get(itf, {}))
 
     def all_rates(self) -> Dict[str, Dict[str, float]]:
         """Every interface that has a derived rate, each a copy of its counters."""
@@ -159,6 +174,7 @@ class RateTracker:
         """Drop the counters of an interface that no longer exists."""
         self._last.pop(itf, None)
         self._rates.pop(itf, None)
+        self._deltas.pop(itf, None)
 
 
 def _extract_item_path(item: Any) -> str:
@@ -180,6 +196,35 @@ def _extract_item_path(item: Any) -> str:
                         parts.append(name)
             return "/".join(parts)
     return ""
+
+
+def _under(path: str, envelope: str) -> bool:
+    """Whether an update *path* lies under *envelope* (``network-instance``,
+    ``system/lldp``); the root envelope holds everything."""
+    if envelope == "":
+        return True
+    return path == envelope or path.startswith(envelope + "/") or path.startswith(envelope + "[")
+
+
+def _stale_lists(node: Any, cutoff: float, path: str = "") -> Dict[str, int]:
+    """How many entries each list under *node* is about to lose, by list path.
+
+    What the eviction log names, so a list that keeps going stale can be
+    traced to the subscription that should have been refreshing it.
+    """
+    found: Dict[str, int] = {}
+    if isinstance(node, ListNode):
+        stale = sum(1 for seen in node.seen.values() if seen < cutoff)
+        if stale:
+            found[path or "/"] = stale
+        for _keys, child in node.entries.values():
+            for key, count in _stale_lists(child, cutoff, path).items():
+                found[key] = found.get(key, 0) + count
+    elif isinstance(node, dict):
+        for name, child in node.items():
+            for key, count in _stale_lists(child, cutoff, f"{path}/{name}").items():
+                found[key] = found.get(key, 0) + count
+    return found
 
 
 class HostStream:
@@ -244,6 +289,10 @@ class HostStream:
         self._get_error: Optional[str] = None
         #: When the last stale-entry sweep ran (monotonic).
         self._last_prune = 0.0
+        #: When each envelope last had an update applied (monotonic): what a
+        #: sweep measures staleness against, so a stream that is merely behind
+        #: is not read as the node forgetting its state.
+        self._envelope_seen: Dict[str, float] = {}
         self.last_update: Optional[float] = None
         self.connected = False
         self.error: Optional[str] = None
@@ -607,11 +656,16 @@ class HostStream:
         with self._lock:
             self._direct_cache.clear()
             self._failed_gets.clear()
+            envelopes = self._envelopes()
+            arrived = time.monotonic()
             for item in update.get("update", []) or []:
                 item_path = _extract_item_path(item)
                 path = join_path(prefix, item_path)
                 val = item.get("val") if isinstance(item, dict) else None
                 insert(self._tree, path, val)
+                for env in envelopes:
+                    if _under(path, env):
+                        self._envelope_seen[env] = arrived
                 itf = _touched_interface(path)
                 if itf:
                     touched_itfs.add(itf)
@@ -640,6 +694,15 @@ class HostStream:
             except Exception:  # noqa: BLE001
                 pass
 
+    def _envelopes(self) -> List[str]:
+        """Every envelope a streaming path of this node feeds."""
+        found: List[str] = []
+        for state in self._paths.values():
+            for env in state.envelopes:
+                if env not in found:
+                    found.append(env)
+        return found
+
     def _evict_stale(self) -> None:
         """Drop list entries the subscription has stopped refreshing.
 
@@ -649,6 +712,13 @@ class HostStream:
         that goes away on the device therefore lingers, and until this ran the
         only thing that removed it was the resync sweep, minutes later: a
         designated forwarder that moved rendered as two.
+
+        Staleness is measured against the envelope's own progress where that
+        lags the clock: an entry is stale when the envelope has had a TTL's
+        worth of newer data that did not include it. A stream that is merely
+        behind - a spine's RPC catching up on a large subtree - delivers its
+        samples late but whole, and evicting what the last sample refreshed
+        because the next one is overdue would blank out live state.
 
         Caller holds ``self._lock``.
         """
@@ -685,15 +755,27 @@ class HostStream:
             node = self._tree if env == "" else get_node(self._tree, env)
             if node is None:
                 continue
-            dropped = prune(node, now - ttl)
+            # The TTL counts from the envelope's last update where that is
+            # older than the clock: only data newer than an entry can say it
+            # is gone, and none has arrived while the stream is behind.
+            latest = self._envelope_seen.get(env)
+            if latest is None:
+                continue
+            cutoff = min(now, latest) - ttl
+            stale = _stale_lists(node, cutoff) if logger.isEnabledFor(logging.DEBUG) else {}
+            dropped = prune(node, cutoff)
             if dropped:
                 logger.debug(
-                    "%s: dropped %d stale entr%s under %s (unrefreshed for %.0fs)",
+                    "%s: dropped %d stale entr%s under %s (unrefreshed for %.0fs): %s",
                     self.name,
                     dropped,
                     "y" if dropped == 1 else "ies",
                     env or "/",
                     ttl,
+                    ", ".join(
+                        f"{path} x{count}"
+                        for path, count in sorted(stale.items(), key=lambda kv: -kv[1])[:6]
+                    ),
                 )
 
     # ------------------------------------------------------------------ #

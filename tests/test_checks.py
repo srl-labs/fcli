@@ -2,13 +2,15 @@
 
 Each check is a pure function over the payloads the report getters return, so a
 test is a fabric written out as those payloads and the findings it should
-produce. The payload shapes here mirror the getters exactly - ``bgp_peers``
-really does key a neighbour address as ``1_peer`` and name a column
-``"EVPN\\nR/A/T"`` - because a check that reads a field by the wrong name would
+produce. Where a getter returns records (:mod:`nornir_srl.records`) the fabric
+is written as those records, and a check that reads a field by the wrong name
+fails to import; where it still returns items, the shapes here mirror the
+getter exactly, because a check that reads a key by the wrong name would
 otherwise pass here and find nothing on a real fabric.
 """
 
-from typing import Any, Dict, List
+from dataclasses import replace
+from typing import Any, Dict, List, Tuple
 
 from nornir_srl import checks as checks_module
 from nornir_srl.checks import (
@@ -21,6 +23,26 @@ from nornir_srl.checks import (
     Check,
     FabricState,
     run_checks,
+    underlay_domains,
+)
+from nornir_srl.records import (
+    Association,
+    BgpPeers,
+    BgpVpnInstance,
+    Candidate,
+    EthernetSegment,
+    Family,
+    Interface,
+    InterfaceStats,
+    LldpInterface,
+    LldpNeighbor,
+    Neighbor,
+    NetworkInstance,
+    Route,
+    RouteTable,
+    Subinterface,
+    SubinterfaceState,
+    VxlanInterface,
 )
 from nornir_srl.reports import REPORTS_BY_NAME
 
@@ -70,20 +92,21 @@ def test_a_finding_fills_every_column():
 # --------------------------------------------------------------------------- #
 
 
-def _peers(state: str = "established", **overrides: Any) -> Dict[str, Any]:
-    peer = {
-        "1_peer": "10.0.0.2",
-        "peer-as": 65002,
-        "state": state,
-        "group": "spines",
-        "U4\nR/A/T": "5/5/3",
-        "U6\nR/A/T": "-",
-        "EVPN\nR/A/T": "12/12/6",
-        "VPNv4\nR/A/T": "-",
-        "VPNv6\nR/A/T": "-",
-    }
-    peer.update(overrides)
-    return {"leaf1": [{"NI": "default", "Neighbors": [peer]}]}
+def _peers(
+    state: str = "established",
+    evpn: Family = Family("evpn", received=12, active=12, sent=6),
+    **overrides: Any,
+) -> Dict[str, Any]:
+    """One leaf with one session carrying ipv4-unicast and *evpn*."""
+    peer = Neighbor(
+        peer="10.0.0.2",
+        state=state,
+        peer_as=65002,
+        group="spines",
+        families=(Family("ipv4-unicast", received=5, active=5, sent=3), evpn),
+    )
+    peer = replace(peer, **overrides)
+    return {"leaf1": [BgpPeers("default", (peer,))]}
 
 
 def test_bgp_down_finds_a_session_that_is_not_established():
@@ -110,7 +133,7 @@ def test_bgp_down_does_not_report_a_session_that_is_not_meant_to_be_up():
 
 
 def test_bgp_af_down_finds_the_family_under_an_established_session():
-    peers = _peers(**{"EVPN\nR/A/T": "down"})
+    peers = _peers(evpn=Family("evpn", oper="down"))
     findings = run("bgp_af_down", fabric(bgp_peers=peers))
     assert len(findings) == 1
     assert findings[0]["Severity"] == ERROR
@@ -119,16 +142,17 @@ def test_bgp_af_down_finds_the_family_under_an_established_session():
 
 def test_bgp_af_down_says_nothing_about_a_session_already_reported_down():
     """One fault is one finding: bgp_down has it."""
-    peers = _peers(state="idle", **{"EVPN\nR/A/T": "down"})
+    peers = _peers(state="idle", evpn=Family("evpn", oper="down"))
     assert run("bgp_af_down", fabric(bgp_peers=peers)) == []
 
 
 def test_bgp_af_down_ignores_a_family_that_was_never_enabled():
-    assert run("bgp_af_down", fabric(bgp_peers=_peers())) == []
+    peers = _peers(evpn=Family("evpn", enabled=False, oper="down"))
+    assert run("bgp_af_down", fabric(bgp_peers=peers)) == []
 
 
 def test_bgp_no_routes_finds_a_family_that_has_learned_nothing():
-    peers = _peers(**{"EVPN\nR/A/T": "0/0/6"})
+    peers = _peers(evpn=Family("evpn", received=0, active=0, sent=6))
     findings = run("bgp_no_routes", fabric(bgp_peers=peers))
     assert len(findings) == 1
     assert findings[0]["Severity"] == WARNING
@@ -137,17 +161,23 @@ def test_bgp_no_routes_finds_a_family_that_has_learned_nothing():
 
 def test_bgp_no_routes_counts_received_rather_than_active():
     """A route received and not selected is a policy question, not a fault."""
-    peers = _peers(**{"EVPN\nR/A/T": "12/0/6"})
+    peers = _peers(evpn=Family("evpn", received=12, active=0, sent=6))
     assert run("bgp_no_routes", fabric(bgp_peers=peers)) == []
 
 
 def test_bgp_no_routes_ignores_a_family_that_is_not_carrying():
-    peers = _peers(**{"EVPN\nR/A/T": "disabled"})
+    peers = _peers(evpn=Family("evpn", enabled=False))
+    assert run("bgp_no_routes", fabric(bgp_peers=peers)) == []
+
+
+def test_bgp_no_routes_ignores_a_family_that_is_down():
+    """A family that is down is bgp_af_down's finding, not an empty one."""
+    peers = _peers(evpn=Family("evpn", oper="down"))
     assert run("bgp_no_routes", fabric(bgp_peers=peers)) == []
 
 
 def test_bgp_checks_survive_a_network_instance_with_no_neighbors():
-    state = fabric(bgp_peers={"leaf1": [{"NI": "default", "Neighbors": None}]})
+    state = fabric(bgp_peers={"leaf1": [BgpPeers("default", ())]})
     assert run("bgp_down", state) == []
 
 
@@ -157,20 +187,14 @@ def test_bgp_checks_survive_a_network_instance_with_no_neighbors():
 
 
 def _subif(node: str = "leaf1", **overrides: Any) -> Dict[str, Any]:
-    subif = {
-        "Subitf": "ethernet-1/1.0",
-        "type": "routed",
-        "admin": "enable",
-        "oper": "up",
-        "down-reason": "",
-        "ip-mtu": 9000,
-    }
-    subif.update(overrides)
-    return {node: [{"Itf": "ethernet-1/1", "subitfs": [subif]}]}
+    subif = SubinterfaceState(
+        "ethernet-1/1.0", type="routed", admin="enable", oper="up", ip_mtu=9000
+    )
+    return {node: [Interface("ethernet-1/1", (replace(subif, **overrides),))]}
 
 
 def test_itf_down_finds_a_subinterface_enabled_but_not_up():
-    state = fabric(subif=_subif(oper="down", **{"down-reason": "port-down"}))
+    state = fabric(subif=_subif(oper="down", down_reason="port-down"))
     findings = run("itf_down", state)
     assert len(findings) == 1
     assert findings[0]["Severity"] == ERROR
@@ -180,7 +204,7 @@ def test_itf_down_finds_a_subinterface_enabled_but_not_up():
 
 def test_itf_down_leaves_a_port_held_down_on_purpose_alone():
     """The standby side of a single-active segment reads as down/standby."""
-    state = fabric(subif=_subif(oper="down/standby", **{"down-reason": "standby-signaling"}))
+    state = fabric(subif=_subif(oper="down/standby", down_reason="standby-signaling"))
     assert run("itf_down", state) == []
 
 
@@ -198,7 +222,7 @@ def test_itf_down_ignores_the_management_interface():
     state = fabric(
         subif={
             "leaf1": [
-                {"Itf": "mgmt0", "subitfs": [{"Subitf": "mgmt0.0", "admin": "enable", "oper": "down"}]}
+                Interface("mgmt0", (SubinterfaceState("mgmt0.0", admin="enable", oper="down"),))
             ]
         }
     )
@@ -206,21 +230,12 @@ def test_itf_down_ignores_the_management_interface():
 
 
 def _ifstats(**overrides: Any) -> Dict[str, Any]:
-    row = {
-        "interface": "ethernet-1/1",
-        "in-Kbps": 12.0,
-        "out-Kbps": 8.0,
-        "in-err": 0,
-        "out-err": 0,
-        "in-disc": 0,
-        "out-disc": 0,
-    }
-    row.update(overrides)
-    return {"leaf1": [row]}
+    stats = InterfaceStats("ethernet-1/1", in_kbps=12.0, out_kbps=8.0)
+    return {"leaf1": [replace(stats, **overrides)]}
 
 
 def test_itf_errors_finds_error_packets():
-    findings = run("itf_errors", fabric(ifstats=_ifstats(**{"in-err": 4})))
+    findings = run("itf_errors", fabric(ifstats=_ifstats(in_errors=4)))
     assert len(findings) == 1
     assert findings[0]["Severity"] == ERROR
     assert findings[0]["Subject"] == "ethernet-1/1"
@@ -228,13 +243,13 @@ def test_itf_errors_finds_error_packets():
 
 
 def test_itf_errors_reports_discards_less_urgently_than_errors():
-    findings = run("itf_errors", fabric(ifstats=_ifstats(**{"out-disc": 7})))
+    findings = run("itf_errors", fabric(ifstats=_ifstats(out_discards=7)))
     assert [f["Severity"] for f in findings] == [WARNING]
     assert "0 in / 7 out discarded packets" in findings[0]["Detail"]
 
 
 def test_itf_errors_reports_errors_and_discards_separately():
-    state = fabric(ifstats=_ifstats(**{"in-err": 1, "in-disc": 2}))
+    state = fabric(ifstats=_ifstats(in_errors=1, in_discards=2))
     assert sorted(f["Severity"] for f in run("itf_errors", state)) == [ERROR, WARNING]
 
 
@@ -247,14 +262,11 @@ def test_itf_errors_says_nothing_about_a_clean_interface():
 # --------------------------------------------------------------------------- #
 
 
-def _lldp(**adjacencies: List[Dict[str, str]]) -> Dict[str, Any]:
+def _lldp(**adjacencies: List[Tuple[str, str, str]]) -> Dict[str, Any]:
     """``_lldp(leaf1=[("ethernet-1/1", "spine1", "ethernet-1/1")])`` per node."""
     return {
         node: [
-            {
-                "interface": local,
-                "Neighbors": [{"Nbr-System": peer, "Nbr-port": peer_port}],
-            }
+            LldpInterface(local, (LldpNeighbor(peer, peer_port),))
             for local, peer, peer_port in links
         ]
         for node, links in adjacencies.items()
@@ -297,16 +309,10 @@ def test_lldp_one_sided_matches_a_short_system_name_to_a_prefixed_inventory():
         reports={
             "lldp": {
                 "clab-dc1-leaf1": [
-                    {
-                        "interface": "ethernet-1/1",
-                        "Neighbors": [{"Nbr-System": "spine1", "Nbr-port": "ethernet-1/1"}],
-                    }
+                    LldpInterface("ethernet-1/1", (LldpNeighbor("spine1", "ethernet-1/1"),))
                 ],
                 "clab-dc1-spine1": [
-                    {
-                        "interface": "ethernet-1/1",
-                        "Neighbors": [{"Nbr-System": "leaf1", "Nbr-port": "ethernet-1/1"}],
-                    }
+                    LldpInterface("ethernet-1/1", (LldpNeighbor("leaf1", "ethernet-1/1"),))
                 ],
             }
         }
@@ -327,14 +333,8 @@ def _link_pair() -> Dict[str, Any]:
 
 
 def _mtu(node: str, mtu: int, index: str = "0") -> Dict[str, Any]:
-    return {
-        node: [
-            {
-                "Itf": "ethernet-1/1",
-                "subitfs": [{"Subitf": f"ethernet-1/1.{index}", "admin": "enable", "oper": "up", "ip-mtu": mtu}],
-            }
-        ]
-    }
+    subif = SubinterfaceState(f"ethernet-1/1.{index}", admin="enable", oper="up", ip_mtu=mtu)
+    return {node: [Interface("ethernet-1/1", (subif,))]}
 
 
 def test_mtu_mismatch_finds_two_ends_that_disagree():
@@ -387,20 +387,19 @@ def test_mtu_mismatch_needs_both_ends_to_report_one():
 def _ni(node: str, *, vxlan: str = "vxlan1.100", in_rt: str = "65000:100", out_rt: str = "65000:100"):
     return {
         node: [
-            {
-                "NI": "mac-vrf-100",
-                "type": "mac-vrf",
-                "oper": "up",
-                "vxlan-itf": vxlan,
-                "In-RT": in_rt,
-                "Out-RT": out_rt,
-            }
+            NetworkInstance(
+                name="mac-vrf-100",
+                type="mac-vrf",
+                oper="up",
+                overlays=(vxlan,),
+                instances=(BgpVpnInstance(1, (in_rt,), (out_rt,)),),
+            )
         ]
     }
 
 
 def _vxlan(node: str, *, itf: str = "vxlan1.100", vni: int = 100):
-    return {node: [{"vxlan-itf": itf, "NI": "mac-vrf-100", "ing-vni": vni}]}
+    return {node: [VxlanInterface(name=itf, ni="mac-vrf-100", vni=vni)]}
 
 
 def test_evpn_service_mismatch_says_nothing_when_two_nodes_agree():
@@ -441,6 +440,134 @@ def test_evpn_service_mismatch_reads_a_route_target_however_it_is_written():
     assert run("evpn_service_mismatch", state) == []
 
 
+def _gateway(node: str, *, wan_rt: str = "65000:100"):
+    """A DCI gateway: the leaves' instance, plus a WAN-side instance of its own."""
+    return {
+        node: [
+            NetworkInstance(
+                name="mac-vrf-100",
+                type="mac-vrf",
+                oper="up",
+                overlays=("vxlan1.100",),
+                instances=(
+                    BgpVpnInstance(1, ("65000:100",), ("65000:100",)),
+                    BgpVpnInstance(2, (wan_rt,), (wan_rt,), rd="192.0.2.8:100"),
+                ),
+            )
+        ]
+    }
+
+
+def test_evpn_service_mismatch_lets_a_gateway_carry_a_second_instance():
+    """A gateway's WAN-side route-target is not a disagreement with the leaves."""
+    state = fabric(
+        ni={**_ni("leaf1"), **_ni("leaf2"), **_gateway("dcgw1"), **_gateway("dcgw2")},
+        vxlan={**_vxlan("leaf1"), **_vxlan("leaf2"), **_vxlan("dcgw1"), **_vxlan("dcgw2")},
+    )
+    assert run("evpn_service_mismatch", state) == []
+
+
+def test_evpn_service_mismatch_compares_a_second_instance_between_the_gateways():
+    state = fabric(
+        ni={**_ni("leaf1"), **_gateway("dcgw1"), **_gateway("dcgw2", wan_rt="65000:999")},
+        vxlan={**_vxlan("leaf1"), **_vxlan("dcgw1"), **_vxlan("dcgw2")},
+    )
+    findings = run("evpn_service_mismatch", state)
+    # Only the gateways have a second instance, so only they are held to it.
+    assert {f["Node"] for f in findings} == {"dcgw1", "dcgw2"}
+    assert all("bgp-instance 2" in f["Detail"] for f in findings)
+    assert not any("leaf1" in f["Detail"] for f in findings)
+
+
+def test_evpn_service_mismatch_takes_a_name_split_by_route_target_in_one_underlay_as_a_warning():
+    """Two services under one name in one fabric, or a mistyped target: a
+    warning either way, and no error about the VNI between them."""
+    state = fabric(
+        ni={
+            **_ni("leaf1", in_rt="65000:201", out_rt="65000:201"),
+            **_ni("leaf2", in_rt="65000:201", out_rt="65000:201"),
+            **_ni("leaf3", in_rt="65000:202", out_rt="65000:202"),
+        },
+        vxlan={**_vxlan("leaf1", vni=201), **_vxlan("leaf2", vni=201), **_vxlan("leaf3", vni=202)},
+    )
+    findings = run("evpn_service_mismatch", state)
+    assert {f["Severity"] for f in findings} == {WARNING}
+    assert {f["Node"] for f in findings} == {"leaf1", "leaf2", "leaf3"}
+    leaf1 = next(f for f in findings if f["Node"] == "leaf1")
+    assert "65000:201, while leaf3 65000:202 in the same underlay" in leaf1["Detail"]
+    assert "two services under one name" in leaf1["Detail"]
+
+
+def _underlay(node: str, address: str, *reachable: str) -> Dict[str, Any]:
+    """A node's own loopback, and the loopbacks it can reach in ``default``."""
+    return {
+        "ni": NetworkInstance(
+            "default", "default", "up",
+            interfaces=(Subinterface("system0.0", "up", prefixes=(f"{address}/32",)),),
+        ),
+        "rib": RouteTable("default", tuple(Route(f"{other}/32", "bgp") for other in reachable)),
+    }
+
+
+def _two_datacenters(*, dc2_gateway_wan_rt: str = "65000:100") -> FabricState:
+    """Two fabrics whose underlays do not see each other, joined by gateways over a WAN.
+
+    Each datacenter has a bridge domain of the same name with its own VNI and
+    route-target; the gateways carry the leaves' instance and a WAN-side one
+    of their own, and reach each other's loopbacks over the WAN.
+    """
+    dc1 = {"leaf1": "192.0.2.1", "leaf2": "192.0.2.2", "dcgw1": "192.0.2.8"}
+    dc2 = {"leaf5": "192.0.2.5", "leaf6": "192.0.2.6", "dcgw3": "192.0.2.18"}
+    ni: Dict[str, Any] = {}
+    rib: Dict[str, Any] = {}
+    vxlan: Dict[str, Any] = {}
+    for site, members, rt, vni in ((1, dc1, "65000:201", 201), (2, dc2, "65000:202", 202)):
+        for node, address in members.items():
+            reachable = [a for n, a in members.items() if n != node]
+            if node.startswith("dcgw"):
+                # Gateways learn every gateway's loopback over the WAN.
+                reachable += [a for n, a in {**dc1, **dc2}.items() if n.startswith("dcgw") and n != node]
+                service = _gateway(node, wan_rt=dc2_gateway_wan_rt if site == 2 else "65000:100")[node][0]
+                service = replace(service, instances=(BgpVpnInstance(1, (rt,), (rt,)), service.instances[1]))
+            else:
+                service = _ni(node, in_rt=rt, out_rt=rt)[node][0]
+            underlay = _underlay(node, address, *reachable)
+            ni[node] = [service, underlay["ni"]]
+            rib[node] = [underlay["rib"]]
+            vxlan.update(_vxlan(node, vni=vni))
+    return fabric(ni=ni, vxlan=vxlan, ipv4_rib=rib)
+
+
+def test_evpn_service_mismatch_says_nothing_about_a_name_shared_across_underlays():
+    """Leaves whose underlays do not see each other are never one service."""
+    assert run("evpn_service_mismatch", _two_datacenters()) == []
+
+
+def test_evpn_service_mismatch_holds_the_gateways_wan_side_together_across_underlays():
+    """The WAN side is one service among the gateways, reached over the WAN."""
+    findings = run("evpn_service_mismatch", _two_datacenters(dc2_gateway_wan_rt="65000:999"))
+    assert {(f["Node"], f["Severity"]) for f in findings} == {("dcgw1", ERROR), ("dcgw3", ERROR)}
+    assert all("bgp-instance 2" in f["Detail"] for f in findings)
+
+
+def test_underlay_domains_fall_back_to_one_without_route_tables():
+    assert underlay_domains(["b", "a"], {}, {}) == [["a", "b"]]
+    assert underlay_domains([], {}, {}) == []
+
+
+def test_evpn_service_mismatch_still_errs_on_a_vni_within_one_route_target_group():
+    """The silent failure: the same route-target, so routes are imported, but a
+    different VNI, so the data plane never joins up."""
+    state = fabric(
+        ni={**_ni("leaf1"), **_ni("leaf2"), **_ni("leaf5", in_rt="65000:202", out_rt="65000:202")},
+        vxlan={**_vxlan("leaf1", vni=100), **_vxlan("leaf2", vni=999), **_vxlan("leaf5", vni=202)},
+    )
+    findings = run("evpn_service_mismatch", state)
+    errors = [f for f in findings if f["Severity"] == ERROR]
+    assert {f["Node"] for f in errors} == {"leaf1", "leaf2"}
+    assert all("VNI" in f["Detail"] and "leaf5" not in f["Detail"] for f in errors)
+
+
 def test_evpn_service_mismatch_ignores_a_service_only_one_node_has():
     """A service on one leaf is a service, not a disagreement."""
     state = fabric(ni=_ni("leaf1"), vxlan=_vxlan("leaf1"))
@@ -450,8 +577,8 @@ def test_evpn_service_mismatch_ignores_a_service_only_one_node_has():
 def test_evpn_service_mismatch_ignores_the_default_network_instance():
     state = fabric(
         ni={
-            "leaf1": [{"NI": "default", "type": "default", "In-RT": "", "Out-RT": ""}],
-            "leaf2": [{"NI": "default", "type": "default", "In-RT": "x", "Out-RT": "y"}],
+            "leaf1": [NetworkInstance("default", "default", "up")],
+            "leaf2": [NetworkInstance("default", "default", "up", instances=(BgpVpnInstance(1, ("x",), ("y",)),))],
         },
         vxlan={},
     )
@@ -463,19 +590,33 @@ def test_evpn_service_mismatch_ignores_the_default_network_instance():
 # --------------------------------------------------------------------------- #
 
 
-def _es(node: str, **overrides: Any) -> Dict[str, Any]:
-    segment = {
-        "name": "es-1",
-        "esi": "01:00:00:00:00:01:00:00:00:01",
-        "type": "virtual",
-        "mh-mode": "all-active",
-        "oper": "up",
-        "itf/nh": "lag1",
-        "evi": "100",
-        "ni-peers": "mac-vrf-100:[10.0.0.1 10.0.0.2(DF)]",
-    }
-    segment.update(overrides)
-    return {node: [segment]}
+def _candidates(*addresses: str) -> Tuple[Candidate, ...]:
+    """DF candidates written the way the ES report shows them: ``(DF)`` marks the elected one."""
+    return tuple(
+        Candidate(address.removesuffix("(DF)"), designated=address.endswith("(DF)"))
+        for address in addresses
+    )
+
+
+def _es(
+    node: str,
+    *,
+    associations: Tuple[Association, ...] = (
+        Association("mac-vrf-100", _candidates("10.0.0.1", "10.0.0.2(DF)")),
+    ),
+    **overrides: Any,
+) -> Dict[str, Any]:
+    segment = EthernetSegment(
+        name="es-1",
+        esi="01:00:00:00:00:01:00:00:00:01",
+        type="virtual",
+        mh_mode="all-active",
+        oper="up",
+        interfaces=("lag1",),
+        next_hops=(),
+        associations=associations,
+    )
+    return {node: [replace(segment, **overrides)]}
 
 
 def test_es_df_says_nothing_about_a_healthy_segment():
@@ -483,7 +624,9 @@ def test_es_df_says_nothing_about_a_healthy_segment():
 
 
 def test_es_df_finds_a_network_instance_with_no_designated_forwarder():
-    state = fabric(es=_es("leaf1", **{"ni-peers": "mac-vrf-100:[10.0.0.1 10.0.0.2]"}))
+    state = fabric(
+        es=_es("leaf1", associations=(Association("mac-vrf-100", _candidates("10.0.0.1", "10.0.0.2")),))
+    )
     findings = run("es_df", state)
     assert len(findings) == 1
     assert findings[0]["Subject"] == "es-1/mac-vrf-100"
@@ -491,7 +634,7 @@ def test_es_df_finds_a_network_instance_with_no_designated_forwarder():
 
 
 def test_es_df_finds_a_network_instance_with_no_candidates_at_all():
-    state = fabric(es=_es("leaf1", **{"ni-peers": "mac-vrf-100:[]"}))
+    state = fabric(es=_es("leaf1", associations=(Association("mac-vrf-100"),)))
     findings = run("es_df", state)
     assert len(findings) == 1
     assert "no candidates" in findings[0]["Detail"]
@@ -501,7 +644,10 @@ def test_es_df_checks_every_network_instance_on_a_segment():
     state = fabric(
         es=_es(
             "leaf1",
-            **{"ni-peers": "mac-vrf-100:[10.0.0.1(DF)], mac-vrf-200:[10.0.0.1 10.0.0.2]"},
+            associations=(
+                Association("mac-vrf-100", _candidates("10.0.0.1(DF)")),
+                Association("mac-vrf-200", _candidates("10.0.0.1", "10.0.0.2")),
+            ),
         )
     )
     findings = run("es_df", state)
@@ -514,7 +660,7 @@ def test_es_df_finds_a_segment_that_is_down():
 
 
 def test_es_df_finds_two_nodes_disagreeing_about_the_multi_homing_mode():
-    state = fabric(es={**_es("leaf1"), **_es("leaf2", **{"mh-mode": "single-active"})})
+    state = fabric(es={**_es("leaf1"), **_es("leaf2", mh_mode="single-active")})
     findings = run("es_df", state)
     assert {f["Node"] for f in findings} == {"leaf1", "leaf2"}
     assert all("multi-homing mode" in f["Detail"] for f in findings)
@@ -524,7 +670,7 @@ def test_es_df_does_not_compare_two_different_segments():
     state = fabric(
         es={
             **_es("leaf1"),
-            **_es("leaf2", esi="01:00:00:00:00:02:00:00:00:02", **{"mh-mode": "single-active"}),
+            **_es("leaf2", esi="01:00:00:00:00:02:00:00:00:02", mh_mode="single-active"),
         }
     )
     assert run("es_df", state) == []
@@ -551,14 +697,14 @@ def test_a_healthy_fabric_produces_nothing():
 def test_findings_come_back_worst_first():
     state = fabric(
         bgp_peers=_peers(state="idle"),
-        ifstats=_ifstats(**{"in-disc": 3}),
+        ifstats=_ifstats(in_discards=3),
     )
     severities = [f.severity for f in run_checks(state)]
     assert severities == [ERROR, WARNING]
 
 
 def test_only_runs_the_checks_asked_for():
-    state = fabric(bgp_peers=_peers(state="idle"), ifstats=_ifstats(**{"in-err": 1}))
+    state = fabric(bgp_peers=_peers(state="idle"), ifstats=_ifstats(in_errors=1))
     findings = run_checks(state, only=["bgp_down"])
     assert {f.check for f in findings} == {"bgp_down"}
 

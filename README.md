@@ -15,6 +15,7 @@ Inventory comes from a [containerlab](https://containerlab.dev/) topology file o
 ## Table of contents
 
 - [Quick start](#quick-start)
+- [GitHub Codespaces](#github-codespaces)
 - [Installation](#installation)
 - [Inventory](#inventory)
 - [Live server](#live-server)
@@ -50,6 +51,52 @@ fcli -t topo.clab.yml bgp-peers
 fcli -t topo.clab.yml -i role=leaf mac -f NI=macvrf-202
 fcli-mcp --topo-file topo.clab.yml
 ```
+
+## GitHub Codespaces
+
+Run fcli against a live 3-stage EVPN-VXLAN fabric in the cloud — no local containerlab setup required.
+
+---
+<div align=center>
+<a href="https://codespaces.new/srl-labs/fcli?quickstart=1">
+<img src="https://gitlab.com/rdodin/pics/-/wikis/uploads/d78a6f9f6869b3ac3c286928dd52fa08/run_in_codespaces-v1.svg?sanitize=true" style="width:50%"/></a>
+
+**[Run](https://codespaces.new/srl-labs/fcli?quickstart=1) fcli in GitHub Codespaces for free**.  
+[Learn more](https://containerlab.dev/manual/codespaces/) about Containerlab for Codespaces.  
+<small>Machine type: 8 vCPU · 16 GB RAM</small>
+</div>
+---
+
+Creating the Codespace hands the slow work to a background script, so the editor is usable immediately. [`.devcontainer/setup.sh`](.devcontainer/setup.sh) narrates five steps into `/tmp/fcli-codespace-setup.log`:
+
+1. wait for the Docker daemon
+2. install fcli from the sources in the repo (`uv sync`)
+3. deploy the [demo lab](labs/demo/) — 8 SR Linux nodes and 9 servers
+4. wait until every node answers gNMI, which is only once SR Linux has booted
+5. start `fcli server` on port 8080
+
+Step 3 is the long one: each SR Linux image is about 1 GB, so the first run usually takes **15–30 minutes**. Watch it work, or ask for a summary:
+
+```bash
+tail -f /tmp/fcli-codespace-setup.log
+bash .devcontainer/status.sh
+```
+
+If the lab did not start at all, run it yourself — it is safe to repeat, and a second run does nothing while the first is still going:
+
+```bash
+bash .devcontainer/launch-setup.sh
+```
+
+Once step 5 is reached, open port 8080 in the **Ports** tab for the live web UI (Overview, Topology, BGP, EVPN services, …).
+
+```bash
+# CLI reports against the same fabric
+fcli -t labs/demo/demo.clab.yaml bgp-peers
+fcli -t labs/demo/demo.clab.yaml -i hostname=leaf1 mac
+```
+
+Optional: set `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, or `XAI_API_KEY` as [Codespaces secrets](https://docs.github.com/en/codespaces/managing-your-codespaces/managing-your-account-specific-secrets-for-github-codespaces) to enable the **Ask** troubleshooting chat.
 
 ## Installation
 
@@ -247,6 +294,7 @@ The server binds to localhost by default. It has no authentication of its own, s
 
 * **Reports** are listed in the sidebar, grouped by category, with a filter box on top. The selected report is kept in the URL fragment (`http://localhost:8080/#bgp_peers`), so a view can be bookmarked or shared.
 * **Overview** is a KPI dashboard: node connectivity, interface and BGP-session health, derived from the same streamed trees as the tables.
+* **Lenses** sit under the reports: *Where*, *Path* and *Service* take an argument in the bar above the table and answer from the state the server is already streaming, re-asked at the refresh interval. The answer is drawn hierarchically, the way the services pages fold a fabric into cards — one card per address, hop or service, the nodes inside it, and under each node what it reports — with a **Table View** toggle for the flat rows. *Path* opens as a **Path View**: the walk drawn hop by hop, one box per lookup, an edge to each lookup it leads to, so the ECMP fan-out and where it converges again are visible at a glance and a branch that dies ends in a red stop. A lens's arguments are kept in the URL (`#path?source=leaf1&destination=10.0.2.51&ni=ipvrf-1`), so a walk can be shared. The **Ask** chat can call them too.
 * **Sorting**: click a column header to sort, click again to reverse. Sorting is natural, so `ethernet-1/10` comes after `ethernet-1/2`.
 * **Filtering**: each column has its own filter box, and the search box above the table filters on all visible columns at once. Both accept a regular expression and fall back to a substring match if the expression is not valid (yet).
 * **Inventory filter**: the same `key=value` filter as the CLI's `-i`, applied live — e.g. `role=leaf`.
@@ -302,7 +350,8 @@ OpenAI runs against the Responses API with `store=false`: fcli replays the model
 2. Each path is bootstrapped with a regular gNMI `Get`, which seeds a per-node state tree and pins down the response shape the report getter expects.
 3. A gNMI `Subscribe` (STREAM/SAMPLE) then keeps that tree current. Report getters run against the tree instead of the device, so a rendered table costs no device round-trip at all.
    One tree per node holds every subscription, so reading it back is not simply a matter of handing over the subtree: reports overlap (`/interface[name=lag*]` and `/interface[name=*]/statistics` both live under `interface`), and SR Linux streams whole subtrees for a subscription on one branch of them. What a report sees is therefore narrowed back down to what its own path selects — matching key predicates, the named branch, and nothing beside it — so a report reads what its own `Get` would have returned rather than what its neighbours put there.
-4. A path that cannot be subscribed to falls back to a short-TTL `Get`, and every node is re-read every `--resync` seconds so a missed delete cannot leave a stale row behind. Nodes are re-read round-robin rather than all at once, so a sweep spreads its `Get`s over the interval.
+4. A path that cannot be subscribed to falls back to a short-TTL `Get`, and every node is re-read every `--resync` seconds so a missed delete cannot leave a stale row behind. Nodes are re-read round-robin rather than all at once, so a sweep spreads its `Get`s over the interval. In between, a list entry a SAMPLE subscription has stopped re-sending is dropped after a few sample intervals — measured from the last update its part of the tree received, not from the clock, so a node whose stream has fallen behind keeps what its last sample delivered rather than blanking out.
+5. A subscription streams everything under its path, config and state alike, so what a report subscribes to is the branches its getter reads and no more: `/network-instance[name=*]` as a whole would carry every route table and BGP RIB of the node — on a spine, most of its state, and enough to put its whole stream behind — where the instance and service reports need its type, interfaces, overlays and BGP instances.
 
 Step 2 needs data to work with: SR Linux answers a `Get` for a subtree that holds nothing with an empty response, which does not reveal the shape the report getter expects. Control-plane driven tables regularly start out that way — no MACs learned yet, no ES destinations, no IPv6 neighbours, or a spine that has no bridge table at all. Such a path is *pending* rather than broken: it is left out of the subscription and served by the short-TTL `Get` of step 4, so the report renders as empty instead of failing. The first of those `Get`s that comes back with an entry pins down the shape, and the path joins the subscription from then on — the table starts streaming by itself, within the `Get` TTL of the first entry appearing, with no extra round-trip spent on polling for it. `GET /api/status` marks these paths `pending`, and `streaming` once they are live.
 
@@ -396,6 +445,12 @@ Commands:
   arp           Displays ARP table
   nd            Displays IPv6 Neighbors
   routing-pol   Displays Routing Policies (json/yaml only)
+  checks        Runs the fabric sanity checks and lists what they found
+  where         Finds which nodes know about a MAC or IP address
+  path          Walks the route tables hop by hop towards a destination
+  service       Shows one service as every node that carries it sees it
+  snapshot      Keeps a report as it is now, to compare a fabric against later
+  diff          Compares a report against a snapshot, or one node against another
 ```
 
 Two kinds of filter, plus report-specific options:
@@ -411,7 +466,7 @@ Two kinds of filter, plus report-specific options:
 MAC entries on leafs in `macvrf-202` matching `1A:DC`:
 
 ```
-fcli -i role=leaf mac -f NI=macvrf-202 -f Address="1A:DC:*"
+fcli -i role=leaf mac -f NI=macvrf-202 -f mac="1A:DC:*"
 ```
 
 BGP peers that are not established:
@@ -420,7 +475,7 @@ BGP peers that are not established:
 fcli bgp-peers -f state=active
 ```
 
-Column headers use two lines in the live table (AFI label, then **R/A/T**). **U4** / **U6** = IPv4/IPv6 unicast, **EVPN**, **VPNv4** / **VPNv6** = L3VPN address families (values are received / active / sent, `disabled`, `down`, or `-`). JSON/YAML/CSV keys collapse the newline to a single space.
+Column headers use two lines in the live table: the address family as SR Linux names it (`evpn`, `ipv4-unicast`, `ipv6-unicast`, `l3vpn-ipv4-unicast`, `l3vpn-ipv6-unicast`), then **Rx/Act/Tx** (routes received / active / sent). A family shows its counts, or `disabled`, `down`, or `-` when the session is not configured for it. A `state` of `up` is an established session; the other values are BGP's own (`active`, `idle`, `connect`...). CSV keys collapse the header newline to a single space; `-o json` / `-o yaml` emit the records, where each family is an object and `state` is the session state as the device reports it (`established`).
 
 LPM lookup for `192.168.0.7` across every network-instance:
 
@@ -532,11 +587,11 @@ One registry drives all three surfaces, so a report cannot drift between CLI, MC
 | Overview | | yes | Fabric KPIs (nodes, interfaces, BGP sessions) |
 | Topology | | yes | LLDP graph with inferred leaf / spine / DCGW / client tiers |
 | System Info | `sys-info` | yes | Chassis, serial, software version, last boot |
-| Interface Stats | `ifstats` | yes | Per-interface rates and error/discard counters |
+| Interface Stats | `ifstats` | yes | Per-interface rates and error/discard counters over the sample; the live table adds the port state |
 | Sub-Interfaces | `subif` | yes | Type, addresses, oper-state |
 | LAGs | `lag` | yes | LAG members and LACP |
 | Network Instances | `ni` | yes | NIs, their EVPN EVI and the interfaces bound to them |
-| BGP Peers | `bgp-peers` | yes | Session state and per-AF R/A/T |
+| BGP Peers | `bgp-peers` | yes | Session state and per-AF Rx/Act/Tx route counts |
 | BGP RIB | `bgp-rib -r …` | split per family / EVPN type | RIB-in-post with path attributes |
 | IPv4 / IPv6 RIB | `ipv4-rib`, `ipv6-rib` | yes | Route table with resolved next-hops; `-a` for LPM |
 | Static Routes | `static-routes` | yes | Configured statics and their state |
@@ -553,6 +608,38 @@ One registry drives all three surfaces, so a report cannot drift between CLI, MC
 | LLDP Neighbors | `lldp` | yes | Neighbours per interface |
 | ARP Table | `arp` | yes | IPv4 neighbours per sub-interface |
 | IPv6 Neighbors | `nd` | yes | ND entries per sub-interface |
+| Checks | `checks` | yes | Fabric sanity checks, worst first; exits non-zero on an error |
+
+A getter and the table it renders as are split apart. Every getter-backed report returns records (`nornir_srl/records.py`) — a network-instance with its subinterfaces as a list, a BGP neighbour with each address family as an object carrying its route counts, a bridge-table entry with its destination already read apart into interface, VTEP, VNI or ESI, a route with each next-hop resolved to the interface, tunnel or prefix it leaves through, a BGP route with every path attribute and the route-targets, SoO and tunnel encapsulation read out of its communities, an interface with its subinterfaces and their resolved down reason, an interface's counters with the errors and discards counted over the sample, an LLDP interface with its neighbours, an ARP or ND cache with each entry's time left as a number of seconds, an irb with each address's flags and its ARP/ND settings as fields, a LAG with its members, a tunnel with each next-hop's port and label stack — and the table is declared next to the report as the columns that read a record. `bgp-rib` has one table per family and EVPN route type, and `--detail` only adds columns to it: the records always carry everything. `-o json` and `-o yaml`, like the MCP tools, emit the records rather than the table's cells (`"families": [{"name": "evpn", "received": 74, ...}]` instead of `"evpn Rx/Act/Tx": "74/0/94"`); the table and `-o csv` are unchanged. The checks and lenses read the same records, so nothing downstream parses a cell back apart. What has no table is what no getter produces: the server-only services and dashboards, which the store builds from its streams, the nested `routing-pol`, and `checks`, whose findings are collected fabric-wide.
+
+## Lenses
+
+A report renders one node's state; a check asks the fabric a fixed question. Neither is what you type while troubleshooting, which is closer to *where is this MAC*, *how would this node reach that address*, and *what does this service look like everywhere it exists*. Each of those joins several reports across several nodes, so none of them fits a report getter — a getter is handed one device and cannot see the fabric it sits in.
+
+A **lens** is that shape: it reads the same fabric-wide state the checks read, takes arguments the way a report does, and returns one table. One registry (`nornir_srl/lenses.py`) drives the CLI command, the MCP tool, the browser page and the chat tool, so a lens cannot drift between them either.
+
+| Lens | CLI | MCP tool | Browser | What it answers |
+| --- | --- | --- | --- | --- |
+| Where | `where <mac\|ip>` | `locate_address` | yes | Which node owns an address, which learned it over the overlay, and whether two claim it locally |
+| Path | `path <from> <to>` | `trace_path` | yes | Hop by hop from the route tables, every ECMP branch, through every tunnel: VXLAN to the VTEP, MPLS to the far gateway, and into the VRF there |
+| Service | `service <name>` | `service_detail` | yes | One network-instance, one row per node: EVI, VNI, RTs, interfaces, VTEPs, MAC counts, ES |
+
+In the browser a lens is run rather than streamed: the reports it reads are what is streamed, and the question is asked of them again at the refresh interval, so the answer stays live. It is drawn as cards — one per thing found, the nodes inside, and under each node what it reports — or as the same table the CLI prints.
+
+```
+# which leaf owns this host, and does anyone else think they do
+fcli -t topo.clab.yml where 00:C1:AB:00:01:21
+
+# why does this tenant address not reach that one
+fcli -t topo.clab.yml path leaf1 10.0.1.4 --ni ipvrf-1
+
+# every node's view of one bridge domain, side by side
+fcli -t topo.clab.yml service subnet-1
+```
+
+`path` is computed from the route tables rather than probed, so it needs no traffic and shows the whole ECMP fan-out instead of the one branch a probe happened to take. A VRF route that resolves onto a tunnel hands the walk to the underlay towards the tunnel's endpoint — a VTEP over VXLAN, a far-end gateway over LDP or SR-MPLS — and resumes in the VRF at the far end (by name, or by the route-target it imports, since a gateway need not call it the same), so a DCI path traces end to end and finishes with the ARP/ND entry for the host or the node's own address. Where it cannot go further — no route, or no LLDP neighbour on the egress port — it says so rather than inventing a hop.
+
+A lens answers with records, and the table is made of them separately. `-o json` and `-o yaml`, like the MCP tools, emit the records themselves — a service's VTEPs as a list, its MAC count as a number, a hop's `outcome` as a field — rather than the table's cells, so the columns can be written for a reader (`4 local / 4 remote`, a `Detail` sentence) without anything downstream having to parse them back. `-o csv` and the table use the columns.
 
 ## Tested SR Linux releases
 

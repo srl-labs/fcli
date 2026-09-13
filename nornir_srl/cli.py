@@ -25,8 +25,11 @@ from .checks import CHECKS, CHECKS_COLUMNS, Finding, collect_fabric_state, run_c
 from .connections.srlinux import CONNECTION_NAME
 from .connections.routing import BGP_RIB_ROUTE_FAM_ALIASES
 from .connections.helpers import clean_structured_key
+from .fabric import collect_fabric_state as collect_lens_state
+from .lenses import LensSpec, get_lens
+from .records import as_dict
 from .reports import ReportSpec, get_report
-from .rows import NodeRows, Row, cell, clean_columns, extract, pass_filter
+from .rows import NodeRows, Row, Table as ReportTable, cell, clean_columns, extract, pass_filter
 from .utils.logging_config import setup_logging
 from . import __version__
 
@@ -147,17 +150,18 @@ TABLE_THEME = Theme(
 CLI_TABLE_OMIT: Dict[str, FrozenSet[str]] = {
     "bgp_rib": frozenset({"communities"}),
     "bgp_peers": frozenset({"local-address", "local-port"}),
+    # The port state streams alongside the counters on the server; the CLI's
+    # two samples read only the counters, so here these would always be blank.
+    "ifstats": frozenset({"oper-state", "down-reason"}),
 }
 
 
 def _cli_table_omit(name: Optional[str]) -> FrozenSet[str]:
     if not name:
         return frozenset()
-    if name == "bgp_rib" or name.startswith("bgp_rib_"):
+    if name.startswith("bgp_rib_"):
         return CLI_TABLE_OMIT["bgp_rib"]
-    if name == "bgp_peers":
-        return CLI_TABLE_OMIT["bgp_peers"]
-    return frozenset()
+    return CLI_TABLE_OMIT.get(name, frozenset())
 
 
 def _cli_table_columns(name: str, columns: List[str]) -> List[str]:
@@ -240,13 +244,22 @@ def print_report(
     f_filter: Optional[Dict] = None,
     i_filter: Optional[Dict] = None,
     output: OutputFormat = OutputFormat.TABLE,
+    table: Optional[ReportTable] = None,
 ) -> None:
     columns, per_node = extract(
         result.name,
         result,
         field_filter=f_filter,
         on_error=_report_failure(result.name),
+        table=table,
     )
+    if table is not None and output in (OutputFormat.JSON, OutputFormat.YAML):
+        # The records themselves, each saying which node it is from.
+        print_records(
+            [{"node": node.node, **as_dict(record)} for node in per_node for record in node.records],
+            output,
+        )
+        return
     if output == OutputFormat.TABLE:
         columns = _cli_table_columns(result.name, columns)
         title = "[bold]" + name + "[/bold]"
@@ -471,7 +484,7 @@ def report_table(
     def on_error(node: str, exception: Optional[BaseException]) -> None:
         errors.append({"node": node, "error": str(exception)})
 
-    raw_columns, per_node = extract(spec.resource, result, on_error=on_error)
+    raw_columns, per_node = extract(spec.resource, result, on_error=on_error, table=spec.table_for(params))
     columns = clean_columns(raw_columns)
     rows = [
         {
@@ -578,6 +591,122 @@ def run_report(
         f_filter=f_filter,
         i_filter=ctx.obj["i_filter"],
         output=ctx.obj["output"],
+        table=spec.table_for(params),
+    )
+
+
+def print_records(
+    records: List[Dict[str, Any]],
+    output_format: OutputFormat,
+) -> None:
+    """Print records as JSON or YAML, as the objects they are.
+
+    A record is what a lens found, with its lists as lists and its counts as
+    numbers; the row a table makes of it joins and truncates those for a
+    reader. Whatever reads the output by machine wants the former.
+    """
+    if not records:
+        typer.echo("No data...")
+        return
+    if output_format == OutputFormat.JSON:
+        typer.echo(json.dumps(records, indent=2, default=str))
+    else:
+        typer.echo(
+            yaml.safe_dump(records, default_flow_style=False, sort_keys=False).rstrip()
+        )
+
+
+def print_lens(
+    spec: LensSpec,
+    records: List[Any],
+    *,
+    box_type: Optional[str] = None,
+    f_filter: Optional[Dict[str, str]] = None,
+    output: OutputFormat = OutputFormat.TABLE,
+    errors: Optional[List[str]] = None,
+    subtitle: str = "",
+) -> None:
+    """Print what a lens answered, one section per node."""
+    for error in errors or []:
+        typer.echo(error, err=True)
+    # A field filter names columns, so a record is kept by the row it makes.
+    answered = [(record, spec.row(record)) for record in records]
+    if f_filter:
+        answered = [(rec, row) for rec, row in answered if pass_filter(row, f_filter)]
+    if output in (OutputFormat.JSON, OutputFormat.YAML):
+        print_records([as_dict(rec) for rec, _row in answered], output)
+        return
+    columns = spec.column_names
+    rows = [row for _rec, row in answered]
+    if output != OutputFormat.TABLE:
+        print_structured(columns, rows, output)
+        return
+    if not rows:
+        Console(theme=TABLE_THEME).print("[i]No data...[/i]")
+        return
+
+    # Consecutive rows of one node are one section. A lens whose rows are an
+    # ordered walk rather than a list keeps that order: grouping every row of a
+    # node together would pull hop 3 up beside hop 1 and lose the sequence.
+    if spec.group_by_node:
+        rows = sorted(rows, key=lambda r: str(r.get("Node", "")))
+    sections: List[NodeRows] = []
+    for row in rows:
+        node = str(row.get("Node", ""))
+        if not sections or sections[-1].node != node:
+            sections.append(NodeRows(node=node))
+        sections[-1].rows.append(Row({c: row.get(c, "") for c in columns}))
+
+    title = f"[bold]{spec.title}[/bold]"
+    if subtitle:
+        title += f"\n{subtitle}"
+    print_table(title, columns, sections, box_type=box_type)
+
+
+def run_lens(
+    ctx: typer.Context,
+    lens: str,
+    field_filter: Optional[List[str]] = None,
+    subtitle: str = "",
+    **params: Any,
+) -> None:
+    """Collect what a lens reads, run it, and print the answer.
+
+    *params* are the lens's own arguments, so nothing here may be called what
+    one of them is: ``service`` takes a ``name``.
+    """
+    spec = get_lens(lens)
+    started = time.perf_counter()
+    state = collect_lens_state(ctx.obj["target"], spec.requires)
+    logger.debug(
+        "lens '%s' collected %s from %d node(s) in %.3fs",
+        spec.name,
+        ", ".join(spec.requires),
+        len(ctx.obj["target"].inventory.hosts),
+        time.perf_counter() - started,
+    )
+    try:
+        records = spec.run(state, **params)
+    except ValueError as exc:
+        # A lens is given an address or a name by hand, so being told it is not
+        # one is an ordinary answer rather than a crash.
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    print_lens(
+        spec,
+        records,
+        box_type=ctx.obj["box_type"],
+        f_filter=(
+            {k: v for k, v in (f.split("=") for f in field_filter)}
+            if field_filter
+            else {}
+        ),
+        output=ctx.obj["output"],
+        errors=[
+            f"{node}: {report} not collected: {error}"
+            for (report, node), error in sorted(state.errors.items())
+        ],
+        subtitle=subtitle,
     )
 
 
@@ -956,6 +1085,70 @@ def checks(
     # as the last step of a deployment as well as by hand.
     if any(f.severity == "error" for f in findings):
         raise typer.Exit(1)
+
+
+# ------------------------- lenses -------------------------
+
+
+@app.command()
+def where(
+    ctx: typer.Context,
+    address: str = typer.Argument(
+        ..., help="MAC or IP address to locate, e.g. 00:C1:AB:00:01:21 or 10.0.1.51"
+    ),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Finds which nodes know about a MAC or IP address"""
+    run_lens(
+        ctx,
+        "where",
+        field_filter=field_filter,
+        subtitle=f"Looking for {address}",
+        target=address,
+    )
+
+
+@app.command()
+def path(
+    ctx: typer.Context,
+    source: str = typer.Argument(
+        ..., help="Node to start from, or an address attached to one"
+    ),
+    destination: str = typer.Argument(..., help="Address being forwarded towards"),
+    ni: str = typer.Option(
+        "default",
+        "--ni",
+        "-n",
+        help="Network instance to look the destination up in",
+    ),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Walks the route tables hop by hop towards a destination"""
+    run_lens(
+        ctx,
+        "path",
+        field_filter=field_filter,
+        subtitle=f"{source} -> {destination} in {ni}",
+        source=source,
+        destination=destination,
+        ni=ni,
+    )
+
+
+@app.command()
+def service(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Network-instance name, matched as a regex"),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Shows one service as every node that carries it sees it"""
+    run_lens(
+        ctx,
+        "service",
+        field_filter=field_filter,
+        subtitle=f"Matching '{name}'",
+        name=name,
+    )
 
 
 # ------------------------- snapshots and comparison -------------------------

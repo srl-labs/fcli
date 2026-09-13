@@ -39,6 +39,9 @@ from . import clab
 from .checks import CHECKS, collect_fabric_state, run_checks
 from .connections.srlinux import CONNECTION_NAME
 from .connections.helpers import clean_structured_key
+from .fabric import collect_fabric_state as collect_lens_state
+from .lenses import get_lens
+from .records import as_dict
 from .reports import ReportSpec, get_report
 from .rows import extract
 
@@ -162,13 +165,27 @@ def _run_report(
     field_filter: Optional[str] = None,
     **params: Any,
 ) -> str:
-    """Run a report from the registry and return its rows as JSON."""
+    """Run a report from the registry and return what it found as JSON.
+
+    A report that returns records is emitted as those records, each saying
+    which node it is from; one that does not yet is emitted as its table rows.
+    """
     spec = get_report(name)
     i_filter, f_filter = _parse_filters(inv_filter, field_filter)
     result = _query(spec, i_filter, **params)
+    table = spec.table_for(params)
     _columns, per_node = extract(
-        spec.resource, result, field_filter=f_filter, on_error=_error_row
+        spec.resource, result, field_filter=f_filter, on_error=_error_row, table=table
     )
+    if table is not None:
+        objects: List[Dict[str, Any]] = []
+        for node in per_node:
+            if node.records:
+                objects.extend({"node": node.node, **as_dict(r)} for r in node.records)
+            else:
+                # A node whose report failed has a row saying so, and no records.
+                objects.extend({"node": node.node, **row.values} for row in node.rows)
+        return json.dumps(objects, indent=2, default=str)
     rows = [
         {"Node": node.node, **row.values} for node in per_node for row in node.rows
     ]
@@ -193,7 +210,7 @@ mcp = FastMCP(
         "If labels are absent or the key does not exist, inv_filter returns NO results. "
         "Use 'show_topology' first to see available nodes and their filterable label keys before applying inv_filter. "
         "If no labels are available, omit inv_filter to target all nodes. "
-        "FIELD FILTERS (field_filter): use field_filter to filter output rows (e.g. 'session-state=established'). "
+        "FIELD FILTERS (field_filter): use field_filter to filter output rows (e.g. 'state=up'). "
         "field_filter values are regex patterns matched case-insensitively against field values. "
         "inv_filter supports wildcards (*, ?). Both accept comma-separated key=value pairs. "
         "Topologies can be loaded at runtime using 'load_topology' or 'load_config'."
@@ -340,14 +357,16 @@ def sys_info(
 ) -> str:
     """Get system information for SR Linux nodes.
 
-    Returns chassis type, serial number, hardware MAC, last boot time, software version, etc.
+    Returns one object per node: node, type (the chassis), serial_number,
+    part_number, hw_mac_address, last_booted and software_version (the
+    release alone, e.g. 26.7.1).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("sys_info", inv_filter, field_filter)
 
@@ -359,17 +378,23 @@ def bgp_peers(
 ) -> str:
     """Get BGP peer status and route statistics for all network instances.
 
-    Returns peer address, peer AS, session state, local AS, flags (D=dynamic, B=BFD, F=fast-failover),
-    and Rx/Active/Tx route counts per AFI/SAFI: IPv4 unicast (U4), IPv6 unicast (U6), EVPN,
-    L3VPN IPv4 (VPNv4), L3VPN IPv6 (VPNv6). Table column headers show the AFI on the first line
-    and R/A/T on the second; JSON keys use a space instead of the newline.
+    Returns one object per network-instance per node: node, ni and neighbors,
+    each with peer, state, peer_as, local_as, local_address, local_port, group,
+    dynamic, bfd, fast_failover, import_policies, export_policies and families.
+    A family (ipv4-unicast, ipv6-unicast, evpn, l3vpn-ipv4-unicast,
+    l3vpn-ipv6-unicast) is listed only where the session is configured for it,
+    with enabled, oper, received, active and sent route counts.
+
+    state is the session state as the device reports it (established, active,
+    idle, connect...). The table shows an established session as 'up', and
+    field_filter matches the table, so filter on 'state=up', not established.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("bgp_peers", inv_filter, field_filter)
 
@@ -391,11 +416,15 @@ def bgp_rib(
 ) -> str:
     """Get BGP RIB (Routing Information Base) entries.
 
-    Returns the full set of path attributes for each route, including standard
-    communities, Site-of-Origin (soo), BGP domain-path (dpath), tunnel-encap
-    extended-community, route-target (RT), as-path, next-hop, and route status
-    (valid/best/used, tie-break reason, internal-tags). Useful for diagnosing
-    EVPN/IP-VPN loop-prevention and route-leaking issues.
+    Returns one object per network-instance per node: node, ni, family,
+    route_type (EVPN only) and routes. A route carries the peer it came from
+    (neighbor), its status (used, valid, best, tie_break), the NLRI fields its
+    family and type have (rd, prefix, esi, tag, mac, ip, gateway, vni, label1,
+    label2) and every path attribute: next_hop, origin, local_pref, med,
+    as_path, communities / large_communities / ext_communities as carried, and
+    read out of the extended ones route_targets, esi_labels, soo and
+    tunnel_encap; plus domain_path (D-PATH), internal_tags and neighbor_as.
+    Useful for diagnosing EVPN/IP-VPN loop-prevention and route-leaking issues.
 
     Args:
         route_fam: BGP RIB address family: evpn, ipv4, ipv6, or L3VPN IPv4/IPv6 unicast
@@ -406,7 +435,7 @@ def bgp_rib(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report(
         "bgp_rib",
@@ -426,7 +455,14 @@ def ipv4_rib(
 ) -> str:
     """Get IPv4 routing table entries.
 
-    Shows active routes with next-hops, metrics, preferences, and route owners.
+    Returns one object per network-instance per node: node, ni and routes,
+    each with prefix, type (local, host, bgp, bgp-evpn, static, arp-nd...),
+    active, metric, preference, leaked_from (the instance a leaked route came
+    from) and next_hops. A next-hop has its address, type (direct, indirect),
+    the resolving_route an indirect one recurses on, and egress: where it
+    leaves the node, each of kind 'interface' (a subinterface, with ni when
+    it is in another instance), 'tunnel' (a vxlan or other tunnel endpoint)
+    or 'route' (a prefix the resolution could not be walked past).
 
     Args:
         address: Optional IP address for longest-prefix-match (LPM) lookup (e.g. '10.0.0.1').
@@ -434,7 +470,7 @@ def ipv4_rib(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("ipv4_rib", inv_filter, field_filter, address=address)
 
@@ -447,7 +483,9 @@ def ipv6_rib(
 ) -> str:
     """Get IPv6 routing table entries.
 
-    Shows active routes with next-hops, metrics, preferences, and route owners.
+    Same shape as ipv4_rib: one object per network-instance per node with its
+    routes, each with prefix, type, active, metric, preference, leaked_from and
+    next_hops resolved to their egress (interface, tunnel or route).
 
     Args:
         address: Optional IPv6 address for longest-prefix-match (LPM) lookup.
@@ -455,7 +493,7 @@ def ipv6_rib(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("ipv6_rib", inv_filter, field_filter, address=address)
 
@@ -467,14 +505,17 @@ def static_routes(
 ) -> str:
     """Get static routes from /network-instance[name=*]/static-routes.
 
-    Returns route, admin-state, installed, metric, pref, and nhops.
+    Returns one object per network-instance per node that has any: node, ni
+    and routes - each with prefix, admin (enable/disable), installed,
+    metric, preference, next_hop_group and next_hops, each an address and
+    whether it is resolved through the route table (resolve).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("static_routes", inv_filter, field_filter)
 
@@ -486,17 +527,19 @@ def tunnel_table(
 ) -> str:
     """Get the IP tunnel-table from /network-instance[name=*]/tunnel-table.
 
-    Returns transport tunnels (LDP, SR-ISIS, RSVP, VXLAN, ...) with the
-    resolved egress interface, next-hop IP, pushed MPLS label-stack, tunnel
-    type, owner, metric and preference. Useful for verifying which transport
-    a remote endpoint (e.g. a loopback) is reached over, and on which port.
+    Returns one object per network-instance per node that has any: node, ni
+    and tunnels - each with prefix (the endpoint), type (vxlan, ldp,
+    sr-isis, rsvp...), owner, preference, metric and next_hops, each
+    resolved to address, subinterface, type and the labels pushed. Useful
+    for verifying which transport a remote endpoint (e.g. a loopback) is
+    reached over, and on which port.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("tunnel_table", inv_filter, field_filter)
 
@@ -508,16 +551,20 @@ def network_instances(
 ) -> str:
     """Get network instances and their interfaces.
 
-    Returns NI name, operational state, type (ip-vrf/mac-vrf/default), router-id,
-    vxlan-interface, the EVPN EVI, import/export RTs, and associated interfaces with
-    IP addresses, VLANs, and MTU.
+    Returns one object per network-instance per node: node, name, type
+    (ip-vrf/mac-vrf/default), oper, router_id, overlays (its vxlan-interfaces),
+    evis, instances (each bgp-vpn instance with id, import_rts, export_rts and
+    rd - a DCI gateway has two, the DC side and the WAN side), and
+    interfaces - each with name, oper, prefixes, mtu, vlan and associated (for
+    an irb, the other instances it is in: the ip-vrf a mac-vrf's irb routes
+    into).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("ni", inv_filter, field_filter)
 
@@ -529,15 +576,18 @@ def subinterfaces(
 ) -> str:
     """Get sub-interfaces of SR Linux nodes.
 
-    Returns interface name, sub-interface index, type (routed/bridged), admin/oper state,
-    IPv4/IPv6 addresses, VLAN ID, and more.
+    Returns one object per interface per node: node, name and subinterfaces -
+    each with name, type (routed/bridged), admin (enable/disable), oper (up,
+    down, or down/standby for one held down on purpose by its
+    ethernet-segment), down_reason (the root cause, resolved to the parent
+    port), ip_mtu, vlan, ipv4 and ipv6 (the prefixes configured on it).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("subif", inv_filter, field_filter)
 
@@ -549,14 +599,17 @@ def lag(
 ) -> str:
     """Get LAG (Link Aggregation Group) information.
 
-    Returns LAG name, oper state, MTU, min-links, LACP config, and member interfaces.
+    Returns one object per LAG per node: node, name, oper, mtu, min_links,
+    description, type (lacp/static), speed, standby_signaling, the LACP
+    settings (lacp_key, lacp_interval, lacp_mode, lacp_system_id,
+    lacp_priority) and members - each with name, oper and activity.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("lag", inv_filter, field_filter)
 
@@ -572,10 +625,12 @@ def ifstats(
     Queries interface statistics twice with a configurable interval, then calculates
     the delta to derive rates for each interface.
 
-    Returns per interface: in-Kbps/out-Kbps (rate over the interval), in-err/out-err
-    and in-disc/out-disc (deltas), plus cumulative counters in-pkts/out-pkts and
-    in-octets/out-octets. Idle interfaces are included so raw counters are always
-    available.
+    Returns one object per interface per node: node, name, in_kbps/out_kbps and
+    in_pps/out_pps (rates over the interval), in_errors/out_errors and
+    in_discards/out_discards (how many during the interval), plus the
+    cumulative counters in_packets/out_packets and in_octets/out_octets. Idle
+    interfaces are included so raw counters are always available. oper and
+    down_reason are empty here: the two samples read only the counters.
 
     Args:
         interval: Seconds between the two samples (default 5).
@@ -583,7 +638,7 @@ def ifstats(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("ifstats", inv_filter, field_filter, interval=interval)
 
@@ -595,14 +650,18 @@ def mac_table(
 ) -> str:
     """Get MAC address table entries.
 
-    Returns network instance, MAC address, destination (interface or VXLAN), and type (learnt/static/evpn).
+    Returns one object per network-instance per node: node, ni and entries,
+    each with address, type (learnt/evpn/evpn-static/irb-interface...), the
+    destination as the device writes it, and that destination read apart:
+    interface for a locally learned entry, or overlay plus either vtep and vni
+    or esi for one learned over EVPN.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("mac", inv_filter, field_filter)
 
@@ -614,15 +673,20 @@ def irb_interfaces(
 ) -> str:
     """Get IRB (Integrated Routing and Bridging) sub-interface details.
 
-    Returns IRB subinterface, network instance, IPv4/IPv6 addresses, anycast gateway config,
-    ARP/ND settings, EVPN advertising config, and ILR (Interface-Less Routing) support.
+    Returns one object per irb per node: node, name, nis (the mac-vrf and
+    the ip-vrf it is in), ipv4 and ipv6 (each address with primary and
+    anycast_gw flags), anycast_gw with anycast_gw_mac and virtual_router_id,
+    and arp and nd - each with proxy, learn_unsolicited, host_routes (the
+    entry origins turned into host routes, and whether they are programmed
+    in the datapath), evpn_advertise (the origins advertised into EVPN) and
+    interface_less_routing.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("irb", inv_filter, field_filter)
 
@@ -634,16 +698,17 @@ def ethernet_segments(
 ) -> str:
     """Get EVPN Ethernet Segment information.
 
-    Returns ESI, type, multi-homing mode, oper state, interfaces, next-hops, the
-    EVIs a virtual segment is tied to, and associated network instances with DF
-    (Designated Forwarder) candidates.
+    Returns one object per segment per node: node, name, esi, type, mh_mode,
+    oper, interfaces (the ports it hangs off), next_hops (for a virtual
+    segment: address and the evis it serves) and associations - each
+    network-instance it is in with its DF candidates (address, designated).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("es", inv_filter, field_filter)
 
@@ -655,14 +720,17 @@ def es_destinations(
 ) -> str:
     """Get Ethernet Segment destinations from bridge tables.
 
-    Returns tunnel name, ESI, and VTEP destinations. VTEP destinations are comma-separated list of (vtep-address, vni) and are dynamically generated, based on traffic/routing data.
+    Returns one object per tunnel-interface per node: node, tunnel and
+    destinations - each an esi, the overlay (vxlan-interface) it is reached
+    through and the vteps behind it. Learned from EVPN, so it reflects the
+    segments the node currently forwards to.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("es_dest", inv_filter, field_filter)
 
@@ -674,8 +742,8 @@ def vxlan_tunnels(
 ) -> str:
     """Get VXLAN tunnel interfaces and unicast destinations.
 
-    Returns VXLAN interface name, associated network instance, ingress-vni,
-    and unicast destinations (vtep-address, vni).
+    Returns one object per vxlan-interface per node: node, name, ni, vni (the
+    ingress VNI) and destinations, each with vtep and vni.
 
     Note: unicast destinations are populated by receipt of EVPN type-2 (MAC/IP) routes,
     which typically requires actual traffic. If no destinations are shown, it means no
@@ -686,7 +754,7 @@ def vxlan_tunnels(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("vxlan", inv_filter, field_filter)
 
@@ -698,15 +766,16 @@ def lldp_neighbors(
 ) -> str:
     """Get LLDP neighbor information.
 
-    Returns local interface, neighbor system name, and neighbor port ID/description.
-    Useful for understanding physical topology and connectivity.
+    Returns one object per interface per node: node, name and neighbors - each
+    with system_name, port_id and port_description. Useful for understanding
+    physical topology and connectivity.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("lldp", inv_filter, field_filter)
 
@@ -718,14 +787,17 @@ def arp_table(
 ) -> str:
     """Get ARP table entries.
 
-    Returns interface, network instance, IPv4 address, MAC address, type, and expiry time.
+    Returns one object per sub-interface per node: node, interface, nis (the
+    network-instances it is bound to; an irb is in two) and entries - each
+    with address, mac, origin (dynamic/static/evpn...) and expires_in, the
+    seconds until the entry ages out (null for a static entry).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("arp", inv_filter, field_filter)
 
@@ -737,14 +809,17 @@ def ipv6_neighbors(
 ) -> str:
     """Get IPv6 Neighbor Discovery table entries.
 
-    Returns interface, IPv6 address, MAC address, state, type, and next state time.
+    Returns one object per sub-interface per node: node, interface, nis (the
+    network-instances it is bound to) and entries - each with address, mac,
+    origin, state (reachable/stale/delay...) and expires_in, the seconds until
+    it leaves that state.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("nd", inv_filter, field_filter)
 
@@ -820,6 +895,146 @@ def fabric_checks(
     target = nornir.filter(**i_filter) if i_filter else nornir
     findings = run_checks(collect_fabric_state(target), only=[check] if check else None)
     return json.dumps([f.as_row() for f in findings], indent=2, default=str)
+
+
+def _run_lens(lens: str, inv_filter: Optional[str] = None, **params: Any) -> str:
+    """Collect what a lens reads, run it, and return its records as JSON.
+
+    The records rather than the table rows: an agent wants the VTEPs a service
+    sends to as a list and the MAC count as a number, not the cell a table
+    joins them into.
+
+    *params* are the lens's own arguments, so nothing here may be called what
+    one of them is: ``service`` takes a ``name``.
+    """
+    spec = get_lens(lens)
+    i_filter, _ = _parse_filters(inv_filter, None)
+    nornir = get_nornir()
+    target = nornir.filter(**i_filter) if i_filter else nornir
+    state = collect_lens_state(target, spec.requires)
+    try:
+        records = spec.run(state, **params)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, indent=2)
+    payload: Dict[str, Any] = {"records": [as_dict(r) for r in records]}
+    if state.errors:
+        payload["not_collected"] = [
+            {"node": node, "report": report, "error": error}
+            for (report, node), error in sorted(state.errors.items())
+        ]
+    return json.dumps(payload, indent=2, default=str)
+
+
+@mcp.tool()
+def locate_address(address: str, inv_filter: Optional[str] = None) -> str:
+    """Find every node in the fabric that knows about one MAC or IP address.
+
+    Use this instead of reading mac_table or arp_table node by node when the
+    question is 'where is this host'. An IP is resolved through ARP or ND to a
+    MAC first, so either form of address works.
+
+    Returns {"records": [...]}, one record per place the address is known, with:
+        kind: 'configured' (the IP is this node's own: a loopback, a system
+            address, an irb gateway), 'local' (this node learned the MAC on its
+            own port), 'remote' (it learned it over the overlay from a VTEP or
+            ethernet-segment), 'arp' or 'neighbor' (an address binding that
+            named the MAC), 'duplicate' (this node learned it locally and so
+            did the nodes in also_on, which is expected on an all-active
+            segment and a fault otherwise), or 'not-found'.
+        node, ni, address: where it was seen, and the IP or MAC seen.
+        interface, vtep, esi: what it sits on - exactly one is set.
+        prefix: for 'configured', the prefix as configured.
+        origin: how the entry got there ('learnt', 'evpn', 'static', 'dynamic').
+        mac, expiry: for 'arp'/'neighbor', the MAC the binding resolved to.
+        overlay, vni: for 'remote', the overlay it was learned over.
+        segments: for 'remote' behind an ESI, the segment's configured names.
+        also_on: for 'duplicate', the other nodes that learned it locally.
+        searched: for 'not-found', how many bridge tables were looked in.
+    Plus "not_collected" when a node's report could not be read.
+
+    Args:
+        address: A MAC ('00:C1:AB:00:01:21') or an IP ('10.0.1.51').
+        inv_filter: Inventory filter as comma-separated key=value pairs. Narrowing
+            the inventory narrows the search, so omit it unless the fabric is large.
+    """
+    return _run_lens("where", inv_filter, target=address)
+
+
+@mcp.tool()
+def trace_path(
+    source: str,
+    destination: str,
+    ni: str = "default",
+    inv_filter: Optional[str] = None,
+) -> str:
+    """Walk the route tables hop by hop from a node towards a destination address.
+
+    Computed from the route tables rather than probed, so it works without
+    sending traffic and shows every ECMP branch instead of the one a probe
+    happened to take. A lookup in a VRF that resolves onto a tunnel hands off
+    to the underlay towards its endpoint and resumes in the VRF at the far end,
+    so a DCI path traces VXLAN to the gateway, MPLS across, and VXLAN again.
+
+    Use this for 'why does A not reach B': the hop whose outcome is 'no-route'
+    or 'dead-end' is where the path stops.
+
+    Returns {"records": [...]}, one record per lookup, ordered by hop. Several
+    records share a hop number when the walk fans out over ECMP. Each has:
+        hop, node, ni, address: where the lookup was done and what was looked
+            up - the destination, or the VTEP being chased through the underlay.
+        outcome: 'forwarded' (out of egress to peer, where the walk goes on),
+            'dead-end' (no LLDP neighbour on egress, so it cannot), 'tunnel'
+            (resolved onto a tunnel - vxlan to a VTEP, ldp or sr-isis to a
+            far-end gateway - continuing in the underlay towards endpoint),
+            'endpoint-reached' (the underlay delivered the endpoint; the packet
+            is decapsulated and looked up in resumes_in, the VRF there),
+            'delivered' (the destination is attached here), 'local-ip' (it is
+            this node's own address), 'neighbor' or 'no-neighbor' (whether
+            ARP/ND has the delivered address), 'no-route', 'loop' or 'too-long'.
+        prefix, route_type, next_hops: the route that matched.
+        egress: the subinterface, or 'vxlan:<vtep>' over the overlay.
+        peer, peer_port: the node on the other end of that cable.
+        tunnel, endpoint, resumes_in, mac, origin, visited: filled for the
+            outcomes named.
+    Plus "not_collected" when a node's report could not be read.
+
+    Args:
+        source: The node to start from, or an address attached to one.
+        destination: The address being forwarded towards.
+        ni: Network instance to look the destination up in. Defaults to 'default'
+            (the underlay); name the IP-VRF for a tenant address.
+        inv_filter: Inventory filter as comma-separated key=value pairs. A filter
+            that excludes a node the path goes through will truncate the walk there.
+    """
+    return _run_lens(
+        "path", inv_filter, source=source, destination=destination, ni=ni
+    )
+
+
+@mcp.tool()
+def service_detail(name: str, inv_filter: Optional[str] = None) -> str:
+    """Show one network-instance as every node that carries it sees it.
+
+    The transpose of network_instances: one row per node for a single service,
+    so the node whose VNI, route-target or oper-state does not match the others
+    is a column to read down rather than several tables to compare by hand.
+
+    Returns {"records": [...]}, one record per node carrying the instance, with
+    node, ni, type, oper, evis, vnis, import_rts, export_rts (the union over
+    its bgp-vpn instances, which are listed in instances with their own),
+    interfaces (each with name and oper), bound (the instances attached to
+    it), vteps, local_macs, remote_macs, segments (its ethernet-segments) and
+    site (the underlay the node is in, numbered, when the service is carried
+    in more than one - nodes in different underlays never have to agree). Plus
+    "not_collected" when a node's report could not be read.
+
+    Args:
+        name: Network-instance name, matched as a case-insensitive regex, so
+            'subnet' matches subnet-1 and subnet-2.
+        inv_filter: Inventory filter as comma-separated key=value pairs. Omit it:
+            the point of this tool is to see every node that carries the service.
+    """
+    return _run_lens("service", inv_filter, name=name)
 
 
 # ---- CLI entry point ----
