@@ -633,6 +633,8 @@ fcli -t topo.clab.yml service subnet-1
 
 `path` is computed from the route tables rather than probed, so it needs no traffic and shows the whole ECMP fan-out instead of the one branch a probe happened to take. Where it cannot go further — no route, or no LLDP neighbour on the egress port — it says so rather than inventing a hop.
 
+A lens answers with records, and the table is made of them separately. `-o json` and `-o yaml`, like the MCP tools, emit the records themselves — a service's VTEPs as a list, its MAC count as a number, a hop's `outcome` as a field — rather than the table's cells, so the columns can be written for a reader (`4 local / 4 remote`, a `Detail` sentence) without anything downstream having to parse them back. `-o csv` and the table use the columns.
+
 ## Tested SR Linux releases
 
 The reports hard-code gNMI paths and the YANG structure they expect back, and both move between SR Linux releases. When they move, the failure is usually silent: a path that no longer carries a value leaves a column empty rather than raising anything.

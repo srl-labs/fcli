@@ -40,7 +40,7 @@ from .checks import CHECKS, collect_fabric_state, run_checks
 from .connections.srlinux import CONNECTION_NAME
 from .connections.helpers import clean_structured_key
 from .fabric import collect_fabric_state as collect_lens_state
-from .lenses import get_lens
+from .lenses import as_dict as lens_record, get_lens
 from .reports import ReportSpec, get_report
 from .rows import extract
 
@@ -824,18 +824,26 @@ def fabric_checks(
     return json.dumps([f.as_row() for f in findings], indent=2, default=str)
 
 
-def _run_lens(name: str, inv_filter: Optional[str] = None, **params: Any) -> str:
-    """Collect what a lens reads, run it, and return its rows as JSON."""
-    spec = get_lens(name)
+def _run_lens(lens: str, inv_filter: Optional[str] = None, **params: Any) -> str:
+    """Collect what a lens reads, run it, and return its records as JSON.
+
+    The records rather than the table rows: an agent wants the VTEPs a service
+    sends to as a list and the MAC count as a number, not the cell a table
+    joins them into.
+
+    *params* are the lens's own arguments, so nothing here may be called what
+    one of them is: ``service`` takes a ``name``.
+    """
+    spec = get_lens(lens)
     i_filter, _ = _parse_filters(inv_filter, None)
     nornir = get_nornir()
     target = nornir.filter(**i_filter) if i_filter else nornir
     state = collect_lens_state(target, spec.requires)
     try:
-        rows = spec.run(state, **params)
+        records = spec.run(state, **params)
     except ValueError as exc:
         return json.dumps({"error": str(exc)}, indent=2)
-    payload: Dict[str, Any] = {"rows": rows}
+    payload: Dict[str, Any] = {"records": [lens_record(r) for r in records]}
     if state.errors:
         payload["not_collected"] = [
             {"node": node, "report": report, "error": error}
@@ -852,14 +860,22 @@ def locate_address(address: str, inv_filter: Optional[str] = None) -> str:
     question is 'where is this host'. An IP is resolved through ARP or ND to a
     MAC first, so either form of address works.
 
-    Returns rows with:
-        Found: 'local' (this node learned it on its own port), 'remote' (it
+    Returns {"records": [...]}, one record per place the address is known, with:
+        kind: 'local' (this node learned it on its own port), 'remote' (it
             learned it over the overlay from a VTEP or ethernet-segment), 'arp'
             or 'neighbor' (an address binding that named the MAC), 'duplicate'
-            (more than one node claims it locally, which is expected on an
-            all-active segment and a fault otherwise), or 'not found'.
-        Via: the subinterface, VTEP address or ESI it sits behind.
-        NI, Address, Detail: the instance, the MAC, and how it was learned.
+            (this node learned it locally and so did the nodes in also_on,
+            which is expected on an all-active segment and a fault otherwise),
+            or 'not-found'.
+        node, ni, address: where it was seen, and the IP or MAC seen.
+        interface, vtep, esi: what it sits on - exactly one is set.
+        origin: how the entry got there ('learnt', 'evpn', 'static', 'dynamic').
+        mac, expiry: for 'arp'/'neighbor', the MAC the binding resolved to.
+        overlay, vni: for 'remote', the overlay it was learned over.
+        segments: for 'remote' behind an ESI, the segment's configured names.
+        also_on: for 'duplicate', the other nodes that learned it locally.
+        searched: for 'not-found', how many bridge tables were looked in.
+    Plus "not_collected" when a node's report could not be read.
 
     Args:
         address: A MAC ('00:C1:AB:00:01:21') or an IP ('10.0.1.51').
@@ -884,13 +900,26 @@ def trace_path(
     to the underlay at the VTEP and the walk continues there, which is how the
     two tables compose on the wire.
 
-    Use this for 'why does A not reach B': the row where Type is 'no route', or
-    where Peer is empty because no LLDP neighbour answers on the egress port, is
-    where the path stops.
+    Use this for 'why does A not reach B': the hop whose outcome is 'no-route'
+    or 'dead-end' is where the path stops.
 
-    Returns rows with Hop, Node, NI, Prefix (the route that matched), Type,
-    Next-hop, Egress (interface, or 'vxlan:<vtep>' over the overlay), Peer (the
-    node on the other end of that cable) and Detail.
+    Returns {"records": [...]}, one record per lookup, ordered by hop. Several
+    records share a hop number when the walk fans out over ECMP. Each has:
+        hop, node, ni, address: where the lookup was done and what was looked
+            up - the destination, or the VTEP being chased through the underlay.
+        outcome: 'forwarded' (out of egress to peer, where the walk goes on),
+            'dead-end' (no LLDP neighbour on egress, so it cannot), 'overlay'
+            (resolved to a tunnel, continuing in the underlay towards vtep),
+            'vtep-reached' (the underlay delivered the VTEP, resuming in
+            resumes_in), 'delivered' (the destination is attached here),
+            'local-ip' (it is this node's own address), 'neighbor' or
+            'no-neighbor' (whether ARP/ND has the delivered address),
+            'no-route', 'loop' or 'too-long'.
+        prefix, route_type, next_hops: the route that matched.
+        egress: the subinterface, or 'vxlan:<vtep>' over the overlay.
+        peer, peer_port: the node on the other end of that cable.
+        vtep, resumes_in, mac, origin, visited: filled for the outcomes named.
+    Plus "not_collected" when a node's report could not be read.
 
     Args:
         source: The node to start from, or an address attached to one.
@@ -913,9 +942,11 @@ def service_detail(name: str, inv_filter: Optional[str] = None) -> str:
     so the node whose VNI, route-target or oper-state does not match the others
     is a column to read down rather than several tables to compare by hand.
 
-    Returns rows with NI, Type, Oper, EVI, VNI, In-RT, Out-RT, Interfaces (with
-    their oper-state), Bound (the instances attached to it), VTEPs, MACs (local
-    versus learned over the overlay) and ES.
+    Returns {"records": [...]}, one record per node carrying the instance, with
+    node, ni, type, oper, evis, vnis, import_rts, export_rts, interfaces (each
+    with name and oper), bound (the instances attached to it), vteps,
+    local_macs, remote_macs and segments (its ethernet-segments). Plus
+    "not_collected" when a node's report could not be read.
 
     Args:
         name: Network-instance name, matched as a case-insensitive regex, so

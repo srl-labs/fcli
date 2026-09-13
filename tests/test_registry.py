@@ -183,6 +183,26 @@ def test_every_lens_reads_reports_that_exist():
             )
 
 
+@pytest.mark.parametrize("runner", [cli.run_lens, mcp_server._run_lens])
+def test_a_lens_parameter_cannot_shadow_the_surface_plumbing(runner):
+    """A lens's arguments are passed through as ``**params``.
+
+    ``service`` takes a ``name``; a surface whose own parameter was called
+    ``name`` got two of them and crashed on the one command that used it.
+    """
+    own = {
+        p.name
+        for p in inspect.signature(runner).parameters.values()
+        if p.kind is not p.VAR_KEYWORD
+    }
+    for lens in lenses_for(CLI) + lenses_for(MCP):
+        clash = own & {param.name for param in lens.params}
+        assert not clash, (
+            f"lens '{lens.name}' takes {sorted(clash)}, which "
+            f"{runner.__qualname__} uses for itself"
+        )
+
+
 def test_mcp_exposes_exactly_the_mcp_reports():
     for report in reports_for(MCP):
         tool = getattr(mcp_server, report.tool_name, None)

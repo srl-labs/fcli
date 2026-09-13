@@ -26,7 +26,7 @@ from .connections.srlinux import CONNECTION_NAME
 from .connections.routing import BGP_RIB_ROUTE_FAM_ALIASES
 from .connections.helpers import clean_structured_key
 from .fabric import collect_fabric_state as collect_lens_state
-from .lenses import LensSpec, get_lens
+from .lenses import LensSpec, as_dict as lens_record, get_lens
 from .reports import ReportSpec, get_report
 from .rows import NodeRows, Row, cell, clean_columns, extract, pass_filter
 from .utils.logging_config import setup_logging
@@ -583,9 +583,30 @@ def run_report(
     )
 
 
+def print_records(
+    records: List[Dict[str, Any]],
+    output_format: OutputFormat,
+) -> None:
+    """Print records as JSON or YAML, as the objects they are.
+
+    A record is what a lens found, with its lists as lists and its counts as
+    numbers; the row a table makes of it joins and truncates those for a
+    reader. Whatever reads the output by machine wants the former.
+    """
+    if not records:
+        typer.echo("No data...")
+        return
+    if output_format == OutputFormat.JSON:
+        typer.echo(json.dumps(records, indent=2, default=str))
+    else:
+        typer.echo(
+            yaml.safe_dump(records, default_flow_style=False, sort_keys=False).rstrip()
+        )
+
+
 def print_lens(
     spec: LensSpec,
-    rows: List[Dict[str, Any]],
+    records: List[Any],
     *,
     box_type: Optional[str] = None,
     f_filter: Optional[Dict[str, str]] = None,
@@ -596,11 +617,17 @@ def print_lens(
     """Print what a lens answered, one section per node."""
     for error in errors or []:
         typer.echo(error, err=True)
+    # A field filter names columns, so a record is kept by the row it makes.
+    answered = [(record, spec.row(record)) for record in records]
     if f_filter:
-        rows = [row for row in rows if pass_filter(row, f_filter)]
-    columns = list(spec.columns)
+        answered = [(rec, row) for rec, row in answered if pass_filter(row, f_filter)]
+    if output in (OutputFormat.JSON, OutputFormat.YAML):
+        print_records([lens_record(rec) for rec, _row in answered], output)
+        return
+    columns = spec.column_names
+    rows = [row for _rec, row in answered]
     if output != OutputFormat.TABLE:
-        print_structured(["Node", *columns], rows, output)
+        print_structured(columns, rows, output)
         return
     if not rows:
         Console(theme=TABLE_THEME).print("[i]No data...[/i]")
@@ -626,13 +653,17 @@ def print_lens(
 
 def run_lens(
     ctx: typer.Context,
-    name: str,
+    lens: str,
     field_filter: Optional[List[str]] = None,
     subtitle: str = "",
     **params: Any,
 ) -> None:
-    """Collect what a lens reads, run it, and print the answer."""
-    spec = get_lens(name)
+    """Collect what a lens reads, run it, and print the answer.
+
+    *params* are the lens's own arguments, so nothing here may be called what
+    one of them is: ``service`` takes a ``name``.
+    """
+    spec = get_lens(lens)
     started = time.perf_counter()
     state = collect_lens_state(ctx.obj["target"], spec.requires)
     logger.debug(
@@ -643,7 +674,7 @@ def run_lens(
         time.perf_counter() - started,
     )
     try:
-        rows = spec.run(state, **params)
+        records = spec.run(state, **params)
     except ValueError as exc:
         # A lens is given an address or a name by hand, so being told it is not
         # one is an ordinary answer rather than a crash.
@@ -651,7 +682,7 @@ def run_lens(
         raise typer.Exit(1) from None
     print_lens(
         spec,
-        rows,
+        records,
         box_type=ctx.obj["box_type"],
         f_filter=(
             {k: v for k, v in (f.split("=") for f in field_filter)}
