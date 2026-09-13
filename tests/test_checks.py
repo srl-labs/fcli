@@ -2,13 +2,15 @@
 
 Each check is a pure function over the payloads the report getters return, so a
 test is a fabric written out as those payloads and the findings it should
-produce. The payload shapes here mirror the getters exactly - ``bgp_peers``
-really does key a neighbour address as ``1_peer`` and name a column
-``"EVPN\\nR/A/T"`` - because a check that reads a field by the wrong name would
+produce. Where a getter returns records (:mod:`nornir_srl.records`) the fabric
+is written as those records, and a check that reads a field by the wrong name
+fails to import; where it still returns items, the shapes here mirror the
+getter exactly, because a check that reads a key by the wrong name would
 otherwise pass here and find nothing on a real fabric.
 """
 
-from typing import Any, Dict, List
+from dataclasses import replace
+from typing import Any, Dict, List, Tuple
 
 from nornir_srl import checks as checks_module
 from nornir_srl.checks import (
@@ -21,6 +23,16 @@ from nornir_srl.checks import (
     Check,
     FabricState,
     run_checks,
+)
+from nornir_srl.records import (
+    Association,
+    BgpPeers,
+    Candidate,
+    EthernetSegment,
+    Family,
+    Neighbor,
+    NetworkInstance,
+    VxlanInterface,
 )
 from nornir_srl.reports import REPORTS_BY_NAME
 
@@ -70,20 +82,21 @@ def test_a_finding_fills_every_column():
 # --------------------------------------------------------------------------- #
 
 
-def _peers(state: str = "established", **overrides: Any) -> Dict[str, Any]:
-    peer = {
-        "1_peer": "10.0.0.2",
-        "peer-as": 65002,
-        "state": state,
-        "group": "spines",
-        "U4\nR/A/T": "5/5/3",
-        "U6\nR/A/T": "-",
-        "EVPN\nR/A/T": "12/12/6",
-        "VPNv4\nR/A/T": "-",
-        "VPNv6\nR/A/T": "-",
-    }
-    peer.update(overrides)
-    return {"leaf1": [{"NI": "default", "Neighbors": [peer]}]}
+def _peers(
+    state: str = "established",
+    evpn: Family = Family("evpn", received=12, active=12, sent=6),
+    **overrides: Any,
+) -> Dict[str, Any]:
+    """One leaf with one session carrying ipv4-unicast and *evpn*."""
+    peer = Neighbor(
+        peer="10.0.0.2",
+        state=state,
+        peer_as=65002,
+        group="spines",
+        families=(Family("ipv4-unicast", received=5, active=5, sent=3), evpn),
+    )
+    peer = replace(peer, **overrides)
+    return {"leaf1": [BgpPeers("default", (peer,))]}
 
 
 def test_bgp_down_finds_a_session_that_is_not_established():
@@ -110,7 +123,7 @@ def test_bgp_down_does_not_report_a_session_that_is_not_meant_to_be_up():
 
 
 def test_bgp_af_down_finds_the_family_under_an_established_session():
-    peers = _peers(**{"EVPN\nR/A/T": "down"})
+    peers = _peers(evpn=Family("evpn", oper="down"))
     findings = run("bgp_af_down", fabric(bgp_peers=peers))
     assert len(findings) == 1
     assert findings[0]["Severity"] == ERROR
@@ -119,16 +132,17 @@ def test_bgp_af_down_finds_the_family_under_an_established_session():
 
 def test_bgp_af_down_says_nothing_about_a_session_already_reported_down():
     """One fault is one finding: bgp_down has it."""
-    peers = _peers(state="idle", **{"EVPN\nR/A/T": "down"})
+    peers = _peers(state="idle", evpn=Family("evpn", oper="down"))
     assert run("bgp_af_down", fabric(bgp_peers=peers)) == []
 
 
 def test_bgp_af_down_ignores_a_family_that_was_never_enabled():
-    assert run("bgp_af_down", fabric(bgp_peers=_peers())) == []
+    peers = _peers(evpn=Family("evpn", enabled=False, oper="down"))
+    assert run("bgp_af_down", fabric(bgp_peers=peers)) == []
 
 
 def test_bgp_no_routes_finds_a_family_that_has_learned_nothing():
-    peers = _peers(**{"EVPN\nR/A/T": "0/0/6"})
+    peers = _peers(evpn=Family("evpn", received=0, active=0, sent=6))
     findings = run("bgp_no_routes", fabric(bgp_peers=peers))
     assert len(findings) == 1
     assert findings[0]["Severity"] == WARNING
@@ -137,17 +151,23 @@ def test_bgp_no_routes_finds_a_family_that_has_learned_nothing():
 
 def test_bgp_no_routes_counts_received_rather_than_active():
     """A route received and not selected is a policy question, not a fault."""
-    peers = _peers(**{"EVPN\nR/A/T": "12/0/6"})
+    peers = _peers(evpn=Family("evpn", received=12, active=0, sent=6))
     assert run("bgp_no_routes", fabric(bgp_peers=peers)) == []
 
 
 def test_bgp_no_routes_ignores_a_family_that_is_not_carrying():
-    peers = _peers(**{"EVPN\nR/A/T": "disabled"})
+    peers = _peers(evpn=Family("evpn", enabled=False))
+    assert run("bgp_no_routes", fabric(bgp_peers=peers)) == []
+
+
+def test_bgp_no_routes_ignores_a_family_that_is_down():
+    """A family that is down is bgp_af_down's finding, not an empty one."""
+    peers = _peers(evpn=Family("evpn", oper="down"))
     assert run("bgp_no_routes", fabric(bgp_peers=peers)) == []
 
 
 def test_bgp_checks_survive_a_network_instance_with_no_neighbors():
-    state = fabric(bgp_peers={"leaf1": [{"NI": "default", "Neighbors": None}]})
+    state = fabric(bgp_peers={"leaf1": [BgpPeers("default", ())]})
     assert run("bgp_down", state) == []
 
 
@@ -387,20 +407,20 @@ def test_mtu_mismatch_needs_both_ends_to_report_one():
 def _ni(node: str, *, vxlan: str = "vxlan1.100", in_rt: str = "65000:100", out_rt: str = "65000:100"):
     return {
         node: [
-            {
-                "NI": "mac-vrf-100",
-                "type": "mac-vrf",
-                "oper": "up",
-                "vxlan-itf": vxlan,
-                "In-RT": in_rt,
-                "Out-RT": out_rt,
-            }
+            NetworkInstance(
+                name="mac-vrf-100",
+                type="mac-vrf",
+                oper="up",
+                overlays=(vxlan,),
+                import_rts=(in_rt,),
+                export_rts=(out_rt,),
+            )
         ]
     }
 
 
 def _vxlan(node: str, *, itf: str = "vxlan1.100", vni: int = 100):
-    return {node: [{"vxlan-itf": itf, "NI": "mac-vrf-100", "ing-vni": vni}]}
+    return {node: [VxlanInterface(name=itf, ni="mac-vrf-100", vni=vni)]}
 
 
 def test_evpn_service_mismatch_says_nothing_when_two_nodes_agree():
@@ -450,8 +470,8 @@ def test_evpn_service_mismatch_ignores_a_service_only_one_node_has():
 def test_evpn_service_mismatch_ignores_the_default_network_instance():
     state = fabric(
         ni={
-            "leaf1": [{"NI": "default", "type": "default", "In-RT": "", "Out-RT": ""}],
-            "leaf2": [{"NI": "default", "type": "default", "In-RT": "x", "Out-RT": "y"}],
+            "leaf1": [NetworkInstance("default", "default", "up")],
+            "leaf2": [NetworkInstance("default", "default", "up", import_rts=("x",), export_rts=("y",))],
         },
         vxlan={},
     )
@@ -463,19 +483,33 @@ def test_evpn_service_mismatch_ignores_the_default_network_instance():
 # --------------------------------------------------------------------------- #
 
 
-def _es(node: str, **overrides: Any) -> Dict[str, Any]:
-    segment = {
-        "name": "es-1",
-        "esi": "01:00:00:00:00:01:00:00:00:01",
-        "type": "virtual",
-        "mh-mode": "all-active",
-        "oper": "up",
-        "itf/nh": "lag1",
-        "evi": "100",
-        "ni-peers": "mac-vrf-100:[10.0.0.1 10.0.0.2(DF)]",
-    }
-    segment.update(overrides)
-    return {node: [segment]}
+def _candidates(*addresses: str) -> Tuple[Candidate, ...]:
+    """DF candidates written the way the ES report shows them: ``(DF)`` marks the elected one."""
+    return tuple(
+        Candidate(address.removesuffix("(DF)"), designated=address.endswith("(DF)"))
+        for address in addresses
+    )
+
+
+def _es(
+    node: str,
+    *,
+    associations: Tuple[Association, ...] = (
+        Association("mac-vrf-100", _candidates("10.0.0.1", "10.0.0.2(DF)")),
+    ),
+    **overrides: Any,
+) -> Dict[str, Any]:
+    segment = EthernetSegment(
+        name="es-1",
+        esi="01:00:00:00:00:01:00:00:00:01",
+        type="virtual",
+        mh_mode="all-active",
+        oper="up",
+        interfaces=("lag1",),
+        next_hops=(),
+        associations=associations,
+    )
+    return {node: [replace(segment, **overrides)]}
 
 
 def test_es_df_says_nothing_about_a_healthy_segment():
@@ -483,7 +517,9 @@ def test_es_df_says_nothing_about_a_healthy_segment():
 
 
 def test_es_df_finds_a_network_instance_with_no_designated_forwarder():
-    state = fabric(es=_es("leaf1", **{"ni-peers": "mac-vrf-100:[10.0.0.1 10.0.0.2]"}))
+    state = fabric(
+        es=_es("leaf1", associations=(Association("mac-vrf-100", _candidates("10.0.0.1", "10.0.0.2")),))
+    )
     findings = run("es_df", state)
     assert len(findings) == 1
     assert findings[0]["Subject"] == "es-1/mac-vrf-100"
@@ -491,7 +527,7 @@ def test_es_df_finds_a_network_instance_with_no_designated_forwarder():
 
 
 def test_es_df_finds_a_network_instance_with_no_candidates_at_all():
-    state = fabric(es=_es("leaf1", **{"ni-peers": "mac-vrf-100:[]"}))
+    state = fabric(es=_es("leaf1", associations=(Association("mac-vrf-100"),)))
     findings = run("es_df", state)
     assert len(findings) == 1
     assert "no candidates" in findings[0]["Detail"]
@@ -501,7 +537,10 @@ def test_es_df_checks_every_network_instance_on_a_segment():
     state = fabric(
         es=_es(
             "leaf1",
-            **{"ni-peers": "mac-vrf-100:[10.0.0.1(DF)], mac-vrf-200:[10.0.0.1 10.0.0.2]"},
+            associations=(
+                Association("mac-vrf-100", _candidates("10.0.0.1(DF)")),
+                Association("mac-vrf-200", _candidates("10.0.0.1", "10.0.0.2")),
+            ),
         )
     )
     findings = run("es_df", state)
@@ -514,7 +553,7 @@ def test_es_df_finds_a_segment_that_is_down():
 
 
 def test_es_df_finds_two_nodes_disagreeing_about_the_multi_homing_mode():
-    state = fabric(es={**_es("leaf1"), **_es("leaf2", **{"mh-mode": "single-active"})})
+    state = fabric(es={**_es("leaf1"), **_es("leaf2", mh_mode="single-active")})
     findings = run("es_df", state)
     assert {f["Node"] for f in findings} == {"leaf1", "leaf2"}
     assert all("multi-homing mode" in f["Detail"] for f in findings)
@@ -524,7 +563,7 @@ def test_es_df_does_not_compare_two_different_segments():
     state = fabric(
         es={
             **_es("leaf1"),
-            **_es("leaf2", esi="01:00:00:00:00:02:00:00:00:02", **{"mh-mode": "single-active"}),
+            **_es("leaf2", esi="01:00:00:00:00:02:00:00:00:02", mh_mode="single-active"),
         }
     )
     assert run("es_df", state) == []

@@ -1,11 +1,13 @@
 """One fabric's worth of report payloads, and the small readings of them.
 
 :class:`FabricState` is what anything fabric-wide sees: one report payload per
-node, keyed the way a getter returned it. It started inside
-:mod:`nornir_srl.checks`, but a check is not the only thing that has to look at
-every node at once - a lens (:mod:`nornir_srl.lenses`) answers a question by
-joining several reports across the fabric, and reads exactly the same thing. It
-lives here so neither module imports the other.
+node, keyed the way a getter returned it - the records of
+:mod:`nornir_srl.records` for a report that returns them, the item dicts for
+one that does not yet. It started inside :mod:`nornir_srl.checks`, but a check
+is not the only thing that has to look at every node at once - a lens
+(:mod:`nornir_srl.lenses`) answers a question by joining several reports
+across the fabric, and reads exactly the same thing. It lives here so neither
+module imports the other.
 
 Collecting it is one Nornir pass per report, which is what the CLI and the MCP
 surfaces do. The live server never calls :func:`collect_fabric_state`: it has
@@ -46,25 +48,24 @@ class FabricState:
         """The nodes *report* was collected from, in inventory order."""
         return list(self.reports.get(report, {}))
 
-    def items(self, report: str) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    def items(self, report: str) -> Iterator[Tuple[str, Any]]:
         """Every top-level entry of *report*, paired with the node it is from."""
         for node, payload in self.reports.get(report, {}).items():
             for entry in as_list(payload):
-                if isinstance(entry, dict):
+                if entry is not None and not isinstance(entry, (str, int, float)):
                     yield node, entry
 
-    def sub_items(
-        self, report: str, key: str
-    ) -> Iterator[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    def sub_items(self, report: str, key: str) -> Iterator[Tuple[str, Any, Any]]:
         """Every nested entry under *key*, with the node and parent it hangs off.
 
         Most report payloads are two levels deep - a network-instance holding a
         route table, an interface holding its neighbours - and almost every
-        reading of one wants both levels at once.
+        reading of one wants both levels at once. *key* is a field of a record
+        or a key of an item, whichever the report returns.
         """
         for node, entry in self.items(report):
-            for child in as_list(entry.get(key)):
-                if isinstance(child, dict):
+            for child in as_list(read(entry, key)):
+                if child is not None:
                     yield node, entry, child
 
     def alias_index(self) -> Dict[str, str]:
@@ -85,7 +86,14 @@ def as_list(value: Any) -> List[Any]:
     """*value* as a list, whether it was one, one item, or nothing."""
     if value is None:
         return []
-    return value if isinstance(value, list) else [value]
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def read(entry: Any, key: str) -> Any:
+    """*key* of *entry*, whether it is a record's field or an item's key."""
+    if isinstance(entry, dict):
+        return entry.get(key)
+    return getattr(entry, key, None)
 
 
 def text(value: Any) -> str:

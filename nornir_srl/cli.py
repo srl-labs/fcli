@@ -26,9 +26,10 @@ from .connections.srlinux import CONNECTION_NAME
 from .connections.routing import BGP_RIB_ROUTE_FAM_ALIASES
 from .connections.helpers import clean_structured_key
 from .fabric import collect_fabric_state as collect_lens_state
-from .lenses import LensSpec, as_dict as lens_record, get_lens
+from .lenses import LensSpec, get_lens
+from .records import as_dict
 from .reports import ReportSpec, get_report
-from .rows import NodeRows, Row, cell, clean_columns, extract, pass_filter
+from .rows import NodeRows, Row, Table as ReportTable, cell, clean_columns, extract, pass_filter
 from .utils.logging_config import setup_logging
 from . import __version__
 
@@ -242,13 +243,22 @@ def print_report(
     f_filter: Optional[Dict] = None,
     i_filter: Optional[Dict] = None,
     output: OutputFormat = OutputFormat.TABLE,
+    table: Optional[ReportTable] = None,
 ) -> None:
     columns, per_node = extract(
         result.name,
         result,
         field_filter=f_filter,
         on_error=_report_failure(result.name),
+        table=table,
     )
+    if table is not None and output in (OutputFormat.JSON, OutputFormat.YAML):
+        # The records themselves, each saying which node it is from.
+        print_records(
+            [{"node": node.node, **as_dict(record)} for node in per_node for record in node.records],
+            output,
+        )
+        return
     if output == OutputFormat.TABLE:
         columns = _cli_table_columns(result.name, columns)
         title = "[bold]" + name + "[/bold]"
@@ -473,7 +483,7 @@ def report_table(
     def on_error(node: str, exception: Optional[BaseException]) -> None:
         errors.append({"node": node, "error": str(exception)})
 
-    raw_columns, per_node = extract(spec.resource, result, on_error=on_error)
+    raw_columns, per_node = extract(spec.resource, result, on_error=on_error, table=spec.table_for(params))
     columns = clean_columns(raw_columns)
     rows = [
         {
@@ -580,6 +590,7 @@ def run_report(
         f_filter=f_filter,
         i_filter=ctx.obj["i_filter"],
         output=ctx.obj["output"],
+        table=spec.table_for(params),
     )
 
 
@@ -622,7 +633,7 @@ def print_lens(
     if f_filter:
         answered = [(rec, row) for rec, row in answered if pass_filter(row, f_filter)]
     if output in (OutputFormat.JSON, OutputFormat.YAML):
-        print_records([lens_record(rec) for rec, _row in answered], output)
+        print_records([as_dict(rec) for rec, _row in answered], output)
         return
     columns = spec.column_names
     rows = [row for _rec, row in answered]

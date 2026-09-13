@@ -27,19 +27,18 @@ Adding one means writing a record type, a function over a :class:`FabricState`
 that returns a list of them, the columns that render one, and an entry in
 :data:`LENSES`.
 
-Some of what these functions do is string parsing that should not be necessary:
-a bridge-table destination arrives as ``"vxlan-interface:vxlan1.101
-vtep:192.168.255.2 vni:101"`` because the getter formatted it for display before
-anything could read it. Where that happens it is parsed here rather than worked
-around, and marked with a comment, so that the eventual split between payload
-and presentation has a list of callers to fix.
+A lens reads the records of :mod:`nornir_srl.records` where a report returns
+them, and the item dicts of a report that does not yet - the route tables,
+LLDP, ARP and ND - as the getter shaped them. Where one of those arrives
+pre-formatted it is read back apart here, marked with a comment, so that
+converting the report has a list of callers to fix.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import re
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from typing import (
     Any,
     Callable,
@@ -50,12 +49,13 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
-    Union,
 )
 
 from .aliases import resolve
 from .fabric import FabricState, as_list, out_of_band, parent, text
+from .records import Route, as_dict
 from .reports import INTERACTIVE, ParamSpec
+from .rows import Column
 
 #: How far a path walk follows the fabric before deciding it is going in
 #: circles. A datacenter fabric is three tiers; anything beyond this is a loop
@@ -99,7 +99,7 @@ class Sighting:
     expiry: str = ""
     #: ``remote``: the overlay interface it was learned over, and the VNI.
     overlay: str = ""
-    vni: str = ""
+    vni: Optional[int] = None
     #: ``remote`` behind a segment: what the segment is called on the nodes
     #: that have it configured. Empty when none of the collected nodes do.
     segments: Tuple[str, ...] = ()
@@ -174,7 +174,7 @@ class Service:
     #: The EVI of each BGP-EVPN instance it advertises with; a gateway has two.
     evis: Tuple[str, ...]
     #: The ingress VNI of each overlay interface bound to it.
-    vnis: Tuple[str, ...]
+    vnis: Tuple[int, ...]
     import_rts: Tuple[str, ...]
     export_rts: Tuple[str, ...]
     interfaces: Tuple[Interface, ...]
@@ -189,34 +189,9 @@ class Service:
     segments: Tuple[str, ...]
 
 
-def _plain(pairs: Iterable[Tuple[str, Any]]) -> Dict[str, Any]:
-    """A record's fields with its tuples as lists, which is what YAML can write."""
-    return {key: list(value) if isinstance(value, tuple) else value for key, value in pairs}
-
-
-def as_dict(record: Any) -> Dict[str, Any]:
-    """*record* as the plain object ``-o json`` and the MCP tools emit."""
-    return asdict(record, dict_factory=_plain)
-
-
 # --------------------------------------------------------------------------- #
 # rows: how a record reads in a table
 # --------------------------------------------------------------------------- #
-
-
-@dataclass(frozen=True)
-class Column:
-    """One table column: what it is called, and how a record fills it."""
-
-    name: str
-    #: The record field to show, or a function of the record for a cell that
-    #: is composed rather than copied.
-    cell: Union[str, Callable[[Any], Any]]
-
-    def of(self, record: Any) -> Any:
-        if isinstance(self.cell, str):
-            return getattr(record, self.cell)
-        return self.cell(record)
 
 
 @dataclass(frozen=True)
@@ -267,74 +242,12 @@ class LensSpec:
 
 
 # --------------------------------------------------------------------------- #
-# reading the parts of a payload that were formatted before anyone read them
+# small readings of an address
 # --------------------------------------------------------------------------- #
-
-#: A bridge-table destination, as ``get_mac_table`` writes it. Local entries are
-#: a bare subinterface or ``irb-interface``; a remote one names the overlay and
-#: then either the VTEP that owns it or the ethernet-segment it sits behind.
-_DEST = re.compile(
-    r"vxlan-interface:(?P<overlay>\S+)"
-    r"(?:\s+vtep:(?P<vtep>\S+))?"
-    r"(?:\s+vni:(?P<vni>\d+))?"
-    r"(?:\s+esi:(?P<esi>\S+))?"
-)
-
-#: A VXLAN destination list, as ``get_vxlan`` writes it: ``(vtep, vni), ...``.
-_VTEP = re.compile(r"\((?P<vtep>[^,\s]+),\s*(?P<vni>\d+)\)")
-
-#: An egress that is not an interface but a tunnel, which is how a route
-#: resolved over the overlay reports itself: ``vxlan:192.168.255.3/32``.
-_TUNNEL = re.compile(r"^vxlan:(?P<vtep>[0-9a-fA-F.:]+)(?:/\d+)?$")
 
 #: Route types that terminate a walk because the destination is attached to the
 #: node that holds them rather than reachable through it.
 _ATTACHED = ("local", "host", "direct", "arp-nd", "static-local")
-
-
-@dataclass(frozen=True)
-class Destination:
-    """Where a bridge-table entry points."""
-
-    #: ``local``, ``irb``, ``vtep`` or ``esi``.
-    kind: str
-    #: The subinterface, VTEP address or ESI, whichever names it.
-    via: str
-    overlay: str = ""
-    vni: str = ""
-
-    @property
-    def local(self) -> bool:
-        return self.kind in ("local", "irb")
-
-
-def parse_destination(dest: Any) -> Destination:
-    """Read a bridge-table destination string back into its parts."""
-    value = str(dest or "").strip()
-    if not value:
-        return Destination(kind="unknown", via="")
-    match = _DEST.search(value)
-    if not match:
-        if value.startswith("irb-interface"):
-            return Destination(kind="irb", via=value)
-        return Destination(kind="local", via=value)
-    esi, vtep = match.group("esi"), match.group("vtep")
-    return Destination(
-        kind="esi" if esi else "vtep",
-        via=esi or vtep or "",
-        overlay=match.group("overlay") or "",
-        vni=match.group("vni") or "",
-    )
-
-
-def parse_vteps(destinations: Any) -> List[Tuple[str, str]]:
-    """The ``(vtep, vni)`` pairs a VXLAN interface sends to."""
-    return [(m.group("vtep"), m.group("vni")) for m in _VTEP.finditer(str(destinations or ""))]
-
-
-def parse_listed(value: Any) -> Tuple[str, ...]:
-    """A list a getter joined with ``", "`` - route-targets, EVIs, overlays."""
-    return tuple(item.strip() for item in str(value or "").split(",") if item.strip())
 
 
 def _address(value: Any) -> Optional[Any]:
@@ -382,14 +295,13 @@ def _arp_bindings(state: FabricState) -> List[Tuple[str, Dict[str, Any], Dict[st
     return bindings
 
 
-def _es_by_esi(state: FabricState) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:
-    """Ethernet segments indexed by ESI, so a remote MAC can name its segment."""
-    segments: Dict[str, List[Tuple[str, Dict[str, Any]]]] = {}
-    for node, entry in state.items("es"):
-        esi = str(entry.get("esi") or "")
-        if esi:
-            segments.setdefault(esi, []).append((node, entry))
-    return segments
+def _es_names(state: FabricState) -> Dict[str, Tuple[str, ...]]:
+    """ESI -> what the segment is called on the nodes that have it configured."""
+    names: Dict[str, set] = {}
+    for _node, segment in state.items("es"):
+        if segment.esi:
+            names.setdefault(segment.esi, set()).add(segment.name)
+    return {esi: tuple(sorted(found)) for esi, found in names.items()}
 
 
 def lens_where(state: FabricState, target: str = "") -> List[Sighting]:
@@ -435,50 +347,32 @@ def lens_where(state: FabricState, target: str = "") -> List[Sighting]:
         if not mac:
             return sightings
 
-    segments = _es_by_esi(state)
+    segments = _es_names(state)
     # Network-instance -> the sightings learned locally in it, by position.
     local: Dict[str, List[int]] = {}
-    for node, ni_entry, entry in state.sub_items("mac", "Fib"):
-        if _mac(entry.get("Address")) != mac:
+    for node, table, entry in state.sub_items("mac", "entries"):
+        if _mac(entry.address) != mac:
             continue
-        ni = str(ni_entry.get("NI", ""))
-        # The destination arrives pre-formatted, so it is read back apart here.
-        dest = parse_destination(entry.get("Dest"))
-        origin = text(entry.get("Type"))
-        if dest.local:
-            local.setdefault(ni, []).append(len(sightings))
+        if entry.local:
+            local.setdefault(table.ni, []).append(len(sightings))
             sightings.append(
-                Sighting(node, ni, "local", mac, interface=dest.via, origin=origin)
+                Sighting(node, table.ni, "local", mac, interface=entry.interface, origin=text(entry.type))
             )
-        elif dest.kind == "esi":
-            sightings.append(
-                Sighting(
-                    node,
-                    ni,
-                    "remote",
-                    mac,
-                    esi=dest.via,
-                    origin=origin,
-                    overlay=dest.overlay,
-                    vni=dest.vni,
-                    segments=tuple(
-                        sorted({str(es.get("name")) for _n, es in segments.get(dest.via, [])})
-                    ),
-                )
+            continue
+        sightings.append(
+            Sighting(
+                node,
+                table.ni,
+                "remote",
+                mac,
+                vtep=entry.vtep,
+                esi=entry.esi,
+                origin=text(entry.type),
+                overlay=entry.overlay,
+                vni=entry.vni,
+                segments=segments.get(entry.esi, ()) if entry.esi else (),
             )
-        else:
-            sightings.append(
-                Sighting(
-                    node,
-                    ni,
-                    "remote",
-                    mac,
-                    vtep=dest.via,
-                    origin=origin,
-                    overlay=dest.overlay,
-                    vni=dest.vni,
-                )
-            )
+        )
 
     # Two nodes both owning one MAC locally is legitimate when they are the two
     # sides of an all-active segment, and is a duplicate or a silent move
@@ -519,7 +413,7 @@ def _sighting_detail(sighting: Sighting) -> str:
     detail = sighting.origin
     if sighting.vtep:
         detail += f", overlay {sighting.overlay}"
-        detail += f", vni {sighting.vni}" if sighting.vni else ""
+        detail += f", vni {sighting.vni}" if sighting.vni is not None else ""
     elif sighting.esi:
         detail += f", segment {', '.join(sighting.segments) or 'not local'}"
     if sighting.also_on:
@@ -548,23 +442,22 @@ def _rib_report(address: Any) -> str:
     return "ipv6_rib" if getattr(address, "version", 4) == 6 else "ipv4_rib"
 
 
-def _routes(state: FabricState, report: str, node: str, ni: str) -> List[Dict[str, Any]]:
+def _routes(state: FabricState, report: str, node: str, ni: str) -> List[Route]:
     """The active routes of one network-instance on one node."""
-    routes = []
-    for entry_node, entry in state.items(report):
-        if entry_node != node or str(entry.get("NI", "")) != ni:
-            continue
-        for route in as_list(entry.get("Rib")):
-            if isinstance(route, dict) and text(route.get("Act")) in ("yes", "true", ""):
-                routes.append(route)
-    return routes
+    return [
+        route
+        for table_node, table in state.items(report)
+        if table_node == node and table.ni == ni
+        for route in table.routes
+        if route.active
+    ]
 
 
-def _lpm(routes: Sequence[Dict[str, Any]], address: Any) -> Optional[Dict[str, Any]]:
+def _lpm(routes: Sequence[Route], address: Any) -> Optional[Route]:
     """The longest prefix among *routes* that contains *address*."""
     best, best_len = None, -1
     for route in routes:
-        network = _network(route.get("Prefix"))
+        network = _network(route.prefix)
         if network is None or network.version != address.version:
             continue
         if address in network and network.prefixlen > best_len:
@@ -628,7 +521,7 @@ def _starting_nodes(state: FabricState, source: str, ni: str) -> List[str]:
         return starts
     for node in known:
         route = _lpm(_routes(state, _rib_report(address), node, ni), address)
-        if route and text(route.get("type")) in ("local", "host", "direct"):
+        if route and text(route.type) in ("local", "host", "direct"):
             starts.append(node)
     if not starts:
         raise ValueError(
@@ -696,21 +589,24 @@ def lens_path(
             hops.append(Hop(**here, outcome="no-route"))
             continue
 
-        kind = text(route.get("type"))
-        egress = [str(i) for i in as_list(route.get("itf")) if i]
+        kind = text(route.type)
+        # Where the route leaves the node: every port, tunnel or unresolved
+        # prefix of every next-hop, in next-hop order.
+        leaves = [hop for nh in route.next_hops for hop in nh.egress]
         matched = dict(
-            prefix=str(route.get("Prefix", "")),
+            prefix=route.prefix,
             route_type=kind,
-            next_hops=tuple(str(n) for n in as_list(route.get("next-hop")) if n),
+            next_hops=tuple(nh.address or nh.resolving_route for nh in route.next_hops),
         )
 
         # A route that resolved over the overlay names its tunnels rather than
         # an interface. The walk hands off to the underlay there: one branch
         # per VTEP, looked up again in the default instance, which is how the
         # two route tables actually compose on the wire.
-        tunnels = [m.group("vtep") for m in map(_TUNNEL.match, egress) if m]
+        tunnels = [hop for hop in leaves if hop.kind == "tunnel" and hop.tunnel == "vxlan"]
         if tunnels:
-            for vtep in tunnels:
+            for tunnel in tunnels:
+                vtep = tunnel.value.split("/", 1)[0]
                 hops.append(
                     Hop(**here, **matched, outcome="overlay", egress=f"vxlan:{vtep}", vtep=vtep)
                 )
@@ -723,6 +619,10 @@ def lens_path(
                     )
             continue
 
+        # Anything else the route leaves through is looked up against LLDP by
+        # its port; a prefix the chain stopped at, or a tunnel of another
+        # kind, has no neighbour and ends the walk saying so.
+        egress = [hop.label for hop in leaves]
         if kind in _ATTACHED or not egress:
             # An attached route has one interface, or none at all when the
             # destination is the node itself.
@@ -835,57 +735,47 @@ def lens_service(state: FabricState, name: str = "") -> List[Service]:
     pattern = re.compile(wanted, re.IGNORECASE)
 
     # vxlan-interface -> what that node sends on it.
-    overlays: Dict[Tuple[str, str], Dict[str, Any]] = {
-        (node, str(entry.get("vxlan-itf", ""))): entry
-        for node, entry in state.items("vxlan")
-    }
-    macs: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
-    for node, ni_entry, entry in state.sub_items("mac", "Fib"):
-        macs.setdefault((node, str(ni_entry.get("NI", ""))), []).append(entry)
+    overlays = {(node, vxlan.name): vxlan for node, vxlan in state.items("vxlan")}
+    macs: Dict[Tuple[str, str], List[Any]] = {}
+    for node, table, entry in state.sub_items("mac", "entries"):
+        macs.setdefault((node, table.ni), []).append(entry)
     segments: Dict[Tuple[str, str], List[str]] = {}
-    for node, entry in state.items("es"):
-        # ``ni-peers`` names the instances a segment is associated with.
-        for instance in re.findall(r"([^:\[\],]+):\[", str(entry.get("ni-peers") or "")):
-            segments.setdefault((node, instance.strip()), []).append(str(entry.get("name", "")))
+    for node, segment in state.items("es"):
+        for association in segment.associations:
+            segments.setdefault((node, association.ni), []).append(segment.name)
 
     services: List[Service] = []
-    for node, entry in state.items("ni"):
-        instance = str(entry.get("NI", ""))
-        if not pattern.search(instance):
+    for node, instance in state.items("ni"):
+        if not pattern.search(instance.name):
             continue
-        interfaces = [i for i in as_list(entry.get("itfs")) if isinstance(i, dict)]
-        # The overlays, RTs and EVIs arrive joined, so they are read back apart.
-        overlay_names = parse_listed(entry.get("vxlan-itf"))
         vnis, vteps = [], []
-        for overlay in overlay_names:
+        for overlay in instance.overlays:
             found = overlays.get((node, overlay))
-            if not found:
+            if found is None:
                 continue
-            vnis.append(str(found.get("ing-vni", "")))
-            vteps.extend(vtep for vtep, _vni in parse_vteps(found.get("destinations")))
-        entries = macs.get((node, instance), [])
-        local = sum(1 for e in entries if parse_destination(e.get("Dest")).local)
+            if found.vni is not None:
+                vnis.append(found.vni)
+            vteps.extend(d.vtep for d in found.destinations)
+        entries = macs.get((node, instance.name), [])
+        local = sum(1 for e in entries if e.local)
         services.append(
             Service(
                 node=node,
-                ni=instance,
-                type=str(entry.get("type") or ""),
-                oper=str(entry.get("oper") or ""),
-                evis=parse_listed(entry.get("evi")),
+                ni=instance.name,
+                type=instance.type,
+                oper=instance.oper,
+                evis=instance.evis,
                 vnis=tuple(vnis),
-                import_rts=parse_listed(entry.get("In-RT")),
-                export_rts=parse_listed(entry.get("Out-RT")),
+                import_rts=instance.import_rts,
+                export_rts=instance.export_rts,
                 interfaces=tuple(
-                    Interface(name=str(i.get("Subitf") or ""), oper=text(i.get("if-oper")))
-                    for i in interfaces
+                    Interface(name=i.name, oper=text(i.oper)) for i in instance.interfaces
                 ),
-                bound=tuple(
-                    sorted({str(i.get("assoc-ni")) for i in interfaces if i.get("assoc-ni")})
-                ),
+                bound=tuple(sorted({ni for i in instance.interfaces for ni in i.associated})),
                 vteps=tuple(sorted(set(vteps))),
                 local_macs=local,
                 remote_macs=len(entries) - local,
-                segments=tuple(sorted(set(segments.get((node, instance), [])))),
+                segments=tuple(sorted(set(segments.get((node, instance.name), [])))),
             )
         )
 
@@ -1032,8 +922,6 @@ __all__ = [
     "PATH_COLUMNS",
     "SERVICE_COLUMNS",
     "WHERE_COLUMNS",
-    "Column",
-    "Destination",
     "Hop",
     "Interface",
     "LensSpec",
@@ -1045,7 +933,4 @@ __all__ = [
     "lens_service",
     "lens_where",
     "lenses_for",
-    "parse_destination",
-    "parse_listed",
-    "parse_vteps",
 ]

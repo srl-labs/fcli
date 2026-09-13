@@ -17,12 +17,13 @@ from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Tuple
 from unittest import mock
 
 from nornir_srl.connections import ifstats as ifstats_module
 from nornir_srl.connections import neighbor_discovery as nd_module
 from nornir_srl.reports import REPORTS_BY_NAME, ReportSpec
+from nornir_srl.connections.helpers import clean_structured_key
 from nornir_srl.rows import clean_columns, flatten
 from nornir_srl.server.devices import MixinDevice
 
@@ -334,13 +335,36 @@ def flatten_report(
     """A getter's result as the ``(columns, rows)`` a user of the report sees.
 
     Capture and replay both go through here, so a recorded table and a replayed
-    one are comparable by construction.
+    one are comparable by construction. Rows are keyed the way the columns are
+    named - see :func:`comparable_rows` for what that leaves out.
     """
-    raw_columns, rows = flatten("", (result or {}).get(spec.resource))
+    raw_columns, rows = flatten("", (result or {}).get(spec.resource), spec.table_for({}))
     # ``flatten`` labels each row with the node it came from; the recording
     # already names the node, so it would only be noise repeated on every row.
-    return clean_columns(raw_columns), [
+    return clean_columns(raw_columns), comparable_rows(
         {k: v for k, v in row.items() if k != "Node"} for row in rows
+    )
+
+
+def comparable_rows(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """*rows* as what they render as, so two ways of producing one compare.
+
+    A cell renders the same whether its key carried a ``<n>_`` ordering
+    prefix or a newline, and whether an empty cell was left out of the row,
+    given as ``None``, as ``""``, as an empty list or as a list of nothing
+    but those - the ``[None]`` a host route's next-hop used to flatten to.
+    Recordings made before a report returned records keep the raw keys and
+    the gaps, so both sides are brought to this shape.
+    """
+
+    def cell(value: Any) -> Any:
+        if isinstance(value, list):
+            value = [v for v in value if v is not None and v != ""]
+        return None if value is None or value == "" or value == [] else value
+
+    return [
+        {clean_structured_key(k): cell(v) for k, v in row.items() if cell(v) is not None}
+        for row in rows
     ]
 
 

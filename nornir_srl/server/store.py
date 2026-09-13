@@ -636,7 +636,7 @@ class FabricStore:
             return name, [], [], error, set()
         host = self.nornir.inventory.hosts.get(name)
         node = (host.hostname if host and host.hostname else name) or name
-        columns, rows = flatten(node, items)
+        columns, rows = flatten(node, items, report.table_for(params))
         return name, columns, rows, None, sub_item_keys(items)
 
     # ------------------------------------------------------------------ #

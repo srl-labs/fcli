@@ -1,11 +1,33 @@
 # Network instance related methods extracted from srlinux.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import jmespath
 
+from ..records import NetworkInstance, Subinterface, as_int
 from .down_reason import ParentReasons
 from .helpers import as_list, bgp_evpn_evis, first_payload
+
+
+def _route_targets(bgp_vpn: Dict[str, Any], direction: str) -> Tuple[str, ...]:
+    """The ``import`` or ``export`` route-targets of a network-instance.
+
+    Where a policy sets them instead of a target list, the policy's name is
+    what there is to show.
+    """
+    targets: List[str] = []
+    for inst in as_list(bgp_vpn.get("bgp-instance")):
+        if not isinstance(inst, dict):
+            continue
+        policy = inst.get(f"{direction}-policy")
+        if policy:
+            targets.extend(as_list(policy))
+            continue
+        for rt in as_list((inst.get("route-target") or {}).get(f"{direction}-rt")):
+            target = rt.get("target") if isinstance(rt, dict) else rt
+            if target:
+                targets.append(str(target).replace("target:", ""))
+    return tuple(sorted(set(targets)))
 
 
 class NetworkInstanceMixin:
@@ -22,92 +44,74 @@ class NetworkInstanceMixin:
 
     def get_nwi_itf(self, nw_instance: str = "*") -> Dict[str, Any]:
         SUBITF_PATH = "/interface[name=*]/subinterface"
-        path_spec = {
-            "path": f"/network-instance[name={nw_instance}]",
-            "jmespath": '"network-instance"[].{NI:name,oper:"oper-state",type:type,"router-id":protocols.bgp."router-id",\
-                    "vxlan-itf":"vxlan-interface"[].name || `[]` | join(\', \',@), \
-                    evi:"_evi", "In-RT":"In-RT", "Out-RT":"Out-RT",\
-                    itfs: interface[].{Subitf:name,"assoc-ni":"_other_ni","if-oper":"oper-state", "ip-prefix":*.address[]."ip-prefix",\
-                        vlan:vlan.encap."single-tagged"."vlan-id", "mtu":"_mtu"}}',
-            "datatype": "all",
-        }
-        subitf: Dict[str, Any] = {}
+        subitf: Dict[str, Dict[str, Any]] = {}
         resp = self.get(paths=[SUBITF_PATH], datatype="all")
         for itf in as_list(first_payload(resp).get("interface")):
             for si in as_list(itf.get("subinterface")):
-                subif_name = f"{itf.get('name', '')}.{si.get('index', '')}"
-                # A copy, because these details are merged into the interfaces of
-                # every network-instance that binds them and the response itself
-                # may be a cached one the streaming server hands out repeatedly.
-                details = {k: v for k, v in si.items() if k != "index"}
-                details["_mtu"] = (
-                    si.get("l2-mtu") if "l2-mtu" in si else si.get("ip-mtu", "")
-                )
-                subitf[subif_name] = details
+                subitf[f"{itf.get('name', '')}.{si.get('index', '')}"] = si
 
-        resp = self.get(
-            paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
-        )
-        ni_list = as_list(first_payload(resp).get("network-instance"))
+        resp = self.get(paths=[f"/network-instance[name={nw_instance}]"], datatype="all")
+        ni_list = [
+            ni for ni in as_list(first_payload(resp).get("network-instance")) if isinstance(ni, dict)
+        ]
+        # interface -> the network-instances it is bound to, which is how an
+        # irb names the ip-vrf a mac-vrf routes into.
+        bound: Dict[str, List[str]] = {}
         for ni in ni_list:
-            bgp_vpn = ni.get("protocols", {}).get("bgp-vpn", {})
-            in_rts = []
-            out_rts = []
-            bgp_instances = bgp_vpn.get("bgp-instance", [])
-            if isinstance(bgp_instances, dict):
-                bgp_instances = [bgp_instances]
+            for itf in as_list(ni.get("interface")):
+                if isinstance(itf, dict) and itf.get("name"):
+                    bound.setdefault(str(itf["name"]), []).append(str(ni.get("name", "")))
 
-            for inst in bgp_instances:
-                rt_cfg = inst.get("route-target", {})
-
-                if inst.get("import-policy"):
-                    imp_pol = inst.get("import-policy")
-                    if isinstance(imp_pol, str):
-                        imp_pol = [imp_pol]
-                    in_rts.extend(imp_pol)
-                else:
-                    import_rt = rt_cfg.get("import-rt", [])
-                    if isinstance(import_rt, (str, dict)):
-                        import_rt = [import_rt]
-                    for rt in import_rt:
-                        target = rt.get("target") if isinstance(rt, dict) else rt
-                        if target:
-                            in_rts.append(target.replace("target:", ""))
-
-                if inst.get("export-policy"):
-                    exp_pol = inst.get("export-policy")
-                    if isinstance(exp_pol, str):
-                        exp_pol = [exp_pol]
-                    out_rts.extend(exp_pol)
-                else:
-                    export_rt = rt_cfg.get("export-rt", [])
-                    if isinstance(export_rt, (str, dict)):
-                        export_rt = [export_rt]
-                    for rt in export_rt:
-                        target = rt.get("target") if isinstance(rt, dict) else rt
-                        if target:
-                            out_rts.append(target.replace("target:", ""))
-            ni["In-RT"] = ", ".join(sorted(list(set(in_rts))))
-            ni["Out-RT"] = ", ".join(sorted(list(set(out_rts))))
-            # The EVI the service advertises with, which is also what a virtual
-            # ethernet-segment names to say which network-instance it serves.
-            ni["_evi"] = ", ".join(bgp_evpn_evis(ni).values())
-
-            for ni_itf in ni.get("interface", []):
-                ni_itf.update(subitf.get(ni_itf["name"], {}))
-                if ni_itf["name"].startswith("irb"):
-                    ni_itf["_other_ni"] = " ".join(
-                        f"{vrf['name']}"
-                        for vrf in ni_list
-                        if ni_itf["name"]
-                        in [i["name"] for i in vrf.get("interface", [])]
-                        and vrf["name"] != ni["name"]
+        records = []
+        for ni in ni_list:
+            name = str(ni.get("name", ""))
+            protocols = ni.get("protocols") or {}
+            bgp_vpn = protocols.get("bgp-vpn") or {}
+            interfaces = []
+            for itf in as_list(ni.get("interface")):
+                if not isinstance(itf, dict):
+                    continue
+                itf_name = str(itf.get("name", ""))
+                details = subitf.get(itf_name, {})
+                interfaces.append(
+                    Subinterface(
+                        name=itf_name,
+                        oper=str(details.get("oper-state") or itf.get("oper-state") or ""),
+                        prefixes=tuple(
+                            str(p) for p in jmespath.search('*.address[]."ip-prefix"', details) or []
+                        ),
+                        mtu=as_int(details.get("l2-mtu") if "l2-mtu" in details else details.get("ip-mtu")),
+                        vlan=as_int(
+                            jmespath.search('vlan.encap."single-tagged"."vlan-id"', details)
+                        ),
+                        associated=tuple(
+                            other for other in bound.get(itf_name, []) if other != name
+                        )
+                        if itf_name.startswith("irb")
+                        else (),
                     )
-
-        # The projection runs against the normalized list, so a lone
-        # network-instance that gNMI returned unwrapped still yields a row.
-        res = jmespath.search(path_spec["jmespath"], {"network-instance": ni_list})
-        return {"nwi_itfs": res}
+                )
+            records.append(
+                NetworkInstance(
+                    name=name,
+                    type=str(ni.get("type") or ""),
+                    oper=str(ni.get("oper-state") or ""),
+                    router_id=str((protocols.get("bgp") or {}).get("router-id") or ""),
+                    overlays=tuple(
+                        str(v.get("name", ""))
+                        for v in as_list(ni.get("vxlan-interface"))
+                        if isinstance(v, dict)
+                    ),
+                    # The EVI the service advertises with, which is also what a
+                    # virtual ethernet-segment names to say which
+                    # network-instance it serves.
+                    evis=tuple(bgp_evpn_evis(ni).values()),
+                    import_rts=_route_targets(bgp_vpn, "import"),
+                    export_rts=_route_targets(bgp_vpn, "export"),
+                    interfaces=tuple(interfaces),
+                )
+            )
+        return {"nwi_itfs": records}
 
     def get_lag(self, lag_id: str = "*") -> Dict[str, Any]:
         path_spec = {

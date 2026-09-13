@@ -8,7 +8,8 @@ disagree about the VNI of a service.
 The payloads, not the rendered tables, are what a check reads. A table exists to
 be looked at: its column names carry newlines and sort prefixes, and they are
 free to change when the display does. ``spec.getter(device)`` returns the same
-structure on every surface, so a check written against it holds on all three.
+structure on every surface - the records of :mod:`nornir_srl.records` where a
+report has them - so a check written against it holds on all three.
 
 Adding one means writing a function that takes a :class:`FabricState` and yields
 :class:`Finding` objects, then listing it in :data:`CHECKS` with the reports it
@@ -18,7 +19,6 @@ driven from that list.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
@@ -43,6 +43,8 @@ from .fabric import (
     out_of_band as _out_of_band,
     text as _text,
 )
+
+from .records import Neighbor
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime, types only
     from nornir.core import Nornir
@@ -101,46 +103,30 @@ class Check:
 #: no admin-state of its own to tell it apart by.
 _BGP_NOT_A_FAULT = {"", "disabled", "-"}
 
-#: The address-family columns of the peers report, and what they are called in
-#: a sentence.
-_BGP_FAMILIES = {
-    "U4\nR/A/T": "ipv4-unicast",
-    "U6\nR/A/T": "ipv6-unicast",
-    "EVPN\nR/A/T": "evpn",
-    "VPNv4\nR/A/T": "l3vpn-ipv4",
-    "VPNv6\nR/A/T": "l3vpn-ipv6",
-}
 
-#: An address family reads as "received/active/sent" when it is carrying
-#: routes, and as a single word when it is not.
-_ROUTE_COUNTS = re.compile(r"^(\d+)/(\d+)/(\d+)$")
-
-
-def _bgp_neighbors(state: FabricState) -> Iterator[Tuple[str, str, Dict[str, Any]]]:
+def _bgp_neighbors(state: FabricState) -> Iterator[Tuple[str, str, Neighbor]]:
     """Every BGP neighbour in the fabric, as (node, network-instance, peer)."""
-    for node, entry in state.items("bgp_peers"):
-        ni = str(entry.get("NI", ""))
-        for peer in _as_list(entry.get("Neighbors")):
-            if isinstance(peer, dict):
-                yield node, ni, peer
+    for node, entry, peer in state.sub_items("bgp_peers", "neighbors"):
+        yield node, entry.ni, peer
 
 
 def check_bgp_down(state: FabricState) -> List[Finding]:
     """A configured BGP session that is not established."""
     findings = []
     for node, ni, peer in _bgp_neighbors(state):
-        session = _text(peer.get("state"))
+        session = _text(peer.state)
         if session == "established" or session in _BGP_NOT_A_FAULT:
             continue
-        address = peer.get("1_peer", "?")
-        group = peer.get("group") or "-"
         findings.append(
             Finding(
                 check="bgp_down",
                 severity=ERROR,
                 node=node,
-                subject=f"{ni}/{address}",
-                detail=f"session is {session}, peer-group {group}, AS {peer.get('peer-as', '?')}",
+                subject=f"{ni}/{peer.peer or '?'}",
+                detail=(
+                    f"session is {session}, peer-group {peer.group or '-'}, "
+                    f"AS {peer.peer_as if peer.peer_as is not None else '?'}"
+                ),
             )
         )
     return findings
@@ -154,18 +140,18 @@ def check_bgp_af_down(state: FabricState) -> List[Finding]:
     """
     findings = []
     for node, ni, peer in _bgp_neighbors(state):
-        if _text(peer.get("state")) != "established":
+        if _text(peer.state) != "established":
             continue
-        for column, family in _BGP_FAMILIES.items():
-            if _text(peer.get(column)) != "down":
+        for family in peer.families:
+            if not family.enabled or _text(family.oper) != "down":
                 continue
             findings.append(
                 Finding(
                     check="bgp_af_down",
                     severity=ERROR,
                     node=node,
-                    subject=f"{ni}/{peer.get('1_peer', '?')}",
-                    detail=f"session established but {family} is down",
+                    subject=f"{ni}/{peer.peer or '?'}",
+                    detail=f"session established but {family.name} is down",
                 )
             )
     return findings
@@ -181,19 +167,18 @@ def check_bgp_no_routes(state: FabricState) -> List[Finding]:
     """
     findings = []
     for node, ni, peer in _bgp_neighbors(state):
-        if _text(peer.get("state")) != "established":
+        if _text(peer.state) != "established":
             continue
-        for column, family in _BGP_FAMILIES.items():
-            counts = _ROUTE_COUNTS.match(_text(peer.get(column)))
-            if not counts or counts.group(1) != "0":
+        for family in peer.families:
+            if not family.enabled or _text(family.oper) == "down" or family.received:
                 continue
             findings.append(
                 Finding(
                     check="bgp_no_routes",
                     severity=WARNING,
                     node=node,
-                    subject=f"{ni}/{peer.get('1_peer', '?')}",
-                    detail=f"{family} is up but has received no routes",
+                    subject=f"{ni}/{peer.peer or '?'}",
+                    detail=f"{family.name} is up but has received no routes",
                 )
             )
     return findings
@@ -469,23 +454,20 @@ def check_evpn_service_mismatch(state: FabricState) -> List[Finding]:
     """
     # vxlan-interface -> the VNI it sends on, per node.
     vnis: Dict[Tuple[str, str], Any] = {}
-    for node, entry in state.items("vxlan"):
-        vnis[(node, str(entry.get("vxlan-itf", "")))] = entry.get("ing-vni")
+    for node, vxlan in state.items("vxlan"):
+        vnis[(node, vxlan.name)] = vxlan.vni
 
     # Service name -> {node: what that node thinks the service looks like}.
     services: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    for node, entry in state.items("ni"):
-        name = str(entry.get("NI", ""))
-        kind = _text(entry.get("type"))
-        if kind not in ("mac-vrf", "ip-vrf"):
+    for node, instance in state.items("ni"):
+        if _text(instance.type) not in ("mac-vrf", "ip-vrf"):
             continue
-        interfaces = [
-            itf.strip() for itf in str(entry.get("vxlan-itf") or "").split(",") if itf.strip()
-        ]
-        services.setdefault(name, {})[node] = {
-            "vni": ", ".join(str(vnis.get((node, itf), "?")) for itf in interfaces),
-            "import-rt": _rt_set(entry.get("In-RT")),
-            "export-rt": _rt_set(entry.get("Out-RT")),
+        services.setdefault(instance.name, {})[node] = {
+            "vni": ", ".join(
+                str(vnis.get((node, overlay), "?")) for overlay in instance.overlays
+            ),
+            "import-rt": _rt_set(instance.import_rts),
+            "export-rt": _rt_set(instance.export_rts),
         }
 
     findings = []
@@ -520,11 +502,9 @@ def check_evpn_service_mismatch(state: FabricState) -> List[Finding]:
     return findings
 
 
-def _rt_set(value: Any) -> Sequence[str]:
+def _rt_set(targets: Sequence[str]) -> Sequence[str]:
     """Route-targets as a comparable set, however they were written."""
-    return sorted(
-        {rt.strip().removeprefix("target:") for rt in str(value or "").split(",") if rt.strip()}
-    )
+    return sorted({rt.strip().removeprefix("target:") for rt in targets if rt.strip()})
 
 
 def _describe(value: Any) -> str:
@@ -537,13 +517,6 @@ def _describe(value: Any) -> str:
 # ethernet segments
 # --------------------------------------------------------------------------- #
 
-#: How the ES report writes the designated-forwarder candidates of one
-#: network-instance, joined by ", " when a segment is in several:
-#: ``macvrf-101:[10.0.0.1 10.0.0.2(DF)], macvrf-202:[10.0.0.1(DF)]``. The comma
-#: is excluded from the name so the separator does not read as part of it.
-_ES_ASSOCIATION = re.compile(r"(?P<ni>[^:\[\],]+):\[(?P<peers>[^\]]*)\]")
-
-
 def check_es_df(state: FabricState) -> List[Finding]:
     """Ethernet segments without a working designated-forwarder election.
 
@@ -554,36 +527,39 @@ def check_es_df(state: FabricState) -> List[Finding]:
     findings = []
     modes: Dict[str, Dict[str, str]] = {}
 
-    for node, entry in state.items("es"):
-        name = str(entry.get("name", "?"))
-        esi = str(entry.get("esi", ""))
-        if esi:
-            modes.setdefault(esi, {})[node] = _text(entry.get("mh-mode"))
+    for node, segment in state.items("es"):
+        if segment.esi:
+            modes.setdefault(segment.esi, {})[node] = _text(segment.mh_mode)
 
-        if _text(entry.get("oper")) not in ("up", ""):
+        if _text(segment.oper) not in ("up", ""):
+            attached = " ".join(segment.interfaces) or " ".join(
+                nh.address for nh in segment.next_hops
+            )
             findings.append(
                 Finding(
                     check="es_df",
                     severity=ERROR,
                     node=node,
-                    subject=name,
-                    detail=f"segment is {_text(entry.get('oper'))} on {entry.get('itf/nh') or 'no interface'}",
+                    subject=segment.name or "?",
+                    detail=f"segment is {_text(segment.oper)} on {attached or 'no interface'}",
                 )
             )
 
-        for association in _ES_ASSOCIATION.finditer(str(entry.get("ni-peers") or "")):
-            peers = association.group("peers").split()
-            if any(peer.endswith("(DF)") for peer in peers):
+        for association in segment.associations:
+            if association.designated is not None:
                 continue
             findings.append(
                 Finding(
                     check="es_df",
                     severity=ERROR,
                     node=node,
-                    subject=f"{name}/{association.group('ni').strip()}",
+                    subject=f"{segment.name or '?'}/{association.ni}",
                     detail=(
                         "no designated forwarder elected among "
-                        + (" ".join(peers) if peers else "no candidates")
+                        + (
+                            " ".join(c.address for c in association.candidates)
+                            or "no candidates"
+                        )
                     ),
                 )
             )

@@ -11,6 +11,8 @@ import pytest
 from nornir_srl.connections.helpers import clean_structured_key
 from nornir_srl.connections.interfaces import NetworkInstanceMixin
 from nornir_srl.connections.routing import RoutingMixin
+from nornir_srl.records import Egress
+from nornir_srl.reports import ES_TABLE, IP_RIB_TABLE, bgp_rib_table
 
 # --------------------------------------------------------------------------- #
 # clean_structured_key
@@ -25,8 +27,8 @@ def test_clean_structured_key_strips_order_prefix():
 
 def test_clean_structured_key_collapses_newlines():
     assert clean_structured_key("AF: EVPN\nRx/Act/Tx") == "AF: EVPN Rx/Act/Tx"
-    assert clean_structured_key("U4 R/A/T") == "U4 R/A/T"
-    assert clean_structured_key("U4\nR/A/T") == "U4 R/A/T"
+    assert clean_structured_key("ipv4-unicast Rx/Act/Tx") == "ipv4-unicast Rx/Act/Tx"
+    assert clean_structured_key("ipv4-unicast\nRx/Act/Tx") == "ipv4-unicast Rx/Act/Tx"
     assert clean_structured_key("EVPN\nR/A/T") == "EVPN R/A/T"
 
 
@@ -153,15 +155,31 @@ def test_get_sum_bgp_includes_local_address_and_port():
         }
     ]
     dev = _FakeBgpPeers({"protocols/bgp/neighbor": neighbors})
-    peer = dev.get_sum_bgp()["bgp_peers"][0]["Neighbors"][0]
-    assert peer["1_peer"] == "10.0.0.2"
-    assert peer["2_local-address"] == "10.0.0.1"
-    assert peer["3_local-port"] == 179
+    peer = dev.get_sum_bgp()["bgp_peers"][0].neighbors[0]
+    assert peer.peer == "10.0.0.2"
+    assert peer.local_address == "10.0.0.1"
+    assert peer.local_port == 179
+    ipv4 = peer.family("ipv4-unicast")
+    assert (ipv4.enabled, ipv4.oper, ipv4.received, ipv4.active, ipv4.sent) == (
+        True, "up", 10, 8, 5,
+    )
+    assert peer.family("evpn") is None, "a family the session is not configured for"
 
 
 # --------------------------------------------------------------------------- #
 # get_bgp_rib path attributes (detail=True)
 # --------------------------------------------------------------------------- #
+
+
+def _bgp_row(out: Dict[str, Any], detail: bool = False) -> Dict[str, Any]:
+    """The first route of the first RIB returned, as the table shows it."""
+    rib = out["bgp_rib"][0]
+    return bgp_rib_table(rib.family, rib.route_type, detail).rows(rib)[0].values
+
+
+def _rib_row(out: Dict[str, Any]) -> Dict[str, Any]:
+    """The first route of the first route table returned, as the table shows it."""
+    return IP_RIB_TABLE.rows(out["ip_rib"][0])[0].values
 
 
 def test_get_bgp_rib_evpn_detail_attributes():
@@ -241,25 +259,40 @@ def test_get_bgp_rib_evpn_detail_attributes():
     ]
 
     dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "mac-ip-route": routes})
-    out = dev.get_bgp_rib(route_fam="evpn", route_type="2", detail=True)
-    rib = out["bgp_rib"]
-    assert len(rib) == 1
-    route = rib[0]["Rib"][0]
-    assert route["RT"] == "65000:100"
-    assert route["soo"] == "65000:1"
-    assert route["tunnel-encap"] == "MPLS"
-    assert route["dpath"] == "65000:1"
-    assert route["communities"] == (
+    out = dev.get_bgp_rib(route_fam="evpn", route_type="2")
+    assert len(out["bgp_rib"]) == 1
+    rib = out["bgp_rib"][0]
+    assert (rib.ni, rib.family, rib.route_type) == ("default", "evpn", "2")
+    route = rib.routes[0]
+    # The record carries every attribute, read apart from the communities.
+    assert route.route_targets == ("65000:100",)
+    assert route.soo == ("65000:1",)
+    assert route.tunnel_encap == ("MPLS",)
+    assert route.domain_path == ("65000:1",)
+    assert route.communities == ("65000:1",)
+    assert route.ext_communities == ("target:65000:100", "origin:65000:1", "bgp-tunnel-encap:MPLS")
+    assert (route.valid, route.best, route.used) == (True, True, True)
+    assert route.tie_break == "none"
+    assert route.internal_tags == ("tag-value = 0x1",)
+    assert route.neighbor_as == 65002
+    assert (route.mac, route.ip, route.vni, route.as_path) == ("1A:DC:0E:FF:00:41", "10.0.0.1", 100, (65000,))
+    # The detail table shows them.
+    row = _bgp_row(out, detail=True)
+    assert row["RT"] == "65000:100"
+    assert row["soo"] == "65000:1"
+    assert row["tunnel-encap"] == "MPLS"
+    assert row["dpath"] == "65000:1"
+    assert row["communities"] == (
         "65000:1, target:65000:100, origin:65000:1, bgp-tunnel-encap:MPLS"
     )
-    assert route["valid"] is True and route["best"] is True and route["used"] is True
-    assert route["tie-break"] == "none"
-    assert route["internal-tags"] == ["tag-value = 0x1"]
-    assert route["neighbor-as"] == 65002
+    assert row["valid"] is True and row["best"] is True and row["used"] is True
+    assert row["tie-break"] == "none"
+    assert row["internal-tags"] == ["tag-value = 0x1"]
+    assert row["neighbor-as"] == 65002
 
 
 def test_get_bgp_rib_evpn_lean_has_communities_not_detail_attrs():
-    """Lean projection carries communities; other detail-only fields stay out."""
+    """The lean table carries communities; the detail-only columns stay out."""
     attr_sets = [
         {
             "network-instance": [
@@ -307,11 +340,11 @@ def test_get_bgp_rib_evpn_lean_has_communities_not_detail_attrs():
         }
     ]
     dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "mac-ip-route": routes})
-    out = dev.get_bgp_rib(route_fam="evpn", route_type="2", detail=False)
-    route = out["bgp_rib"][0]["Rib"][0]
-    assert route["communities"] == ""
-    assert "soo" not in route
-    assert "dpath" not in route
+    out = dev.get_bgp_rib(route_fam="evpn", route_type="2")
+    row = _bgp_row(out)
+    assert row["communities"] == ""
+    assert "soo" not in row
+    assert "dpath" not in row
 
 
 def test_get_bgp_rib_evpn_type5_reports_the_esi():
@@ -369,12 +402,15 @@ def test_get_bgp_rib_evpn_type5_reports_the_esi():
         }
     ]
     dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "ip-prefix-route": routes})
-    route = dev.get_bgp_rib(route_fam="evpn", route_type="5", detail=False)["bgp_rib"][
-        0
-    ]["Rib"][0]
-    assert route["ESI"] == "01:24:00:00:00:00:00:00:00:01"
-    assert route["IP-Pfx"] == "10.0.1.0/24"
-    assert route["GW"] == "0.0.0.0"
+    out = dev.get_bgp_rib(route_fam="evpn", route_type="5")
+    route = out["bgp_rib"][0].routes[0]
+    assert (route.esi, route.prefix, route.gateway) == (
+        "01:24:00:00:00:00:00:00:00:01", "10.0.1.0/24", "0.0.0.0",
+    )
+    row = _bgp_row(out)
+    assert row["ESI"] == "01:24:00:00:00:00:00:00:00:01"
+    assert row["IP-Pfx"] == "10.0.1.0/24"
+    assert row["GW"] == "0.0.0.0"
 
 
 def test_get_bgp_rib_l3vpn_ipv4_alias_and_columns():
@@ -437,13 +473,14 @@ def test_get_bgp_rib_l3vpn_ipv4_alias_and_columns():
         }
     ]
     dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "local-rib/route": routes})
-    out = dev.get_bgp_rib(route_fam="l3vpn-v4", detail=False)
-    route = out["bgp_rib"][0]["Rib"][0]
-    assert route["RD"] == "65000:1"
-    assert route["Pfx"] == "172.16.1.0/24"
-    assert route["neighbor"] == "10.0.0.6"
-    assert route["0_st"] == "u*>"
-    assert route["communities"] == ""
+    out = dev.get_bgp_rib(route_fam="l3vpn-v4")
+    assert out["bgp_rib"][0].family == "l3vpn-ipv4-unicast"
+    row = _bgp_row(out)
+    assert row["RD"] == "65000:1"
+    assert row["Pfx"] == "172.16.1.0/24"
+    assert row["neighbor"] == "10.0.0.6"
+    assert row["st"] == "u*>"
+    assert row["communities"] == ""
 
 
 def test_get_bgp_rib_l3vpn_detail_includes_communities():
@@ -503,8 +540,8 @@ def test_get_bgp_rib_l3vpn_detail_includes_communities():
         }
     ]
     dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "local-rib/route": routes})
-    route = dev.get_bgp_rib(route_fam="l3vpn-v4", detail=True)["bgp_rib"][0]["Rib"][0]
-    assert route["communities"] == "65000:100, 65000:1:2, target:65000:200"
+    row = _bgp_row(dev.get_bgp_rib(route_fam="l3vpn-v4"), detail=True)
+    assert row["communities"] == "65000:100, 65000:1:2, target:65000:200"
 
 
 def _ip_rib_payloads(afi: str, prefix: str, communities: Dict[str, Any]):
@@ -573,12 +610,7 @@ def _ip_rib_payloads(afi: str, prefix: str, communities: Dict[str, Any]):
     ],
 )
 def test_get_bgp_rib_ip_lean_has_communities(route_fam, afi, prefix):
-    """The IP-family lean projection carries communities, as EVPN and L3VPN do.
-
-    Guards the JMESPath itself as much as the field: these projections are built
-    as plain strings rather than f-strings, so a brace count copied from the
-    f-string variants makes the whole expression unparseable.
-    """
+    """The IP-family lean table carries communities, as EVPN and L3VPN do."""
     attr_sets, routes = _ip_rib_payloads(
         afi,
         prefix,
@@ -589,24 +621,24 @@ def test_get_bgp_rib_ip_lean_has_communities(route_fam, afi, prefix):
         },
     )
     dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "local-rib/route": routes})
-    route = dev.get_bgp_rib(route_fam=route_fam, detail=False)["bgp_rib"][0]["Rib"][0]
-    assert route["Prefix"] == prefix
-    assert route["communities"] == "65000:100, 65000:1:2, target:65000:200"
-    # Lean means lean: the detail-only path attributes stay out.
-    assert "valid" not in route
-    assert "soo" not in route
+    row = _bgp_row(dev.get_bgp_rib(route_fam=route_fam))
+    assert row["Prefix"] == prefix
+    assert row["communities"] == "65000:100, 65000:1:2, target:65000:200"
+    # Lean means lean: the detail-only path attributes stay out of the table.
+    assert "valid" not in row
+    assert "soo" not in row
 
 
 def test_get_bgp_rib_ip_detail_keeps_communities_and_adds_attrs():
-    """``detail=True`` extends the IP projection without displacing communities."""
+    """The detail table extends the IP columns without displacing communities."""
     attr_sets, routes = _ip_rib_payloads(
         "ipv4-unicast", "10.10.0.0/24", {"community": ["65000:100"]}
     )
     dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "local-rib/route": routes})
-    route = dev.get_bgp_rib(route_fam="ipv4", detail=True)["bgp_rib"][0]["Rib"][0]
-    assert route["communities"] == "65000:100"
-    assert route["valid"] is True
-    assert route["best"] is True
+    row = _bgp_row(dev.get_bgp_rib(route_fam="ipv4"), detail=True)
+    assert row["communities"] == "65000:100"
+    assert row["valid"] is True
+    assert row["best"] is True
 
 
 def test_get_bgp_rib_l3vpn_returns_empty_when_rib_path_absent():
@@ -1335,7 +1367,7 @@ def _rib_device() -> "_FakeRouting":
 
 
 def _prefixes(out: Dict[str, Any]) -> List[str]:
-    return [route["Prefix"] for route in out["ip_rib"][0]["Rib"]]
+    return [route.prefix for route in out["ip_rib"][0].routes]
 
 
 def test_get_rib_narrows_to_the_prefix_an_address_falls_into():
@@ -1454,10 +1486,13 @@ def test_get_rib_follows_an_indirect_next_hop_to_the_egress_interface():
         },
     )
 
-    route = device.get_rib(afi="ipv4-unicast")["ip_rib"][0]["Rib"][0]
-
-    assert route["next-hop"] == ["10.1.5.0/31 (indirect)"]
-    assert route["itf"] == ["ethernet-1/3.1"]
+    out = device.get_rib(afi="ipv4-unicast")
+    next_hop = out["ip_rib"][0].routes[0].next_hops[0]
+    assert (next_hop.type, next_hop.resolving_route) == ("indirect", "10.1.5.0/31")
+    assert next_hop.egress == (Egress("interface", "ethernet-1/3.1"),)
+    row = _rib_row(out)
+    assert row["next-hop"] == ["10.1.5.0/31 (indirect)"]
+    assert row["itf"] == ["ethernet-1/3.1"]
 
 
 def test_get_rib_follows_an_indirect_ipv6_next_hop_to_the_egress_interface():
@@ -1475,9 +1510,7 @@ def test_get_rib_follows_an_indirect_ipv6_next_hop_to_the_egress_interface():
         },
     )
 
-    route = device.get_rib(afi="ipv6-unicast")["ip_rib"][0]["Rib"][0]
-
-    assert route["itf"] == ["ethernet-1/3.1"]
+    assert _rib_row(device.get_rib(afi="ipv6-unicast"))["itf"] == ["ethernet-1/3.1"]
 
 
 def test_get_rib_names_the_resolving_route_when_it_leads_to_no_interface():
@@ -1493,9 +1526,9 @@ def test_get_rib_names_the_resolving_route_when_it_leads_to_no_interface():
         nhs={"200": _indirect("10.1.5.1", "10.1.5.0/31", via="742")},
     )
 
-    route = device.get_rib(afi="ipv4-unicast")["ip_rib"][0]["Rib"][0]
-
-    assert route["itf"] == ["10.1.5.0/31"]
+    out = device.get_rib(afi="ipv4-unicast")
+    assert out["ip_rib"][0].routes[0].next_hops[0].egress == (Egress("route", "10.1.5.0/31"),)
+    assert _rib_row(out)["itf"] == ["10.1.5.0/31"]
 
 
 def test_get_rib_reports_the_tunnel_of_an_overlay_next_hop():
@@ -1524,9 +1557,11 @@ def test_get_rib_reports_the_tunnel_of_an_overlay_next_hop():
         },
     )
 
-    route = device.get_rib(afi="ipv4-unicast")["ip_rib"][0]["Rib"][0]
-
-    assert route["itf"] == ["vxlan:192.168.255.2/32"]
+    out = device.get_rib(afi="ipv4-unicast")
+    assert out["ip_rib"][0].routes[0].next_hops[0].egress == (
+        Egress("tunnel", "192.168.255.2/32", tunnel="vxlan"),
+    )
+    assert _rib_row(out)["itf"] == ["vxlan:192.168.255.2/32"]
 
 
 def test_get_rib_resolves_a_next_hop_group_in_another_network_instance():
@@ -1553,10 +1588,9 @@ def test_get_rib_resolves_a_next_hop_group_in_another_network_instance():
         nh_ni="default",
     )
 
-    route = device.get_rib(afi="ipv4-unicast")["ip_rib"][0]["Rib"][0]
-
-    assert route["next-hop"] == ["10.0.0.1"]
-    assert route["itf"] == ["ethernet-1/1.0"]
+    row = _rib_row(device.get_rib(afi="ipv4-unicast"))
+    assert row["next-hop"] == ["10.0.0.1"]
+    assert row["itf"] == ["ethernet-1/1.0"]
 
 
 class _RecordingLayer2:
@@ -1789,13 +1823,18 @@ def test_get_es_reports_the_evi_a_virtual_segment_is_tied_to():
     """A virtual ES has no port, and the EVI under its next-hop names its ip-vrf."""
     dev = _es_device({"ethernet-segments": _ves_payload()})
 
-    rows = {r["name"]: r for r in dev.get_es()["es"]}
+    segments = {es.name: es for es in dev.get_es()["es"]}
 
-    assert rows["L3-ES-1"]["itf/nh"] == "10.1.100.254"
-    assert rows["L3-ES-1"]["evi"] == "2"
+    virtual = segments["L3-ES-1"]
+    assert virtual.interfaces == ()
+    assert [(nh.address, nh.evis) for nh in virtual.next_hops] == [("10.1.100.254", ("2",))]
     # A port-based segment is not tied to a service by an EVI at all.
-    assert rows["ES-01"]["itf/nh"] == "lag1"
-    assert rows["ES-01"]["evi"] == ""
+    port = segments["ES-01"]
+    assert port.interfaces == ("lag1",) and port.next_hops == ()
+    # ...and the table shows one column for both.
+    rows = {row.values["name"]: row.values for row in ES_TABLE.rows(virtual) + ES_TABLE.rows(port)}
+    assert (rows["L3-ES-1"]["itf/nh"], rows["L3-ES-1"]["evi"]) == ("10.1.100.254", "2")
+    assert (rows["ES-01"]["itf/nh"], rows["ES-01"]["evi"]) == ("lag1", "")
 
 
 def test_get_es_names_the_next_hop_of_each_evi_only_when_they_differ():
@@ -1809,12 +1848,12 @@ def test_get_es_names_the_next_hop_of_each_evi_only_when_they_differ():
         {"l3-next-hop": "10.1.200.254", "evi": [{"start": 2}]},
     ]
     dev = _es_device({"ethernet-segments": payload})
-    assert dev.get_es()["es"][0]["evi"] == "2"
+    assert ES_TABLE.rows(dev.get_es()["es"][0])[0].values["evi"] == "2"
 
     segment["next-hop"][1]["evi"] = [{"start": 3}]
     dev = _es_device({"ethernet-segments": payload})
     assert (
-        dev.get_es()["es"][0]["evi"] == "10.1.100.254:2 10.1.200.254:3"
+        ES_TABLE.rows(dev.get_es()["es"][0])[0].values["evi"] == "10.1.100.254:2 10.1.200.254:3"
     )
 
 
@@ -2586,20 +2625,20 @@ def test_get_nwi_itf_joins_subinterface_details_onto_network_instances():
         {"subinterface": _SUBITF_RESPONSE, "network-instance": ni_response}
     )
 
-    rows = device.get_nwi_itf()["nwi_itfs"]
+    instances = device.get_nwi_itf()["nwi_itfs"]
 
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["NI"] == "ip-vrf-1"
-    assert row["oper"] == "up"
-    assert row["In-RT"] == "65000:1"
-    assert row["Out-RT"] == "65000:1"
-    by_name = {i["Subitf"]: i for i in row["itfs"]}
-    assert by_name["ethernet-1/10.0"]["ip-prefix"] == ["192.168.1.1/30"]
-    assert by_name["ethernet-1/10.0"]["mtu"] == 1500
+    assert len(instances) == 1
+    instance = instances[0]
+    assert instance.name == "ip-vrf-1"
+    assert instance.oper == "up"
+    assert instance.import_rts == ("65000:1",)
+    assert instance.export_rts == ("65000:1",)
+    by_name = {i.name: i for i in instance.interfaces}
+    assert by_name["ethernet-1/10.0"].prefixes == ("192.168.1.1/30",)
+    assert by_name["ethernet-1/10.0"].mtu == 1500
     # An IRB carries an l2-mtu rather than an ip-mtu.
-    assert by_name["irb1.100"]["mtu"] == 9000
-    assert by_name["irb1.100"]["if-oper"] == "up"
+    assert by_name["irb1.100"].mtu == 9000
+    assert by_name["irb1.100"].oper == "up"
 
 
 def test_get_nwi_itf_reports_the_bgp_evpn_evi_of_each_instance():
@@ -2635,12 +2674,12 @@ def test_get_nwi_itf_reports_the_bgp_evpn_evi_of_each_instance():
         {"subinterface": _SUBITF_RESPONSE, "network-instance": ni_response}
     )
 
-    rows = {r["NI"]: r for r in device.get_nwi_itf()["nwi_itfs"]}
+    instances = {ni.name: ni for ni in device.get_nwi_itf()["nwi_itfs"]}
 
-    assert rows["mac-vrf-100"]["evi"] == "100"
-    assert rows["ipvrf-l3dci"]["evi"] == "2, 3000"
+    assert instances["mac-vrf-100"].evis == ("100",)
+    assert instances["ipvrf-l3dci"].evis == ("2", "3000")
     # An instance that runs no EVPN has no EVI to show.
-    assert rows["default"]["evi"] == ""
+    assert instances["default"].evis == ()
 
 
 def test_get_nwi_itf_records_the_other_network_instance_an_irb_is_in():
@@ -2667,10 +2706,10 @@ def test_get_nwi_itf_records_the_other_network_instance_an_irb_is_in():
         {"subinterface": _SUBITF_RESPONSE, "network-instance": ni_response}
     )
 
-    rows = {r["NI"]: r for r in device.get_nwi_itf()["nwi_itfs"]}
+    instances = {ni.name: ni for ni in device.get_nwi_itf()["nwi_itfs"]}
 
-    assert rows["ip-vrf-1"]["itfs"][0]["assoc-ni"] == "mac-vrf-100"
-    assert rows["mac-vrf-100"]["itfs"][0]["assoc-ni"] == "ip-vrf-1"
+    assert instances["ip-vrf-1"].interfaces[0].associated == ("mac-vrf-100",)
+    assert instances["mac-vrf-100"].interfaces[0].associated == ("ip-vrf-1",)
 
 
 def test_get_nwi_itf_accepts_a_single_network_instance_as_a_bare_dict():
@@ -2714,10 +2753,10 @@ def test_get_nwi_itf_reads_route_targets_from_import_and_export_policies():
         {"subinterface": _SUBITF_RESPONSE, "network-instance": ni_response}
     )
 
-    row = device.get_nwi_itf()["nwi_itfs"][0]
+    instance = device.get_nwi_itf()["nwi_itfs"][0]
 
-    assert row["In-RT"] == "import-all"
-    assert row["Out-RT"] == "export-a, export-b"
+    assert instance.import_rts == ("import-all",)
+    assert instance.export_rts == ("export-a", "export-b")
 
 
 def test_get_lag_shortens_member_interface_names():

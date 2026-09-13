@@ -128,7 +128,7 @@ _FILTER_PROPS: Dict[str, Any] = {
         "type": "string",
         "description": (
             "Row filter as comma-separated field=regex pairs "
-            "(e.g. 'session-state=established'). Values are case-insensitive regexes."
+            "(e.g. 'state=up'). Values are case-insensitive regexes."
         ),
     },
 }

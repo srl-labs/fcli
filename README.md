@@ -464,7 +464,7 @@ Two kinds of filter, plus report-specific options:
 MAC entries on leafs in `macvrf-202` matching `1A:DC`:
 
 ```
-fcli -i role=leaf mac -f NI=macvrf-202 -f Address="1A:DC:*"
+fcli -i role=leaf mac -f NI=macvrf-202 -f mac="1A:DC:*"
 ```
 
 BGP peers that are not established:
@@ -473,7 +473,7 @@ BGP peers that are not established:
 fcli bgp-peers -f state=active
 ```
 
-Column headers use two lines in the live table (AFI label, then **R/A/T**). **U4** / **U6** = IPv4/IPv6 unicast, **EVPN**, **VPNv4** / **VPNv6** = L3VPN address families (values are received / active / sent, `disabled`, `down`, or `-`). JSON/YAML/CSV keys collapse the newline to a single space.
+Column headers use two lines in the live table: the address family as SR Linux names it (`evpn`, `ipv4-unicast`, `ipv6-unicast`, `l3vpn-ipv4-unicast`, `l3vpn-ipv6-unicast`), then **Rx/Act/Tx** (routes received / active / sent). A family shows its counts, or `disabled`, `down`, or `-` when the session is not configured for it. A `state` of `up` is an established session; the other values are BGP's own (`active`, `idle`, `connect`...). CSV keys collapse the header newline to a single space; `-o json` / `-o yaml` emit the records, where each family is an object and `state` is the session state as the device reports it (`established`).
 
 LPM lookup for `192.168.0.7` across every network-instance:
 
@@ -589,7 +589,7 @@ One registry drives all three surfaces, so a report cannot drift between CLI, MC
 | Sub-Interfaces | `subif` | yes | Type, addresses, oper-state |
 | LAGs | `lag` | yes | LAG members and LACP |
 | Network Instances | `ni` | yes | NIs, their EVPN EVI and the interfaces bound to them |
-| BGP Peers | `bgp-peers` | yes | Session state and per-AF R/A/T |
+| BGP Peers | `bgp-peers` | yes | Session state and per-AF Rx/Act/Tx route counts |
 | BGP RIB | `bgp-rib -r …` | split per family / EVPN type | RIB-in-post with path attributes |
 | IPv4 / IPv6 RIB | `ipv4-rib`, `ipv6-rib` | yes | Route table with resolved next-hops; `-a` for LPM |
 | Static Routes | `static-routes` | yes | Configured statics and their state |
@@ -607,6 +607,8 @@ One registry drives all three surfaces, so a report cannot drift between CLI, MC
 | ARP Table | `arp` | yes | IPv4 neighbours per sub-interface |
 | IPv6 Neighbors | `nd` | yes | ND entries per sub-interface |
 | Checks | `checks` | yes | Fabric sanity checks, worst first; exits non-zero on an error |
+
+A getter and the table it renders as are being split apart, one report at a time. For `ni`, `bgp-peers`, `mac`, `es`, `vxlan`, `ipv4-rib`, `ipv6-rib` and `bgp-rib` the getter returns records (`nornir_srl/records.py`) — a network-instance with its subinterfaces as a list, a BGP neighbour with each address family as an object carrying its route counts, a bridge-table entry with its destination already read apart into interface, VTEP, VNI or ESI, a route with each next-hop resolved to the interface, tunnel or prefix it leaves through, a BGP route with every path attribute and the route-targets, SoO and tunnel encapsulation read out of its communities — and the table is declared next to the report as the columns that read a record. `bgp-rib` has one table per family and EVPN route type, and `--detail` only adds columns to it: the records always carry everything. For those reports `-o json` and `-o yaml`, like the MCP tools, emit the records rather than the table's cells (`"families": [{"name": "evpn", "received": 74, ...}]` instead of `"evpn Rx/Act/Tx": "74/0/94"`); the table and `-o csv` are unchanged. The checks and lenses read the same records, so nothing downstream parses a cell back apart. The other reports still emit their table rows until they are converted.
 
 ## Lenses
 

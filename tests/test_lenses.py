@@ -35,14 +35,12 @@ from nornir_srl.lenses import (
     Interface,
     Service,
     Sighting,
-    as_dict,
     get_lens,
     lens_path,
     lens_service,
     lens_where,
-    parse_destination,
-    parse_vteps,
 )
+from nornir_srl.records import BridgeTable, Egress, MacEntry, Route, RouteNextHop, RouteTable, as_dict
 from nornir_srl.reports import REPORTS_BY_NAME
 from tests.system.replay import Recording, recording_paths
 
@@ -94,50 +92,6 @@ def _with(hops: List[Hop], outcome: str) -> List[Hop]:
 
 
 # --------------------------------------------------------------------------- #
-# reading the pre-formatted payloads apart again
-# --------------------------------------------------------------------------- #
-
-
-def test_destination_reads_a_local_subinterface():
-    dest = parse_destination("lag1.100")
-    assert (dest.kind, dest.via, dest.local) == ("local", "lag1.100", True)
-
-
-def test_destination_reads_an_irb_entry():
-    assert parse_destination("irb-interface").local
-
-
-def test_destination_reads_a_vtep():
-    dest = parse_destination("vxlan-interface:vxlan1.101 vtep:192.168.255.2 vni:101")
-    assert (dest.kind, dest.via, dest.overlay, dest.vni) == (
-        "vtep",
-        "192.168.255.2",
-        "vxlan1.101",
-        "101",
-    )
-    assert not dest.local
-
-
-def test_destination_reads_an_ethernet_segment():
-    dest = parse_destination(
-        "vxlan-interface:vxlan1.101 esi:00:01:03:00:00:00:66:00:01:03"
-    )
-    assert dest.kind == "esi"
-    assert dest.via == "00:01:03:00:00:00:66:00:01:03"
-
-
-def test_destination_of_nothing_is_unknown():
-    assert parse_destination("").kind == "unknown"
-
-
-def test_vteps_read_the_destination_list():
-    assert parse_vteps("(192.168.255.2, 101), (192.168.255.3, 101)") == [
-        ("192.168.255.2", "101"),
-        ("192.168.255.3", "101"),
-    ]
-
-
-# --------------------------------------------------------------------------- #
 # where
 # --------------------------------------------------------------------------- #
 
@@ -156,9 +110,9 @@ def _a_remote_mac(state: FabricState) -> str:
     The generated MACs differ between one lab deploy and the next, so which one
     it is cannot be written down - only that there is one.
     """
-    for _node, _ni, entry in state.sub_items("mac", "Fib"):
-        if parse_destination(entry.get("Dest")).kind == "vtep":
-            return str(entry["Address"])
+    for _node, _table, entry in state.sub_items("mac", "entries"):
+        if entry.vtep:
+            return entry.address
     pytest.skip("this recording has no MAC learned over the overlay")
 
 
@@ -200,12 +154,16 @@ def test_where_needs_something_to_look_for(state: FabricState):
         lens_where(state, "")
 
 
+def _bridge_table(mac: str, port: str) -> BridgeTable:
+    return BridgeTable("subnet-1", (MacEntry.read(mac, port, "learnt"),))
+
+
 def _two_leaves_owning(mac: str) -> FabricState:
     state = FabricState()
     state.hostnames = {"l1": "l1", "l2": "l2"}
     state.reports = {
         "mac": {
-            node: [{"NI": "subnet-1", "Fib": [{"Address": mac, "Dest": port, "Type": "learnt"}]}]
+            node: [_bridge_table(mac, port)]
             for node, port in (("l1", "lag1.100"), ("l2", "lag7.100"))
         },
         "arp": {},
@@ -234,16 +192,7 @@ def test_where_does_not_call_one_node_a_duplicate():
     state = FabricState()
     state.hostnames = {"l1": "l1"}
     state.reports = {
-        "mac": {
-            "l1": [
-                {
-                    "NI": "subnet-1",
-                    "Fib": [
-                        {"Address": "00:C1:AB:00:01:21", "Dest": "lag1.100", "Type": "learnt"}
-                    ],
-                }
-            ]
-        },
+        "mac": {"l1": [_bridge_table("00:C1:AB:00:01:21", "lag1.100")]},
         "arp": {},
         "nd": {},
         "es": {},
@@ -331,6 +280,14 @@ def test_path_starts_from_an_attached_address(state: FabricState):
     assert _at_hop(hops, 1)[0].node == LEAF
 
 
+def _via(address: str, *egress: Egress) -> RouteNextHop:
+    return RouteNextHop(address=address, type="direct", egress=egress)
+
+
+def _route(prefix: str, kind: str, *next_hops: RouteNextHop) -> Route:
+    return Route(prefix=prefix, type=kind, active=True, next_hops=next_hops)
+
+
 def _leaf_and_dcgw() -> FabricState:
     """A leaf whose VRF route resolves over VXLAN to a DCGW that owns the VTEP.
 
@@ -343,56 +300,18 @@ def _leaf_and_dcgw() -> FabricState:
     state.reports = {
         "ipv4_rib": {
             "leaf1": [
-                {
-                    "NI": "ipvrf-l3dci",
-                    "Rib": [
-                        {
-                            "Prefix": "10.200.2.0/24",
-                            "type": "bgp",
-                            "Act": "yes",
-                            "next-hop": "192.168.255.2",
-                            "itf": "vxlan:192.168.255.2",
-                        },
-                    ],
-                },
-                {
-                    "NI": "default",
-                    "Rib": [
-                        {
-                            "Prefix": "192.168.255.2/32",
-                            "type": "bgp",
-                            "Act": "yes",
-                            "next-hop": "192.168.255.2",
-                            "itf": "ethernet-1/49.0",
-                        },
-                    ],
-                },
+                RouteTable(
+                    "ipvrf-l3dci",
+                    (_route("10.200.2.0/24", "bgp", _via("192.168.255.2", Egress("tunnel", "192.168.255.2/32", tunnel="vxlan"))),),
+                ),
+                RouteTable(
+                    "default",
+                    (_route("192.168.255.2/32", "bgp", _via("192.168.255.2", Egress("interface", "ethernet-1/49.0"))),),
+                ),
             ],
             "dcgw1": [
-                {
-                    "NI": "default",
-                    "Rib": [
-                        {
-                            "Prefix": "192.168.255.2/32",
-                            "type": "host",
-                            "Act": "yes",
-                            "next-hop": "",
-                            "itf": "system0.0",
-                        },
-                    ],
-                },
-                {
-                    "NI": "ipvrf-l3dci",
-                    "Rib": [
-                        {
-                            "Prefix": "10.200.2.0/24",
-                            "type": "local",
-                            "Act": "yes",
-                            "next-hop": "",
-                            "itf": "irb0.2",
-                        },
-                    ],
-                },
+                RouteTable("default", (_route("192.168.255.2/32", "host", _via("", Egress("interface", "system0.0"))),)),
+                RouteTable("ipvrf-l3dci", (_route("10.200.2.0/24", "local", _via("", Egress("interface", "irb0.2"))),)),
             ],
         },
         "ipv6_rib": {"leaf1": [], "dcgw1": []},
@@ -460,9 +379,9 @@ def test_path_reports_a_loop_with_the_steps_it_took():
     """Two nodes each routing the destination to the other."""
     state = FabricState()
     state.hostnames = {"a": "a", "b": "b"}
-    route = {"Prefix": "10.9.9.0/24", "type": "static", "Act": "yes", "itf": "ethernet-1/1.0"}
+    route = _route("10.9.9.0/24", "static", _via("", Egress("interface", "ethernet-1/1.0")))
     state.reports = {
-        "ipv4_rib": {node: [{"NI": "default", "Rib": [route]}] for node in ("a", "b")},
+        "ipv4_rib": {node: [RouteTable("default", (route,))] for node in ("a", "b")},
         "ipv6_rib": {},
         "lldp": {
             "a": [{"interface": "ethernet-1/1", "Neighbors": [{"Nbr-System": "b", "Nbr-port": "ethernet-1/1"}]}],
@@ -549,7 +468,7 @@ def test_a_row_holds_the_node_and_every_declared_column(state: FabricState):
 def test_a_remote_sighting_reads_its_overlay():
     remote = Sighting(
         "l1", "subnet-1", "remote", "00:C1:AB:00:01:21",
-        vtep="192.168.255.3", origin="evpn", overlay="vxlan1.101", vni="101",
+        vtep="192.168.255.3", origin="evpn", overlay="vxlan1.101", vni=101,
     )
     row = WHERE.row(remote)
     assert row["Node"] == "l1"
@@ -652,7 +571,7 @@ def test_every_hop_outcome_has_a_detail():
 def test_a_service_row_joins_its_lists_and_counts_its_macs():
     service = Service(
         node="l1", ni="subnet-1", type="mac-vrf", oper="up", evis=("101",),
-        vnis=("101",), import_rts=("target:100:101",), export_rts=("target:100:101",),
+        vnis=(101,), import_rts=("target:100:101",), export_rts=("target:100:101",),
         interfaces=(Interface("lag1.100", "up"), Interface("irb0.1", "down")),
         bound=("ipvrf-1",), vteps=("192.168.255.2", "192.168.255.3"),
         local_macs=2, remote_macs=3, segments=("ES-1",),
@@ -677,7 +596,7 @@ def test_a_service_with_no_macs_leaves_the_count_blank():
 def test_a_long_list_says_how_much_it_left_out():
     service = Service(
         node="l1", ni="subnet-1", type="mac-vrf", oper="up", evis=("101",),
-        vnis=("101",), import_rts=(), export_rts=(), interfaces=(), bound=(),
+        vnis=(101,), import_rts=(), export_rts=(), interfaces=(), bound=(),
         vteps=tuple(f"192.168.255.{n}" for n in range(2, 9)),
         local_macs=0, remote_macs=0, segments=(),
     )
@@ -692,7 +611,7 @@ def test_a_long_list_says_how_much_it_left_out():
 def test_a_record_is_a_plain_object_with_its_lists_intact():
     service = Service(
         node="l1", ni="subnet-1", type="mac-vrf", oper="up", evis=("101",),
-        vnis=("101",), import_rts=(), export_rts=(),
+        vnis=(101,), import_rts=(), export_rts=(),
         interfaces=(Interface("lag1.100", "up"),), bound=(),
         vteps=("192.168.255.2", "192.168.255.3"), local_macs=2, remote_macs=3,
         segments=(),

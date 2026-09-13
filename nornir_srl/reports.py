@@ -21,13 +21,23 @@ in :attr:`ReportSpec.params` as well: the CLI and MCP surfaces name their own
 options and tool arguments, but the browser has nothing to go on but the report
 registry, so a parameter it is meant to collect has to describe and validate
 itself.
+
+A report whose getter returns records (:mod:`nornir_srl.records`) declares the
+:class:`~nornir_srl.rows.Table` that renders them in :attr:`ReportSpec.table`,
+so the getter says what it found and the table says what that is called on a
+screen. The tables live here next to the specs, and are the only place a
+column name is written.
 """
 
 from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple, Union
+
+from .connections.routing import BGP_RIB_ROUTE_FAM_ALIASES
+from .records import BgpRoute, EthernetSegment, Neighbor, Route, VxlanInterface
+from .rows import Column, Table
 
 CLI = "cli"
 MCP = "mcp"
@@ -144,6 +154,12 @@ class ReportSpec:
     #: then reads as one row gone and another arrived, rather than as a row
     #: that changed.
     key_columns: Tuple[str, ...] = ()
+    #: How the getter's records read as rows, or - where that depends on the
+    #: parameters the report was run with, as a BGP RIB's columns depend on
+    #: the family - a function of those parameters. A report without one
+    #: returns items that :mod:`nornir_srl.rows` flattens by the fields they
+    #: carry.
+    table: Union[None, Table, Callable[[Mapping[str, Any]], Table]] = None
 
     @property
     def tool_name(self) -> str:
@@ -152,6 +168,12 @@ class ReportSpec:
 
     def on(self, surface: str) -> bool:
         return surface in self.surfaces
+
+    def table_for(self, params: Optional[Mapping[str, Any]] = None) -> Optional[Table]:
+        """The table that renders this report's records, run with *params*."""
+        if self.table is None or isinstance(self.table, Table):
+            return self.table
+        return self.table(params or {})
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -228,6 +250,344 @@ def _lpm_param(example: str) -> ParamSpec:
     )
 
 
+# --------------------------------------------------------------------------- #
+# the tables of the reports that return records
+# --------------------------------------------------------------------------- #
+#
+# Columns are in the order they read. For a converted report that order was
+# inherited from the old flattening, which sorted a sub-record's fields
+# alphabetically, so it is not always the order one would choose: moving a
+# column is a matter of moving a line, and reordering the ``columns`` list of
+# the ``bgp_peers`` entry in each release recording that pins the table
+# (``tests/fixtures/releases``), as was done to put ``state`` after ``peer``.
+
+
+def _joined(values: Any, sep: str = ", ") -> str:
+    return sep.join(str(v) for v in values)
+
+
+def _listed(values: Any) -> Any:
+    """A list cell, or nothing at all rather than an empty list."""
+    return list(values) or ""
+
+
+def _ni_associated(record: Any) -> str:
+    return " ".join(record.associated)
+
+
+NI_TABLE = Table(
+    columns=(
+        Column("NI", "name"),
+        Column("oper", "oper"),
+        Column("type", "type"),
+        Column("router-id", "router_id"),
+        Column("vxlan-itf", lambda ni: _joined(ni.overlays)),
+        Column("evi", lambda ni: _joined(ni.evis)),
+        Column("In-RT", lambda ni: _joined(ni.import_rts)),
+        Column("Out-RT", lambda ni: _joined(ni.export_rts)),
+    ),
+    each="interfaces",
+    each_columns=(
+        Column("Subitf", "name"),
+        Column("assoc-ni", _ni_associated),
+        Column("if-oper", "oper"),
+        Column("ip-prefix", lambda itf: _listed(itf.prefixes)),
+        Column("mtu", "mtu"),
+        Column("vlan", "vlan"),
+    ),
+)
+
+
+def _family_cell(name: str) -> Callable[[Neighbor], str]:
+    """``received/active/sent`` for a family, or the one word that says why not."""
+
+    def cell(neighbor: Neighbor) -> str:
+        family = neighbor.family(name)
+        if family is None:
+            return "-"
+        if not family.enabled:
+            return "disabled"
+        if family.oper == "down":
+            return "down"
+        return f"{family.received}/{family.active}/{family.sent}"
+
+    return cell
+
+
+def _session(neighbor: Neighbor) -> str:
+    """The session state, with the one that matters read as ``up``.
+
+    The record keeps what the device says - ``established`` - so a check and
+    the JSON output see BGP's own vocabulary; a table wants the word that the
+    eye finds among ``idle``, ``active`` and ``connect``.
+    """
+    return "up" if neighbor.state == "established" else neighbor.state
+
+
+def _flags(neighbor: Neighbor) -> str:
+    return "".join(
+        letter if enabled else "-"
+        for letter, enabled in (
+            ("D", neighbor.dynamic),
+            ("B", neighbor.bfd),
+            ("F", neighbor.fast_failover),
+        )
+    )
+
+
+BGP_PEERS_TABLE = Table(
+    columns=(Column("NI", "ni"),),
+    each="neighbors",
+    each_columns=(
+        Column("peer", "peer"),
+        Column("state", _session),
+        Column("local-address", "local_address"),
+        Column("local-port", "local_port"),
+        Column("evpn\nRx/Act/Tx", _family_cell("evpn")),
+        Column("ipv4-unicast\nRx/Act/Tx", _family_cell("ipv4-unicast")),
+        Column("ipv6-unicast\nRx/Act/Tx", _family_cell("ipv6-unicast")),
+        Column("l3vpn-ipv4-unicast\nRx/Act/Tx", _family_cell("l3vpn-ipv4-unicast")),
+        Column("l3vpn-ipv6-unicast\nRx/Act/Tx", _family_cell("l3vpn-ipv6-unicast")),
+        Column("export-policy", lambda n: _listed(n.export_policies)),
+        Column("flags", _flags),
+        Column("group", "group"),
+        Column("import-policy", lambda n: _listed(n.import_policies)),
+        Column("local-as", lambda n: n.local_as if n.local_as is not None else "-"),
+        Column("peer-as", "peer_as"),
+    ),
+)
+
+MAC_TABLE = Table(
+    columns=(Column("NI", "ni"),),
+    each="entries",
+    each_columns=(
+        Column("mac", "address"),
+        Column("Dest", "destination"),
+        Column("Type", "type"),
+    ),
+)
+
+
+def _vxlan_destinations(vxlan: VxlanInterface) -> str:
+    return (
+        _joined(f"({d.vtep}, {d.vni if d.vni is not None else ''})" for d in vxlan.destinations)
+        or "-"
+    )
+
+
+VXLAN_TABLE = Table(
+    columns=(
+        Column("vxlan-itf", "name"),
+        Column("NI", "ni"),
+        Column("ing-vni", lambda v: v.vni if v.vni is not None else "-"),
+        Column("destinations", _vxlan_destinations),
+    ),
+)
+
+
+def _es_attachment(es: EthernetSegment) -> str:
+    """The ports a segment hangs off, or the next-hops a virtual one tracks."""
+    return " ".join(es.interfaces) or " ".join(nh.address for nh in es.next_hops)
+
+
+def _es_evis(es: EthernetSegment) -> str:
+    """The EVIs of a virtual segment, paired with a next-hop only where that matters.
+
+    One next-hop, or several that are tied to the same EVIs, is just the EVI
+    list. A segment that tracks a different next-hop per EVI has to say which
+    of them is which, or the column cannot be matched to a router at all.
+    """
+    with_evis = [nh for nh in es.next_hops if nh.evis]
+    if not with_evis:
+        return ""
+    if len({nh.evis for nh in with_evis}) == 1:
+        return " ".join(with_evis[0].evis)
+    return " ".join(f"{nh.address}:{','.join(nh.evis)}" for nh in with_evis)
+
+
+def _es_associations(es: EthernetSegment) -> str:
+    """Each network-instance with its DF candidates, the elected one marked."""
+    return _joined(
+        f"{a.ni}:[{' '.join(c.address + '(DF)' if c.designated else c.address for c in a.candidates)}]"
+        for a in es.associations
+    )
+
+
+ES_TABLE = Table(
+    columns=(
+        Column("name", "name"),
+        Column("esi", "esi"),
+        Column("type", "type"),
+        Column("mh-mode", "mh_mode"),
+        Column("oper", "oper"),
+        Column("itf/nh", _es_attachment),
+        Column("evi", _es_evis),
+        Column("ni-peers", _es_associations),
+    ),
+)
+
+
+def _route_next_hop(nh: Any) -> str:
+    """A next-hop as the table names it: its address, or what it resolves through."""
+    if nh.type == "indirect" and nh.resolving_route:
+        return f"{nh.resolving_route} (indirect)"
+    return nh.address
+
+
+def _route_egress(route: Route) -> Any:
+    """Every port, tunnel or prefix the route leaves through, in next-hop order.
+
+    One indirect next-hop can resolve onto several ports, so there can be
+    more of these than next-hops.
+    """
+    return _listed(
+        f"{hop.label}@vrf:{hop.ni}" if hop.ni else hop.label
+        for nh in route.next_hops
+        for hop in nh.egress
+    )
+
+
+IP_RIB_TABLE = Table(
+    columns=(Column("NI", "ni"),),
+    each="routes",
+    each_columns=(
+        Column("Act", lambda r: "yes" if r.active else "no"),
+        Column("Prefix", "prefix"),
+        Column("itf", _route_egress),
+        Column("metric", "metric"),
+        Column("next-hop", lambda r: _listed(nh for nh in map(_route_next_hop, r.next_hops) if nh)),
+        Column("orig-vrf", "leaked_from"),
+        Column("pref", "preference"),
+        Column("type", "type"),
+    ),
+)
+
+
+def _dash(value: Any) -> Any:
+    return "-" if value is None else value
+
+
+def _route_status(route: BgpRoute) -> str:
+    """``u*>``: used, valid, best - the way the CLI marks a route."""
+    return ("u" if route.used else "") + ("*" if route.valid else "") + (">" if route.best else "")
+
+
+def _esi_labels(route: BgpRoute) -> str:
+    return ",".join(
+        label.replace("Single-Active", "S-A").replace("All-Active", "A-A")
+        for label in route.esi_labels
+    )
+
+
+#: Every column a BGP RIB table can have, by name. Which of them a table shows
+#: depends on the family and the EVPN route type.
+_BGP_RIB_COLUMNS: Dict[str, Column] = {
+    column.name: column
+    for column in (
+        Column("st", _route_status),
+        Column("ESI", "esi"),
+        Column("GW", "gateway"),
+        Column("IP", "ip"),
+        Column("IP-Pfx", "prefix"),
+        Column("Pfx", "prefix"),
+        Column("Prefix", "prefix"),
+        Column("L1", lambda r: _dash(r.label1)),
+        Column("L2", lambda r: _dash(r.label2)),
+        Column("MAC", "mac"),
+        Column("RD", "rd"),
+        Column("RT", lambda r: _joined(r.route_targets)),
+        Column("Tag", "tag"),
+        Column("as-path", lambda r: _listed(r.as_path)),
+        Column(
+            "communities",
+            lambda r: _joined([*r.communities, *r.large_communities, *r.ext_communities]),
+        ),
+        Column("esi-lbl", _esi_labels),
+        Column("lpref", "local_pref"),
+        Column("med", "med"),
+        Column("neighbor", "neighbor"),
+        Column("next-hop", "next_hop"),
+        Column("NextHop", "next_hop"),
+        Column("origin", "origin"),
+        Column("peer", "neighbor"),
+        Column("vni", lambda r: _dash(r.vni)),
+        # The path attributes a table shows only in detail.
+        Column("soo", lambda r: _joined(r.soo)),
+        Column("tunnel-encap", lambda r: _joined(r.tunnel_encap)),
+        Column("dpath", lambda r: " ".join(r.domain_path)),
+        Column("valid", "valid"),
+        Column("best", "best"),
+        Column("used", "used"),
+        Column("tie-break", "tie_break"),
+        Column("internal-tags", lambda r: _listed(r.internal_tags)),
+        Column("neighbor-as", "neighbor_as"),
+    )
+}
+
+#: The columns of each BGP RIB table, keyed by family and - for EVPN - route
+#: type, in the order the tables have always had them.
+_BGP_RIB_LAYOUT: Dict[Tuple[str, str], Tuple[str, ...]] = {
+    ("evpn", "1"): ("st", "ESI", "NextHop", "RD", "RT", "Tag", "as-path", "communities", "esi-lbl", "peer", "vni"),
+    ("evpn", "2"): ("st", "ESI", "IP", "L1", "L2", "MAC", "RD", "RT", "as-path", "communities", "next-hop", "peer", "vni"),
+    ("evpn", "3"): ("st", "RD", "RT", "Tag", "as-path", "communities", "next-hop", "origin", "peer"),
+    ("evpn", "4"): ("st", "ESI", "RD", "RT", "as-path", "communities", "next-hop", "origin", "peer"),
+    ("evpn", "5"): ("st", "ESI", "GW", "IP-Pfx", "RD", "RT", "as-path", "communities", "lpref", "med", "next-hop", "origin", "peer", "vni"),
+    ("ipv4-unicast", ""): ("st", "Prefix", "as-path", "communities", "lpref", "med", "neighbor", "next-hop"),
+    ("ipv6-unicast", ""): ("st", "Prefix", "as-path", "communities", "lpref", "med", "neighbor", "next-hop"),
+    ("l3vpn-ipv4-unicast", ""): ("st", "Pfx", "RD", "as-path", "communities", "lpref", "med", "neighbor", "next-hop"),
+    ("l3vpn-ipv6-unicast", ""): ("st", "Pfx", "RD", "as-path", "communities", "lpref", "med", "neighbor", "next-hop"),
+}
+_BGP_RIB_DETAIL: Tuple[str, ...] = (
+    "soo", "tunnel-encap", "dpath", "valid", "best", "used", "tie-break", "internal-tags", "neighbor-as",
+)
+
+#: What the BGP RIB report calls a family, and what the model calls it.
+_BGP_RIB_FAMILIES = {
+    "evpn": "evpn",
+    "ipv4": "ipv4-unicast",
+    "ipv6": "ipv6-unicast",
+    "l3vpn-ipv4-unicast": "l3vpn-ipv4-unicast",
+    "l3vpn-ipv6-unicast": "l3vpn-ipv6-unicast",
+}
+
+
+def bgp_rib_table(route_fam: str = "evpn", route_type: Optional[str] = None, detail: bool = False) -> Table:
+    """The table for one BGP RIB family, taking the getter's own arguments.
+
+    An unknown family or route type gets the columns every family shares,
+    which is what a table can still show of a getter that raised.
+    """
+    family = BGP_RIB_ROUTE_FAM_ALIASES.get(str(route_fam).lower(), str(route_fam))
+    family = _BGP_RIB_FAMILIES.get(family, family)
+    layout = _BGP_RIB_LAYOUT.get(
+        (family, str(route_type or "2") if family == "evpn" else ""),
+        ("st", "as-path", "communities", "neighbor", "next-hop"),
+    )
+    names = layout + (_BGP_RIB_DETAIL if detail else ())
+    return Table(
+        columns=(Column("NI", "ni"),),
+        each="routes",
+        each_columns=tuple(_BGP_RIB_COLUMNS[name] for name in names),
+    )
+
+
+def _bgp_rib_table_for(route_fam: Optional[str] = None, route_type: Optional[str] = None) -> Callable[[Mapping[str, Any]], Table]:
+    """A report's table as a function of its parameters, with what is bound.
+
+    The interactive report takes the family and route type as arguments; a
+    streaming variant has them baked in and only ``detail`` left to decide.
+    """
+
+    def table(params: Mapping[str, Any]) -> Table:
+        return bgp_rib_table(
+            route_fam if route_fam is not None else str(params.get("route_fam") or "evpn"),
+            route_type if route_fam is not None else params.get("route_type"),
+            bool(params.get("detail")),
+        )
+
+    return table
+
+
 #: Every service report reads the same two trees.
 _SERVICE_SUBSCRIPTIONS: Tuple[SubscriptionSpec, ...] = (
     SubscriptionSpec("/network-instance[name=*]", datatype="all", sample_interval=20),
@@ -288,6 +648,7 @@ def _bgp_rib_variants() -> List[ReportSpec]:
             title=f"BGP RIB - EVPN {label}",
             description=description,
             getter=_bound_bgp_rib("evpn", route_type),
+            table=_bgp_rib_table_for("evpn", route_type),
             category="BGP RIB",
             surfaces=STREAMING,
         )
@@ -300,6 +661,7 @@ def _bgp_rib_variants() -> List[ReportSpec]:
             title=f"BGP RIB - {label}",
             description=f"{noun} routes in the BGP RIB-in-post.",
             getter=_bound_bgp_rib(route_fam),
+            table=_bgp_rib_table_for(route_fam),
             category="BGP RIB",
             surfaces=STREAMING,
         )
@@ -454,6 +816,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="ni",
+        table=NI_TABLE,
         resource="nwi_itfs",
         key_columns=("Node", "NI", "Subitf"),
         title="Network Instances",
@@ -469,6 +832,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="bgp_peers",
+        table=BGP_PEERS_TABLE,
         resource="bgp_peers",
         key_columns=("Node", "NI", "peer"),
         title="BGP Peers",
@@ -486,12 +850,14 @@ REPORTS: List[ReportSpec] = [
         title="BGP RIB",
         description="Routes in the BGP RIB-in-post with their path attributes.",
         getter=_bgp_rib,
+        table=_bgp_rib_table_for(),
         category="BGP RIB",
         surfaces=INTERACTIVE,
     ),
     *_bgp_rib_variants(),
     ReportSpec(
         name="ipv4_rib",
+        table=IP_RIB_TABLE,
         resource="ip_rib",
         # A prefix can be offered by more than one protocol at once, so the
         # route type is part of what names a route rather than of what it says.
@@ -510,6 +876,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="ipv6_rib",
+        table=IP_RIB_TABLE,
         resource="ip_rib",
         key_columns=("Node", "NI", "Prefix", "type"),
         title="IPv6 RIB",
@@ -599,8 +966,9 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="mac",
+        table=MAC_TABLE,
         resource="mac_table",
-        key_columns=("Node", "NI", "Address"),
+        key_columns=("Node", "NI", "mac"),
         title="MAC Table",
         description="Bridge table MAC entries per network instance.",
         getter=lambda d: d.get_mac_table(),
@@ -625,6 +993,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="es",
+        table=ES_TABLE,
         resource="es",
         key_columns=("Node", "name"),
         title="Ethernet Segments",
@@ -647,6 +1016,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="vxlan",
+        table=VXLAN_TABLE,
         resource="vxlan",
         key_columns=("Node", "vxlan-itf"),
         title="VXLAN Tunnels",

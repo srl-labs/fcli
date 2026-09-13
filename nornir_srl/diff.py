@@ -268,7 +268,7 @@ def key_columns_for(report: Any) -> Tuple[str, ...]:
     """The key columns of a report, as the rendered table spells them.
 
     Getters name a field for the table it will become - ``1_peer`` sorts the
-    column, ``"U4\\nR/A/T"`` wraps its header - and the rendering strips both
+    column, ``"evpn\\nRx/Act/Tx"`` wraps its header - and the rendering strips both
     before anyone sees it. Declaring keys as they are rendered is what lets a
     saved table be compared with a fresh one.
     """

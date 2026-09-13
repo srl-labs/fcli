@@ -40,7 +40,8 @@ from .checks import CHECKS, collect_fabric_state, run_checks
 from .connections.srlinux import CONNECTION_NAME
 from .connections.helpers import clean_structured_key
 from .fabric import collect_fabric_state as collect_lens_state
-from .lenses import as_dict as lens_record, get_lens
+from .lenses import get_lens
+from .records import as_dict
 from .reports import ReportSpec, get_report
 from .rows import extract
 
@@ -164,13 +165,27 @@ def _run_report(
     field_filter: Optional[str] = None,
     **params: Any,
 ) -> str:
-    """Run a report from the registry and return its rows as JSON."""
+    """Run a report from the registry and return what it found as JSON.
+
+    A report that returns records is emitted as those records, each saying
+    which node it is from; one that does not yet is emitted as its table rows.
+    """
     spec = get_report(name)
     i_filter, f_filter = _parse_filters(inv_filter, field_filter)
     result = _query(spec, i_filter, **params)
+    table = spec.table_for(params)
     _columns, per_node = extract(
-        spec.resource, result, field_filter=f_filter, on_error=_error_row
+        spec.resource, result, field_filter=f_filter, on_error=_error_row, table=table
     )
+    if table is not None:
+        objects: List[Dict[str, Any]] = []
+        for node in per_node:
+            if node.records:
+                objects.extend({"node": node.node, **as_dict(r)} for r in node.records)
+            else:
+                # A node whose report failed has a row saying so, and no records.
+                objects.extend({"node": node.node, **row.values} for row in node.rows)
+        return json.dumps(objects, indent=2, default=str)
     rows = [
         {"Node": node.node, **row.values} for node in per_node for row in node.rows
     ]
@@ -195,7 +210,7 @@ mcp = FastMCP(
         "If labels are absent or the key does not exist, inv_filter returns NO results. "
         "Use 'show_topology' first to see available nodes and their filterable label keys before applying inv_filter. "
         "If no labels are available, omit inv_filter to target all nodes. "
-        "FIELD FILTERS (field_filter): use field_filter to filter output rows (e.g. 'session-state=established'). "
+        "FIELD FILTERS (field_filter): use field_filter to filter output rows (e.g. 'state=up'). "
         "field_filter values are regex patterns matched case-insensitively against field values. "
         "inv_filter supports wildcards (*, ?). Both accept comma-separated key=value pairs. "
         "Topologies can be loaded at runtime using 'load_topology' or 'load_config'."
@@ -349,7 +364,7 @@ def sys_info(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("sys_info", inv_filter, field_filter)
 
@@ -361,17 +376,23 @@ def bgp_peers(
 ) -> str:
     """Get BGP peer status and route statistics for all network instances.
 
-    Returns peer address, peer AS, session state, local AS, flags (D=dynamic, B=BFD, F=fast-failover),
-    and Rx/Active/Tx route counts per AFI/SAFI: IPv4 unicast (U4), IPv6 unicast (U6), EVPN,
-    L3VPN IPv4 (VPNv4), L3VPN IPv6 (VPNv6). Table column headers show the AFI on the first line
-    and R/A/T on the second; JSON keys use a space instead of the newline.
+    Returns one object per network-instance per node: node, ni and neighbors,
+    each with peer, state, peer_as, local_as, local_address, local_port, group,
+    dynamic, bfd, fast_failover, import_policies, export_policies and families.
+    A family (ipv4-unicast, ipv6-unicast, evpn, l3vpn-ipv4-unicast,
+    l3vpn-ipv6-unicast) is listed only where the session is configured for it,
+    with enabled, oper, received, active and sent route counts.
+
+    state is the session state as the device reports it (established, active,
+    idle, connect...). The table shows an established session as 'up', and
+    field_filter matches the table, so filter on 'state=up', not established.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("bgp_peers", inv_filter, field_filter)
 
@@ -393,11 +414,15 @@ def bgp_rib(
 ) -> str:
     """Get BGP RIB (Routing Information Base) entries.
 
-    Returns the full set of path attributes for each route, including standard
-    communities, Site-of-Origin (soo), BGP domain-path (dpath), tunnel-encap
-    extended-community, route-target (RT), as-path, next-hop, and route status
-    (valid/best/used, tie-break reason, internal-tags). Useful for diagnosing
-    EVPN/IP-VPN loop-prevention and route-leaking issues.
+    Returns one object per network-instance per node: node, ni, family,
+    route_type (EVPN only) and routes. A route carries the peer it came from
+    (neighbor), its status (used, valid, best, tie_break), the NLRI fields its
+    family and type have (rd, prefix, esi, tag, mac, ip, gateway, vni, label1,
+    label2) and every path attribute: next_hop, origin, local_pref, med,
+    as_path, communities / large_communities / ext_communities as carried, and
+    read out of the extended ones route_targets, esi_labels, soo and
+    tunnel_encap; plus domain_path (D-PATH), internal_tags and neighbor_as.
+    Useful for diagnosing EVPN/IP-VPN loop-prevention and route-leaking issues.
 
     Args:
         route_fam: BGP RIB address family: evpn, ipv4, ipv6, or L3VPN IPv4/IPv6 unicast
@@ -408,7 +433,7 @@ def bgp_rib(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report(
         "bgp_rib",
@@ -428,7 +453,14 @@ def ipv4_rib(
 ) -> str:
     """Get IPv4 routing table entries.
 
-    Shows active routes with next-hops, metrics, preferences, and route owners.
+    Returns one object per network-instance per node: node, ni and routes,
+    each with prefix, type (local, host, bgp, bgp-evpn, static, arp-nd...),
+    active, metric, preference, leaked_from (the instance a leaked route came
+    from) and next_hops. A next-hop has its address, type (direct, indirect),
+    the resolving_route an indirect one recurses on, and egress: where it
+    leaves the node, each of kind 'interface' (a subinterface, with ni when
+    it is in another instance), 'tunnel' (a vxlan or other tunnel endpoint)
+    or 'route' (a prefix the resolution could not be walked past).
 
     Args:
         address: Optional IP address for longest-prefix-match (LPM) lookup (e.g. '10.0.0.1').
@@ -436,7 +468,7 @@ def ipv4_rib(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("ipv4_rib", inv_filter, field_filter, address=address)
 
@@ -449,7 +481,9 @@ def ipv6_rib(
 ) -> str:
     """Get IPv6 routing table entries.
 
-    Shows active routes with next-hops, metrics, preferences, and route owners.
+    Same shape as ipv4_rib: one object per network-instance per node with its
+    routes, each with prefix, type, active, metric, preference, leaked_from and
+    next_hops resolved to their egress (interface, tunnel or route).
 
     Args:
         address: Optional IPv6 address for longest-prefix-match (LPM) lookup.
@@ -457,7 +491,7 @@ def ipv6_rib(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("ipv6_rib", inv_filter, field_filter, address=address)
 
@@ -476,7 +510,7 @@ def static_routes(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("static_routes", inv_filter, field_filter)
 
@@ -498,7 +532,7 @@ def tunnel_table(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("tunnel_table", inv_filter, field_filter)
 
@@ -510,16 +544,18 @@ def network_instances(
 ) -> str:
     """Get network instances and their interfaces.
 
-    Returns NI name, operational state, type (ip-vrf/mac-vrf/default), router-id,
-    vxlan-interface, the EVPN EVI, import/export RTs, and associated interfaces with
-    IP addresses, VLANs, and MTU.
+    Returns one object per network-instance per node: node, name, type
+    (ip-vrf/mac-vrf/default), oper, router_id, overlays (its vxlan-interfaces),
+    evis, import_rts, export_rts, and interfaces - each with name, oper,
+    prefixes, mtu, vlan and associated (for an irb, the other instances it is
+    in: the ip-vrf a mac-vrf's irb routes into).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("ni", inv_filter, field_filter)
 
@@ -539,7 +575,7 @@ def subinterfaces(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("subif", inv_filter, field_filter)
 
@@ -558,7 +594,7 @@ def lag(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("lag", inv_filter, field_filter)
 
@@ -585,7 +621,7 @@ def ifstats(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("ifstats", inv_filter, field_filter, interval=interval)
 
@@ -597,14 +633,18 @@ def mac_table(
 ) -> str:
     """Get MAC address table entries.
 
-    Returns network instance, MAC address, destination (interface or VXLAN), and type (learnt/static/evpn).
+    Returns one object per network-instance per node: node, ni and entries,
+    each with address, type (learnt/evpn/evpn-static/irb-interface...), the
+    destination as the device writes it, and that destination read apart:
+    interface for a locally learned entry, or overlay plus either vtep and vni
+    or esi for one learned over EVPN.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("mac", inv_filter, field_filter)
 
@@ -624,7 +664,7 @@ def irb_interfaces(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("irb", inv_filter, field_filter)
 
@@ -636,16 +676,17 @@ def ethernet_segments(
 ) -> str:
     """Get EVPN Ethernet Segment information.
 
-    Returns ESI, type, multi-homing mode, oper state, interfaces, next-hops, the
-    EVIs a virtual segment is tied to, and associated network instances with DF
-    (Designated Forwarder) candidates.
+    Returns one object per segment per node: node, name, esi, type, mh_mode,
+    oper, interfaces (the ports it hangs off), next_hops (for a virtual
+    segment: address and the evis it serves) and associations - each
+    network-instance it is in with its DF candidates (address, designated).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("es", inv_filter, field_filter)
 
@@ -664,7 +705,7 @@ def es_destinations(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("es_dest", inv_filter, field_filter)
 
@@ -676,8 +717,8 @@ def vxlan_tunnels(
 ) -> str:
     """Get VXLAN tunnel interfaces and unicast destinations.
 
-    Returns VXLAN interface name, associated network instance, ingress-vni,
-    and unicast destinations (vtep-address, vni).
+    Returns one object per vxlan-interface per node: node, name, ni, vni (the
+    ingress VNI) and destinations, each with vtep and vni.
 
     Note: unicast destinations are populated by receipt of EVPN type-2 (MAC/IP) routes,
     which typically requires actual traffic. If no destinations are shown, it means no
@@ -688,7 +729,7 @@ def vxlan_tunnels(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("vxlan", inv_filter, field_filter)
 
@@ -708,7 +749,7 @@ def lldp_neighbors(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("lldp", inv_filter, field_filter)
 
@@ -727,7 +768,7 @@ def arp_table(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("arp", inv_filter, field_filter)
 
@@ -746,7 +787,7 @@ def ipv6_neighbors(
             Supports wildcards. Matches against node labels from the topology file; use
             'show_topology' to see available keys. Omit to target all nodes.
         field_filter: Field filter as comma-separated key=value pairs to filter output rows
-            (e.g. 'session-state=established'). Values are case-insensitive regexes.
+            (e.g. 'state=up'). Values are case-insensitive regexes.
     """
     return _run_report("nd", inv_filter, field_filter)
 
@@ -843,7 +884,7 @@ def _run_lens(lens: str, inv_filter: Optional[str] = None, **params: Any) -> str
         records = spec.run(state, **params)
     except ValueError as exc:
         return json.dumps({"error": str(exc)}, indent=2)
-    payload: Dict[str, Any] = {"records": [lens_record(r) for r in records]}
+    payload: Dict[str, Any] = {"records": [as_dict(r) for r in records]}
     if state.errors:
         payload["not_collected"] = [
             {"node": node, "report": report, "error": error}

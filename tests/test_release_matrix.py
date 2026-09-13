@@ -27,7 +27,7 @@ import pytest
 
 from nornir_srl.reports import REPORTS_BY_NAME
 from tests.system.capture import SKIP
-from tests.system.replay import Recording, recording_paths
+from tests.system.replay import Recording, comparable_rows, recording_paths
 
 #: gNMI paths a release does not have, and the report that asks for them.
 #:
@@ -138,7 +138,10 @@ def test_report_reproduces_the_table_the_device_gave(path: str, report: str) -> 
     assert columns == captured.columns, (
         f"{report} on {recording.release}/{recording.node}: columns changed"
     )
-    assert rows == captured.rows, (
+    # Recorded rows predate the reports that return records; they are keyed
+    # and gapped the way the old flattening keyed them, so both sides are
+    # compared as what they render.
+    assert rows == comparable_rows(captured.rows), (
         f"{report} on {recording.release}/{recording.node}: "
         f"{len(rows)} rows replayed, {len(captured.rows)} recorded"
     )
