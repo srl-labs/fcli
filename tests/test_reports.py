@@ -12,7 +12,7 @@ from nornir_srl.connections.helpers import clean_structured_key
 from nornir_srl.connections.interfaces import NetworkInstanceMixin
 from nornir_srl.connections.routing import RoutingMixin
 from nornir_srl.records import Egress
-from nornir_srl.reports import ES_TABLE, IP_RIB_TABLE, bgp_rib_table
+from nornir_srl.reports import ES_TABLE, IP_RIB_TABLE, LAG_TABLE, TUNNEL_TABLE, bgp_rib_table
 
 # --------------------------------------------------------------------------- #
 # clean_structured_key
@@ -823,17 +823,15 @@ def test_get_tunnel_table_resolves_egress_and_label():
             "tunnel-table": tunnel_table,
         }
     )
-    out = dev.get_tunnel_table()
-    rows = out["tunnel_table"]
-    assert len(rows) == 1
-    row = rows[0]
-    assert row["Prefix"] == "192.0.2.152/32"
-    assert row["type"] == "ldp"
-    assert row["pref"] == 9
-    assert row["metric"] == 10
-    assert row["next-hop"] == ["10.255.0.1"]
-    assert row["egress-itf"] == ["ethernet-1/5.0"]
-    assert row["label"] == ["20000"]
+    (table,) = dev.get_tunnel_table()["tunnel_table"]
+    assert table.ni == "default"
+    (tunnel,) = table.tunnels
+    assert (tunnel.prefix, tunnel.type, tunnel.preference, tunnel.metric) == ("192.0.2.152/32", "ldp", 9, 10)
+    (hop,) = tunnel.next_hops
+    assert (hop.address, hop.subinterface, hop.type, hop.labels) == ("10.255.0.1", "ethernet-1/5.0", "mpls", ("20000",))
+    # The table lists what each next-hop resolved to, one column per part.
+    row = TUNNEL_TABLE.rows(table)[0].values
+    assert (row["next-hop"], row["egress-itf"], row["label"]) == (["10.255.0.1"], ["ethernet-1/5.0"], ["20000"])
 
 
 def test_get_bridge_domains():
@@ -2759,7 +2757,7 @@ def test_get_nwi_itf_reads_route_targets_from_import_and_export_policies():
     assert instance.export_rts == ("export-a", "export-b")
 
 
-def test_get_lag_shortens_member_interface_names():
+def test_get_lag_keeps_the_member_name_and_the_table_shortens_it():
     lag_response = [
         {
             "interface": [
@@ -2785,13 +2783,13 @@ def test_get_lag_shortens_member_interface_names():
     ]
     device = _FakeInterfaces({"interface": lag_response})
 
-    rows = device.get_lag()["lag"]
+    (lag,) = device.get_lag()["lag"]
 
-    assert len(rows) == 1
-    assert rows[0]["lag"] == "lag1"
-    assert rows[0]["oper"] == "up"
+    assert (lag.name, lag.oper, lag.type, lag.min_links, lag.lacp_mode) == ("lag1", "up", "lacp", 1, "ACTIVE")
+    assert lag.members[0].name == "ethernet-1/1"
+    assert lag.members[0].activity == "ACTIVE"
     # Members are abbreviated so the column stays narrow enough to read.
-    assert rows[0]["members"][0]["member-itf"] == "et-1/1"
+    assert LAG_TABLE.rows(lag)[0].values["member-itf"] == "et-1/1"
 
 
 def test_get_lag_survives_an_empty_response():

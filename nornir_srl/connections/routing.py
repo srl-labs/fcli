@@ -17,6 +17,12 @@ from ..records import (
     Route,
     RouteNextHop,
     RouteTable,
+    StaticNextHop,
+    StaticRoute,
+    StaticRouteTable,
+    Tunnel,
+    TunnelNextHop,
+    TunnelTable,
     as_int,
 )
 from .helpers import as_list, first_payload, lpm, model_version, version_bucket
@@ -621,8 +627,7 @@ class RoutingMixin:
 
         Resolves each tunnel's next-hop-group to the egress subinterface,
         next-hop IP and pushed MPLS label-stack, mirroring the next-hop
-        resolution used by :meth:`get_rib`. Returns flat rows with the fields
-        required to verify transport/forwarding paths in tests.
+        resolution used by :meth:`get_rib`.
         """
         # Build next-hop and next-hop-group lookups (per network-instance).
         nhs = self.get(
@@ -638,72 +643,76 @@ class RoutingMixin:
             datatype="state",
         )
 
-        nh_mapping: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        nh_mapping: Dict[str, Dict[str, TunnelNextHop]] = {}
         for ni in as_list(first_payload(nhs).get("network-instance")):
-            tmp_map: Dict[str, Dict[str, Any]] = {}
-            for nh in ni.get("route-table", {}).get("next-hop", []):
-                label_stack = nh.get("mpls-encapsulation", {}).get(
+            if not isinstance(ni, dict):
+                continue
+            resolved: Dict[str, TunnelNextHop] = {}
+            for nh in as_list((ni.get("route-table") or {}).get("next-hop")):
+                if not isinstance(nh, dict):
+                    continue
+                label_stack = (nh.get("mpls-encapsulation") or {}).get(
                     "pushed-mpls-label-stack"
-                ) or nh.get("mpls", {}).get("pushed-mpls-label-stack")
-                tmp_map[nh["index"]] = {
-                    "ip-address": nh.get("ip-address"),
-                    "subinterface": nh.get("subinterface"),
-                    "type": nh.get("type"),
-                    "labels": label_stack,
-                }
-            nh_mapping[ni["name"]] = tmp_map
+                ) or (nh.get("mpls") or {}).get("pushed-mpls-label-stack")
+                resolved[str(nh.get("index"))] = TunnelNextHop(
+                    address=str(nh.get("ip-address") or ""),
+                    subinterface=str(nh.get("subinterface") or ""),
+                    type=str(nh.get("type") or ""),
+                    labels=tuple(str(label) for label in as_list(label_stack)),
+                )
+            nh_mapping[str(ni.get("name", ""))] = resolved
 
-        nhgroup_mapping: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        nhgroup_mapping: Dict[str, Dict[str, Tuple[TunnelNextHop, ...]]] = {}
         for ni in as_list(first_payload(nhgroups).get("network-instance")):
-            ni_name = ni["name"]
-            nh_map: Dict[str, List[Dict[str, Any]]] = {}
-            for nhgroup in ni.get("route-table", {}).get("next-hop-group", []):
-                nh_map[nhgroup["index"]] = [
-                    nh_mapping.get(ni_name, {}).get(nh.get("next-hop"), {})
-                    for nh in nhgroup.get("next-hop", [])
-                ]
-            nhgroup_mapping[ni_name] = nh_map
+            if not isinstance(ni, dict):
+                continue
+            ni_name = str(ni.get("name", ""))
+            groups: Dict[str, Tuple[TunnelNextHop, ...]] = {}
+            for nhgroup in as_list((ni.get("route-table") or {}).get("next-hop-group")):
+                if not isinstance(nhgroup, dict):
+                    continue
+                groups[str(nhgroup.get("index"))] = tuple(
+                    nh_mapping.get(ni_name, {}).get(str(member.get("next-hop")), TunnelNextHop())
+                    for member in as_list(nhgroup.get("next-hop"))
+                    if isinstance(member, dict)
+                )
+            nhgroup_mapping[ni_name] = groups
 
         resp = self.get(
             paths=[f"/network-instance[name={network_instance}]/tunnel-table"],
             datatype="state",
         )
 
-        rows: List[Dict[str, Any]] = []
+        tables: List[TunnelTable] = []
         for ni in as_list(first_payload(resp).get("network-instance")):
-            ni_name = ni["name"]
-            tunnel_table = ni.get("tunnel-table", {})
+            if not isinstance(ni, dict):
+                continue
+            ni_name = str(ni.get("name", ""))
+            tunnel_table = ni.get("tunnel-table") or {}
+            tunnels: List[Tunnel] = []
             for afi in ("ipv4", "ipv6"):
-                prefix_key = "ipv4-prefix" if afi == "ipv4" else "ipv6-prefix"
-                for tunnel in tunnel_table.get(afi, {}).get("tunnel", []):
-                    nhg_index = tunnel.get("next-hop-group")
-                    resolved = nhgroup_mapping.get(ni_name, {}).get(nhg_index, [])
-                    next_hops = [
-                        nh.get("ip-address") for nh in resolved if nh.get("ip-address")
-                    ]
-                    egress_itfs = [
-                        nh.get("subinterface")
-                        for nh in resolved
-                        if nh.get("subinterface")
-                    ]
-                    labels = [
-                        str(lbl) for nh in resolved for lbl in (nh.get("labels") or [])
-                    ]
-                    rows.append(
-                        {
-                            "NI": ni_name,
-                            "Prefix": tunnel.get(prefix_key),
-                            "type": tunnel.get("type"),
-                            "owner": tunnel.get("owner"),
-                            "pref": tunnel.get("preference"),
-                            "metric": tunnel.get("metric"),
-                            "next-hop": next_hops,
-                            "egress-itf": egress_itfs,
-                            "label": labels,
-                        }
+                prefix_key = f"{afi}-prefix"
+                for tunnel in as_list((tunnel_table.get(afi) or {}).get("tunnel")):
+                    if not isinstance(tunnel, dict):
+                        continue
+                    tunnels.append(
+                        Tunnel(
+                            prefix=str(tunnel.get(prefix_key) or ""),
+                            type=str(tunnel.get("type") or ""),
+                            owner=str(tunnel.get("owner") or ""),
+                            preference=as_int(tunnel.get("preference")),
+                            metric=as_int(tunnel.get("metric")),
+                            next_hops=nhgroup_mapping.get(ni_name, {}).get(
+                                str(tunnel.get("next-hop-group")), ()
+                            ),
+                        )
                     )
+            # An instance without tunnels has no table to show, rather than
+            # an empty one: most instances have none.
+            if tunnels:
+                tables.append(TunnelTable(ni=ni_name, tunnels=tuple(tunnels)))
 
-        return {"tunnel_table": rows}
+        return {"tunnel_table": tables}
 
     def get_routing_policies(self) -> Dict[str, Any]:
         """
@@ -729,57 +738,55 @@ class RoutingMixin:
         ]
         resp = self.get(paths=paths, datatype="all")
 
-        # Map next-hop groups
-        # nh_mapping[ni_name][group_name] = [ip1, ip2(R), ...]
-        nh_mapping: Dict[str, Dict[str, List[str]]] = {}
-        # static_routes_data[ni_name] = [route1, route2, ...]
-        static_routes_data: Dict[str, List[Dict[str, Any]]] = {}
-
+        # The two paths answer as separate notifications, each with its own
+        # network-instance list, so both are read per instance before the
+        # routes are resolved against their groups.
+        groups: Dict[str, Dict[str, Tuple[StaticNextHop, ...]]] = {}
+        routes: Dict[str, List[Dict[str, Any]]] = {}
         for item in resp:
-            if "network-instance" in item:
-                for ni in item["network-instance"]:
-                    ni_name = ni["name"]
-                    if "next-hop-groups" in ni:
-                        if ni_name not in nh_mapping:
-                            nh_mapping[ni_name] = {}
-                        for group in ni["next-hop-groups"].get("group", []):
-                            group_name = group["name"]
-                            nh_list = []
-                            for nh in group.get("nexthop", []):
-                                ip = nh.get("ip-address")
-                                if ip:
-                                    if nh.get("resolve", False):
-                                        ip = f"{ip}(R)"
-                                    nh_list.append(ip)
-                            nh_mapping[ni_name][group_name] = nh_list
-
-                    if "static-routes" in ni:
-                        if ni_name not in static_routes_data:
-                            static_routes_data[ni_name] = []
-                        static_routes_data[ni_name].extend(
-                            ni["static-routes"].get("route", [])
+            if not isinstance(item, dict):
+                continue
+            for ni in as_list(item.get("network-instance")):
+                if not isinstance(ni, dict):
+                    continue
+                ni_name = str(ni.get("name", ""))
+                for group in as_list((ni.get("next-hop-groups") or {}).get("group")):
+                    if not isinstance(group, dict):
+                        continue
+                    groups.setdefault(ni_name, {})[str(group.get("name"))] = tuple(
+                        StaticNextHop(
+                            address=str(nh.get("ip-address")),
+                            resolve=bool(nh.get("resolve", False)),
                         )
+                        for nh in as_list(group.get("nexthop"))
+                        if isinstance(nh, dict) and nh.get("ip-address")
+                    )
+                if "static-routes" in ni:
+                    routes.setdefault(ni_name, []).extend(
+                        route
+                        for route in as_list((ni.get("static-routes") or {}).get("route"))
+                        if isinstance(route, dict)
+                    )
 
-        processed_routes = []
-        for ni_name, routes in static_routes_data.items():
-            for route in routes:
-                nh_group_name = route.get("next-hop-group")
-                nhops = (
-                    nh_mapping.get(ni_name, {}).get(nh_group_name, [])
-                    if nh_group_name
-                    else []
-                )
-
-                processed_routes.append(
-                    {
-                        "NI": ni_name,
-                        "route": route.get("prefix"),
-                        "admin-state": route.get("admin-state"),
-                        "installed": route.get("installed"),
-                        "metric": route.get("metric"),
-                        "pref": route.get("preference"),
-                        "nhops": nhops,
-                    }
-                )
-
-        return {"static_routes": processed_routes}
+        tables = [
+            StaticRouteTable(
+                ni=ni_name,
+                routes=tuple(
+                    StaticRoute(
+                        prefix=str(route.get("prefix") or ""),
+                        admin=str(route.get("admin-state") or ""),
+                        installed=(
+                            bool(route["installed"]) if route.get("installed") is not None else None
+                        ),
+                        metric=as_int(route.get("metric")),
+                        preference=as_int(route.get("preference")),
+                        next_hop_group=str(route.get("next-hop-group") or ""),
+                        next_hops=groups.get(ni_name, {}).get(str(route.get("next-hop-group")), ()),
+                    )
+                    for route in ni_routes
+                ),
+            )
+            for ni_name, ni_routes in routes.items()
+            if ni_routes
+        ]
+        return {"static_routes": tables}

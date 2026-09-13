@@ -269,6 +269,64 @@ class Interface:
 
 
 # --------------------------------------------------------------------------- #
+# sys_info: what the node is
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class SystemInfo:
+    """The chassis and the software it runs."""
+
+    type: str = ""
+    serial_number: str = ""
+    part_number: str = ""
+    hw_mac_address: str = ""
+    last_booted: str = ""
+    #: The release alone, ``26.7.1``: the build tag the device appends is
+    #: not what a matrix of releases is keyed on.
+    software_version: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# lag: link aggregation groups
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class LagMember:
+    """One port of a LAG."""
+
+    #: The port as the device names it, ``ethernet-1/20``.
+    name: str
+    oper: str = ""
+    #: LACP: ``ACTIVE`` or ``PASSIVE``.
+    activity: str = ""
+
+
+@dataclass(frozen=True)
+class Lag:
+    """One link aggregation group and the ports in it."""
+
+    name: str
+    oper: str = ""
+    mtu: Optional[int] = None
+    min_links: Optional[int] = None
+    description: str = ""
+    #: ``lacp`` or ``static``.
+    type: str = ""
+    speed: Optional[int] = None
+    #: How the standby side of a single-active segment is signalled:
+    #: ``lacp`` or ``power-off``.
+    standby_signaling: str = ""
+    lacp_key: Optional[int] = None
+    lacp_interval: str = ""
+    lacp_mode: str = ""
+    lacp_system_id: str = ""
+    lacp_priority: Optional[int] = None
+    members: Tuple[LagMember, ...] = ()
+
+
+# --------------------------------------------------------------------------- #
 # vxlan: tunnel interfaces
 # --------------------------------------------------------------------------- #
 
@@ -339,6 +397,102 @@ class EthernetSegment:
     interfaces: Tuple[str, ...] = ()
     next_hops: Tuple[NextHop, ...] = ()
     associations: Tuple[Association, ...] = ()
+
+
+# --------------------------------------------------------------------------- #
+# irb: the routed side of a bridge domain
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class IrbAddress:
+    """One address of an irb, and what it is there as."""
+
+    prefix: str
+    primary: bool = False
+    #: The address every leaf of the domain answers on, as the anycast gateway.
+    anycast_gw: bool = False
+
+
+@dataclass(frozen=True)
+class HostRouteRule:
+    """Which neighbour entries an irb turns into host routes.
+
+    ``populate`` names the origin of the entries - ``dynamic``, ``static``,
+    ``evpn`` - and whether the routes are programmed into the datapath or
+    only advertised.
+    """
+
+    route_type: str
+    datapath_programming: bool = False
+
+
+@dataclass(frozen=True)
+class IrbArp:
+    """The ARP settings of an irb."""
+
+    proxy: bool = False
+    learn_unsolicited: bool = False
+    host_routes: Tuple[HostRouteRule, ...] = ()
+    #: The entry origins advertised into EVPN as MAC/IP routes.
+    evpn_advertise: Tuple[str, ...] = ()
+    #: Whether the advertisement carries an interface-less-routing setting.
+    interface_less_routing: bool = False
+
+
+@dataclass(frozen=True)
+class IrbNd:
+    """The neighbour-discovery settings of an irb."""
+
+    proxy: bool = False
+    #: ``none``, ``global``, ``link-local`` or ``both``: unsolicited
+    #: advertisements are learned for these address scopes.
+    learn_unsolicited: str = ""
+    host_routes: Tuple[HostRouteRule, ...] = ()
+    evpn_advertise: Tuple[str, ...] = ()
+    interface_less_routing: bool = False
+
+
+@dataclass(frozen=True)
+class IrbInterface:
+    """One irb subinterface: the gateway a bridge domain routes through."""
+
+    name: str
+    #: The network-instances it is in: the mac-vrf it bridges and the ip-vrf
+    #: it routes into.
+    nis: Tuple[str, ...] = ()
+    ipv4: Tuple[IrbAddress, ...] = ()
+    ipv6: Tuple[IrbAddress, ...] = ()
+    #: Configured as an anycast gateway, shared with the other leaves of the
+    #: domain; the MAC is what they all answer with.
+    anycast_gw: bool = False
+    anycast_gw_mac: str = ""
+    virtual_router_id: Optional[int] = None
+    arp: IrbArp = IrbArp()
+    nd: IrbNd = IrbNd()
+
+
+# --------------------------------------------------------------------------- #
+# es_dest: where the bridge table sends a segment's traffic
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class EsDestination:
+    """One ethernet-segment the bridge table forwards to, and the VTEPs behind it."""
+
+    esi: str
+    #: The vxlan-interface it is reached through, ``vxlan1.101``.
+    overlay: str = ""
+    vteps: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class EsDestinations:
+    """The ethernet-segment destinations of one tunnel-interface."""
+
+    tunnel: str
+    destinations: Tuple[EsDestination, ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -514,6 +668,84 @@ class RouteTable:
 
 
 # --------------------------------------------------------------------------- #
+# static_routes: the routes someone typed in
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class StaticNextHop:
+    """One next-hop of a static route's next-hop-group."""
+
+    address: str
+    #: Resolved through the route table, rather than on a connected subnet.
+    resolve: bool = False
+
+
+@dataclass(frozen=True)
+class StaticRoute:
+    """One static route, with the next-hops its group names."""
+
+    prefix: str
+    #: ``enable`` or ``disable``, as the device spells it.
+    admin: str = ""
+    #: Whether it made it into the route table; ``None`` where the device did
+    #: not say.
+    installed: Optional[bool] = None
+    metric: Optional[int] = None
+    preference: Optional[int] = None
+    next_hop_group: str = ""
+    next_hops: Tuple[StaticNextHop, ...] = ()
+
+
+@dataclass(frozen=True)
+class StaticRouteTable:
+    """The static routes of one network-instance."""
+
+    ni: str
+    routes: Tuple[StaticRoute, ...] = ()
+
+
+# --------------------------------------------------------------------------- #
+# tunnel_table: the transport tunnels
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class TunnelNextHop:
+    """One next-hop a tunnel is resolved onto."""
+
+    address: str = ""
+    subinterface: str = ""
+    #: ``mpls``, ``direct``...
+    type: str = ""
+    #: The label stack pushed, outermost first - as strings, because a label
+    #: can be a reserved name rather than a number.
+    labels: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Tunnel:
+    """One entry of a tunnel table: the endpoint and how it is reached."""
+
+    prefix: str
+    #: ``vxlan``, ``ldp``, ``sr-isis``, ``rsvp``...
+    type: str = ""
+    #: The application that installed it, ``vxlan_mgr``, ``ldp_mgr``...
+    owner: str = ""
+    preference: Optional[int] = None
+    metric: Optional[int] = None
+    next_hops: Tuple[TunnelNextHop, ...] = ()
+
+
+@dataclass(frozen=True)
+class TunnelTable:
+    """The tunnel table of one network-instance."""
+
+    ni: str
+    tunnels: Tuple[Tunnel, ...] = ()
+
+
+# --------------------------------------------------------------------------- #
 # bgp_rib: the BGP RIBs
 # --------------------------------------------------------------------------- #
 
@@ -591,10 +823,19 @@ __all__ = [
     "BridgeTable",
     "Candidate",
     "Egress",
+    "EsDestination",
+    "EsDestinations",
     "EthernetSegment",
     "Family",
+    "HostRouteRule",
     "Interface",
     "InterfaceStats",
+    "IrbAddress",
+    "IrbArp",
+    "IrbInterface",
+    "IrbNd",
+    "Lag",
+    "LagMember",
     "LldpInterface",
     "LldpNeighbor",
     "MacEntry",
@@ -606,8 +847,15 @@ __all__ = [
     "Route",
     "RouteNextHop",
     "RouteTable",
+    "StaticNextHop",
+    "StaticRoute",
+    "StaticRouteTable",
     "Subinterface",
     "SubinterfaceState",
+    "SystemInfo",
+    "Tunnel",
+    "TunnelNextHop",
+    "TunnelTable",
     "VxlanDestination",
     "VxlanInterface",
     "as_dict",

@@ -5,7 +5,7 @@ import datetime
 import math
 
 from ..records import NeighborCache, NeighborEntry
-from .helpers import as_list, first_payload
+from .helpers import as_list, first_payload, instances_by_interface
 
 
 def _seconds_until(timestamp: Any) -> Optional[int]:
@@ -36,41 +36,13 @@ class NeighborDiscoveryMixin:
         """Placeholder method implemented in :class:`SrLinux`."""
         raise NotImplementedError
 
-    def _ni_names_by_subitf(self) -> Dict[str, Tuple[str, ...]]:
-        """Map ``<interface>.<index>`` to the network-instances that bind it.
-
-        Only the interface lists are asked for. On the server a Get is served
-        from what is subscribed, and a subscription to the whole
-        network-instance subtree streams every node's BGP RIBs and statistics
-        along with it - enough to fall behind on, and then everything on that
-        node's stream goes stale.
-        """
-        ni_itfs = self.get(paths=["/network-instance[name=*]/interface"], datatype="config")
-        ni_itf_map: Dict[str, List[str]] = {}
-        for ni in as_list(first_payload(ni_itfs).get("network-instance")):
-            if not isinstance(ni, dict):
-                continue
-            ni_name = str(ni.get("name", "") or "")
-            if not ni_name:
-                continue
-            for ni_itf in as_list(ni.get("interface")):
-                if isinstance(ni_itf, str):
-                    itf_name = ni_itf
-                elif isinstance(ni_itf, dict):
-                    itf_name = ni_itf.get("name")
-                else:
-                    continue
-                if itf_name:
-                    ni_itf_map.setdefault(str(itf_name), []).append(ni_name)
-        return {subitf: tuple(names) for subitf, names in ni_itf_map.items()}
-
     def _subinterfaces(self, path: str) -> Iterator[Tuple[str, Tuple[str, ...], Dict[str, Any]]]:
         """Every subinterface *path* answers with: its name, its instances, its payload.
 
         gNMI often unwraps a one-entry YANG list to a dict, so both levels are
         read as lists whether or not they came as one.
         """
-        bound = self._ni_names_by_subitf()
+        bound = instances_by_interface(self.get)
         resp = self.get(paths=[path], datatype="all")
         for itf in as_list(first_payload(resp).get("interface")):
             if not isinstance(itf, dict):

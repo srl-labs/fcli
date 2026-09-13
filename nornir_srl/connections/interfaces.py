@@ -7,6 +7,8 @@ import jmespath
 from ..records import (
     BgpVpnInstance,
     Interface,
+    Lag,
+    LagMember,
     NetworkInstance,
     Subinterface,
     SubinterfaceState,
@@ -141,22 +143,40 @@ class NetworkInstanceMixin:
         return {"nwi_itfs": records}
 
     def get_lag(self, lag_id: str = "*") -> Dict[str, Any]:
-        path_spec = {
-            "path": f"/interface[name=lag{lag_id}]",
-            "jmespath": '"interface"[].{lag:name, oper:"oper-state",mtu:mtu,"min":lag."min-links",desc:description, type:lag."lag-type", speed:lag."lag-speed","stby-sig":ethernet."standby-signaling",\
-                  "lacp-key":lag.lacp."admin-key","lacp-itvl":lag.lacp.interval,"lacp-mode":lag.lacp."lacp-mode","lacp-sysid":lag.lacp."system-id-mac","lacp-prio":lag.lacp."system-priority",\
-                    members:lag.member[].{"member-itf":name, "member-oper":"oper-state","act":lacp."activity"}}',
-            "datatype": "all",
-        }
-        resp = self.get(
-            paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
-        )
-        lags = as_list(first_payload(resp).get("interface"))
-        for itf in lags:
-            for member in as_list(itf.get("lag", {}).get("member")):
-                member["name"] = str(member.get("name", "")).replace("ethernet", "et")
-        res = jmespath.search(path_spec["jmespath"], {"interface": lags})
-        return {"lag": res}
+        resp = self.get(paths=[f"/interface[name=lag{lag_id}]"], datatype="all")
+        records = []
+        for itf in as_list(first_payload(resp).get("interface")):
+            if not isinstance(itf, dict):
+                continue
+            lag = itf.get("lag") or {}
+            lacp = lag.get("lacp") or {}
+            records.append(
+                Lag(
+                    name=str(itf.get("name") or ""),
+                    oper=str(itf.get("oper-state") or ""),
+                    mtu=as_int(itf.get("mtu")),
+                    min_links=as_int(lag.get("min-links")),
+                    description=str(itf.get("description") or ""),
+                    type=str(lag.get("lag-type") or ""),
+                    speed=as_int(lag.get("lag-speed")),
+                    standby_signaling=str((itf.get("ethernet") or {}).get("standby-signaling") or ""),
+                    lacp_key=as_int(lacp.get("admin-key")),
+                    lacp_interval=str(lacp.get("interval") or ""),
+                    lacp_mode=str(lacp.get("lacp-mode") or ""),
+                    lacp_system_id=str(lacp.get("system-id-mac") or ""),
+                    lacp_priority=as_int(lacp.get("system-priority")),
+                    members=tuple(
+                        LagMember(
+                            name=str(member.get("name") or ""),
+                            oper=str(member.get("oper-state") or ""),
+                            activity=str((member.get("lacp") or {}).get("activity") or ""),
+                        )
+                        for member in as_list(lag.get("member"))
+                        if isinstance(member, dict)
+                    ),
+                )
+            )
+        return {"lag": records}
 
     def get_sum_subitf(self, interface: str = "*") -> Dict[str, Any]:
         path_spec = {

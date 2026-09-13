@@ -36,7 +36,16 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple, Union
 
 from .connections.routing import BGP_RIB_ROUTE_FAM_ALIASES
-from .records import BgpRoute, EthernetSegment, Neighbor, Route, VxlanInterface
+from .records import (
+    BgpRoute,
+    EthernetSegment,
+    IrbAddress,
+    IrbInterface,
+    Neighbor,
+    Route,
+    StaticRoute,
+    VxlanInterface,
+)
 from .rows import Column, Table, countdown
 
 CLI = "cli"
@@ -374,6 +383,139 @@ ND_TABLE = Table(
         Column("State", "state"),
         Column("Type", "origin"),
         Column("next_state", lambda e: countdown(e.expires_in)),
+    ),
+)
+
+
+SYS_INFO_TABLE = Table(
+    columns=(
+        Column("type", "type"),
+        Column("hw-mac-address", "hw_mac_address"),
+        Column("last-booted", "last_booted"),
+        Column("part-number", "part_number"),
+        Column("serial-number", "serial_number"),
+        Column("software-version", "software_version"),
+    ),
+)
+
+LAG_TABLE = Table(
+    columns=(
+        Column("lag", "name"),
+        Column("oper", "oper"),
+        Column("mtu", "mtu"),
+        Column("min", "min_links"),
+        Column("desc", "description"),
+        Column("type", "type"),
+        Column("speed", "speed"),
+        Column("stby-sig", "standby_signaling"),
+        Column("lacp-key", "lacp_key"),
+        Column("lacp-itvl", "lacp_interval"),
+        Column("lacp-mode", "lacp_mode"),
+        Column("lacp-sysid", "lacp_system_id"),
+        Column("lacp-prio", "lacp_priority"),
+    ),
+    each="members",
+    each_columns=(
+        Column("act", "activity"),
+        # Abbreviated so the column stays narrow enough to read; the record
+        # keeps the port's full name.
+        Column("member-itf", lambda m: m.name.replace("ethernet", "et")),
+        Column("member-oper", "oper"),
+    ),
+)
+
+
+def _static_next_hops(route: StaticRoute) -> Any:
+    """Each next-hop, marked ``(R)`` where it resolves through the route table."""
+    return _listed(f"{nh.address}(R)" if nh.resolve else nh.address for nh in route.next_hops)
+
+
+STATIC_ROUTES_TABLE = Table(
+    columns=(Column("NI", "ni"),),
+    each="routes",
+    each_columns=(
+        Column("route", "prefix"),
+        Column("admin-state", "admin"),
+        Column("installed", "installed"),
+        Column("metric", "metric"),
+        Column("pref", "preference"),
+        Column("nhops", _static_next_hops),
+    ),
+)
+
+TUNNEL_TABLE = Table(
+    columns=(Column("NI", "ni"),),
+    each="tunnels",
+    each_columns=(
+        Column("Prefix", "prefix"),
+        Column("type", "type"),
+        Column("owner", "owner"),
+        Column("pref", "preference"),
+        Column("metric", "metric"),
+        Column("next-hop", lambda t: _listed(nh.address for nh in t.next_hops if nh.address)),
+        Column("egress-itf", lambda t: _listed(nh.subinterface for nh in t.next_hops if nh.subinterface)),
+        Column("label", lambda t: _listed(label for nh in t.next_hops for label in nh.labels)),
+    ),
+)
+
+
+def _irb_addresses(addresses: Tuple[IrbAddress, ...]) -> str:
+    """Each address with what it is there as: ``10.0.1.254/24 (P,AGW)``."""
+    cells = []
+    for address in addresses:
+        flags = [flag for flag, on in (("P", address.primary), ("AGW", address.anycast_gw)) if on]
+        cells.append(f"{address.prefix} ({','.join(flags)})" if flags else address.prefix)
+    return ", ".join(cells)
+
+
+def _host_route_cells(rules: Any) -> List[str]:
+    return [
+        f"host-rt:{rule.route_type or '?'}/{'dp' if rule.datapath_programming else 'no-dp'}"
+        for rule in rules
+    ]
+
+
+def _irb_arp(irb: IrbInterface) -> str:
+    parts = (["proxy"] if irb.arp.proxy else []) + (["learn-unsol"] if irb.arp.learn_unsolicited else [])
+    return ", ".join(parts + _host_route_cells(irb.arp.host_routes)) or "-"
+
+
+def _irb_nd(irb: IrbInterface) -> str:
+    parts = ["proxy"] if irb.nd.proxy else []
+    if irb.nd.learn_unsolicited and irb.nd.learn_unsolicited != "none":
+        parts.append(f"learn-unsol:{irb.nd.learn_unsolicited}")
+    return ", ".join(parts + _host_route_cells(irb.nd.host_routes)) or "-"
+
+
+def _evpn_advertise(route_types: Tuple[str, ...]) -> str:
+    return ", ".join(rt or "?" for rt in route_types) or "-"
+
+
+def _yes_no(value: bool) -> str:
+    return "Y" if value else "N"
+
+
+IRB_TABLE = Table(
+    columns=(
+        Column("name", "name"),
+        Column("NI", lambda irb: _joined(irb.nis)),
+        Column("ipv4", lambda irb: _irb_addresses(irb.ipv4)),
+        Column("ipv6", lambda irb: _irb_addresses(irb.ipv6)),
+        Column("AGW?", lambda irb: _yes_no(irb.anycast_gw)),
+        Column("arp", _irb_arp),
+        Column("nd", _irb_nd),
+        Column("arp-evpn", lambda irb: _evpn_advertise(irb.arp.evpn_advertise)),
+        Column("nd-evpn", lambda irb: _evpn_advertise(irb.nd.evpn_advertise)),
+        Column("IFL?", lambda irb: _yes_no(irb.arp.interface_less_routing or irb.nd.interface_less_routing)),
+    ),
+)
+
+ES_DEST_TABLE = Table(
+    columns=(Column("tunnel", "tunnel"),),
+    each="destinations",
+    each_columns=(
+        Column("esi", "esi"),
+        Column("vteps", lambda d: " ".join(d.vteps)),
     ),
 )
 
@@ -862,6 +1004,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="sys_info",
+        table=SYS_INFO_TABLE,
         resource="sys_info",
         key_columns=("Node",),
         title="System Info",
@@ -909,6 +1052,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="lag",
+        table=LAG_TABLE,
         resource="lag",
         key_columns=("Node", "lag", "member-itf"),
         title="LAGs",
@@ -999,6 +1143,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="static_routes",
+        table=STATIC_ROUTES_TABLE,
         resource="static_routes",
         key_columns=("Node", "NI", "route"),
         title="Static Routes",
@@ -1012,6 +1157,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="tunnel_table",
+        table=TUNNEL_TABLE,
         resource="tunnel_table",
         key_columns=("Node", "NI", "Prefix", "type"),
         title="Tunnel Table",
@@ -1084,6 +1230,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="irb",
+        table=IRB_TABLE,
         resource="irb",
         key_columns=("Node", "name"),
         title="IRB Interfaces",
@@ -1111,6 +1258,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="es_dest",
+        table=ES_DEST_TABLE,
         resource="es_dest",
         key_columns=("Node", "tunnel", "esi"),
         title="L2-ES Destinations",

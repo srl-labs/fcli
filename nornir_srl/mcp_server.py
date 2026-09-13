@@ -357,7 +357,9 @@ def sys_info(
 ) -> str:
     """Get system information for SR Linux nodes.
 
-    Returns chassis type, serial number, hardware MAC, last boot time, software version, etc.
+    Returns one object per node: node, type (the chassis), serial_number,
+    part_number, hw_mac_address, last_booted and software_version (the
+    release alone, e.g. 26.7.1).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
@@ -503,7 +505,10 @@ def static_routes(
 ) -> str:
     """Get static routes from /network-instance[name=*]/static-routes.
 
-    Returns route, admin-state, installed, metric, pref, and nhops.
+    Returns one object per network-instance per node that has any: node, ni
+    and routes - each with prefix, admin (enable/disable), installed,
+    metric, preference, next_hop_group and next_hops, each an address and
+    whether it is resolved through the route table (resolve).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
@@ -522,10 +527,12 @@ def tunnel_table(
 ) -> str:
     """Get the IP tunnel-table from /network-instance[name=*]/tunnel-table.
 
-    Returns transport tunnels (LDP, SR-ISIS, RSVP, VXLAN, ...) with the
-    resolved egress interface, next-hop IP, pushed MPLS label-stack, tunnel
-    type, owner, metric and preference. Useful for verifying which transport
-    a remote endpoint (e.g. a loopback) is reached over, and on which port.
+    Returns one object per network-instance per node that has any: node, ni
+    and tunnels - each with prefix (the endpoint), type (vxlan, ldp,
+    sr-isis, rsvp...), owner, preference, metric and next_hops, each
+    resolved to address, subinterface, type and the labels pushed. Useful
+    for verifying which transport a remote endpoint (e.g. a loopback) is
+    reached over, and on which port.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
@@ -592,7 +599,10 @@ def lag(
 ) -> str:
     """Get LAG (Link Aggregation Group) information.
 
-    Returns LAG name, oper state, MTU, min-links, LACP config, and member interfaces.
+    Returns one object per LAG per node: node, name, oper, mtu, min_links,
+    description, type (lacp/static), speed, standby_signaling, the LACP
+    settings (lacp_key, lacp_interval, lacp_mode, lacp_system_id,
+    lacp_priority) and members - each with name, oper and activity.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
@@ -663,8 +673,13 @@ def irb_interfaces(
 ) -> str:
     """Get IRB (Integrated Routing and Bridging) sub-interface details.
 
-    Returns IRB subinterface, network instance, IPv4/IPv6 addresses, anycast gateway config,
-    ARP/ND settings, EVPN advertising config, and ILR (Interface-Less Routing) support.
+    Returns one object per irb per node: node, name, nis (the mac-vrf and
+    the ip-vrf it is in), ipv4 and ipv6 (each address with primary and
+    anycast_gw flags), anycast_gw with anycast_gw_mac and virtual_router_id,
+    and arp and nd - each with proxy, learn_unsolicited, host_routes (the
+    entry origins turned into host routes, and whether they are programmed
+    in the datapath), evpn_advertise (the origins advertised into EVPN) and
+    interface_less_routing.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
@@ -705,7 +720,10 @@ def es_destinations(
 ) -> str:
     """Get Ethernet Segment destinations from bridge tables.
 
-    Returns tunnel name, ESI, and VTEP destinations. VTEP destinations are comma-separated list of (vtep-address, vni) and are dynamically generated, based on traffic/routing data.
+    Returns one object per tunnel-interface per node: node, tunnel and
+    destinations - each an esi, the overlay (vxlan-interface) it is reached
+    through and the vteps behind it. Learned from EVPN, so it reflects the
+    segments the node currently forwards to.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
