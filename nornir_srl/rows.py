@@ -20,6 +20,7 @@ and :func:`flatten`; a spec that declares a table is routed through it.
 
 from __future__ import annotations
 
+import datetime
 import re
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple, Union
@@ -37,6 +38,7 @@ __all__ = [
     "NodeRows",
     "Table",
     "clean_columns",
+    "countdown",
     "extract",
     "flatten",
     "get_fields",
@@ -142,6 +144,14 @@ def cell(value: Any) -> Any:
     if isinstance(value, list):
         return ", ".join(str(v) for v in value)
     return str(value)
+
+
+def countdown(seconds: Optional[int]) -> str:
+    """Seconds left as ``3:58:52s``, the way a table has always written an expiry.
+
+    A dash where there is no time - a static ARP entry never ages out.
+    """
+    return "-" if seconds is None else f"{datetime.timedelta(seconds=seconds)}s"
 
 
 def pass_filter(row: Dict[str, Any], filter: Optional[Dict[str, Any]]) -> bool:

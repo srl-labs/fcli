@@ -191,6 +191,84 @@ class NetworkInstance:
 
 
 # --------------------------------------------------------------------------- #
+# ifstats: what an interface carried over the last sample
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class InterfaceStats:
+    """The traffic of one interface, read from two counter samples.
+
+    The rates and the error and discard counts are for the interval between
+    the two samples - the pair the CLI takes *interval* seconds apart, or the
+    last two the server streamed - so an error here is one happening now
+    rather than one that once did. The packet and octet totals are the
+    counters as the device keeps them.
+    """
+
+    name: str
+    in_kbps: float = 0.0
+    out_kbps: float = 0.0
+    in_pps: float = 0.0
+    out_pps: float = 0.0
+    in_errors: int = 0
+    out_errors: int = 0
+    in_discards: int = 0
+    out_discards: int = 0
+    in_packets: int = 0
+    out_packets: int = 0
+    in_octets: int = 0
+    out_octets: int = 0
+    #: ``up``, ``down`` or ``down/standby``, where the sample carried the port
+    #: state alongside its counters - the server streams both; the CLI reads
+    #: only the counters and leaves this empty.
+    oper: str = ""
+    #: Why it is down, resolved to something one can act on - what tells an
+    #: idle port that is meant to be idle from one that is not.
+    down_reason: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# subif: interfaces and the subinterfaces on them
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class SubinterfaceState:
+    """A subinterface as its interface has it: what it is and whether it is up.
+
+    :class:`Subinterface` is the same thing seen from the network-instance it
+    is bound to; this is its own view, with the state that is not visible
+    from there.
+    """
+
+    name: str
+    #: ``routed``, ``bridged``, or empty where the type is implied - an irb, a
+    #: loopback.
+    type: str = ""
+    #: ``enable`` or ``disable``, as the device spells it.
+    admin: str = ""
+    #: ``up``, ``down``, or ``down/standby`` for one held down on purpose by
+    #: the ethernet-segment its port is in.
+    oper: str = ""
+    #: The root cause of a down subinterface, resolved past the ``port-down``
+    #: it says about itself to what its parent port says.
+    down_reason: str = ""
+    ip_mtu: Optional[int] = None
+    vlan: Optional[int] = None
+    ipv4: Tuple[str, ...] = ()
+    ipv6: Tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class Interface:
+    """One interface and the subinterfaces on it."""
+
+    name: str
+    subinterfaces: Tuple[SubinterfaceState, ...] = ()
+
+
+# --------------------------------------------------------------------------- #
 # vxlan: tunnel interfaces
 # --------------------------------------------------------------------------- #
 
@@ -261,6 +339,61 @@ class EthernetSegment:
     interfaces: Tuple[str, ...] = ()
     next_hops: Tuple[NextHop, ...] = ()
     associations: Tuple[Association, ...] = ()
+
+
+# --------------------------------------------------------------------------- #
+# lldp: what is on the other end of each cable
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class LldpNeighbor:
+    """One neighbour an interface hears LLDP from."""
+
+    #: The system name it advertises, which is how it is matched back to a
+    #: node of the inventory.
+    system_name: str
+    port_id: str
+    port_description: str = ""
+
+
+@dataclass(frozen=True)
+class LldpInterface:
+    """One interface and the neighbours it hears."""
+
+    name: str
+    neighbors: Tuple[LldpNeighbor, ...] = ()
+
+
+# --------------------------------------------------------------------------- #
+# arp / nd: the neighbour caches
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class NeighborEntry:
+    """One ARP or ND entry: an address and the MAC it resolves to."""
+
+    address: str
+    mac: str
+    #: ``dynamic``, ``static``, ``evpn``...
+    origin: str = ""
+    #: ND only: the reachability state, ``reachable``, ``stale``, ``delay``...
+    state: str = ""
+    #: Seconds until the entry ages out - for an ND entry, until it leaves
+    #: its current state - or ``None`` where the device gives no time, as it
+    #: does not for a static entry.
+    expires_in: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class NeighborCache:
+    """The ARP or ND entries of one subinterface."""
+
+    interface: str
+    #: The network-instances the subinterface is bound to; an irb is in two.
+    nis: Tuple[str, ...] = ()
+    entries: Tuple[NeighborEntry, ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -460,14 +593,21 @@ __all__ = [
     "Egress",
     "EthernetSegment",
     "Family",
+    "Interface",
+    "InterfaceStats",
+    "LldpInterface",
+    "LldpNeighbor",
     "MacEntry",
     "Neighbor",
+    "NeighborCache",
+    "NeighborEntry",
     "NetworkInstance",
     "NextHop",
     "Route",
     "RouteNextHop",
     "RouteTable",
     "Subinterface",
+    "SubinterfaceState",
     "VxlanDestination",
     "VxlanInterface",
     "as_dict",

@@ -118,11 +118,18 @@ class PathState:
 
 
 class RateTracker:
-    """Derives per-interface rates from consecutive streamed counter samples."""
+    """Derives per-interface rates from consecutive streamed counter samples.
+
+    Alongside each rate it keeps the raw change over the same interval, which
+    is what an error or discard count is reported as: how many during the
+    last sample, the way the CLI's two-sample report counts them, rather than
+    a total that never goes back to zero.
+    """
 
     def __init__(self) -> None:
         self._last: Dict[str, Tuple[float, Dict[str, int]]] = {}
         self._rates: Dict[str, Dict[str, float]] = {}
+        self._deltas: Dict[str, Dict[str, int]] = {}
 
     def observe(self, itf: str, counters: Dict[str, Any], ts_ns: int) -> None:
         now = ts_ns / 1e9 if ts_ns else time.time()
@@ -138,12 +145,15 @@ class RateTracker:
             dt = now - prev_ts
             if dt >= _MIN_RATE_INTERVAL:
                 rates = {}
+                deltas = {}
                 for name in IFSTATS_COUNTERS:
                     delta = current[name] - prev_counters.get(name, 0)
                     if delta < 0:  # counter reset/wrap
                         delta = 0
                     rates[name] = delta / dt
+                    deltas[name] = delta
                 self._rates[itf] = rates
+                self._deltas[itf] = deltas
                 self._last[itf] = (now, current)
             return
         self._last[itf] = (now, current)
@@ -151,6 +161,10 @@ class RateTracker:
     def rates(self, itf: str) -> Dict[str, float]:
         # Copied: read by report renders while the subscription thread observes.
         return dict(self._rates.get(itf, {}))
+
+    def deltas(self, itf: str) -> Dict[str, int]:
+        """How much each counter moved between the last two samples."""
+        return dict(self._deltas.get(itf, {}))
 
     def all_rates(self) -> Dict[str, Dict[str, float]]:
         """Every interface that has a derived rate, each a copy of its counters."""
@@ -160,6 +174,7 @@ class RateTracker:
         """Drop the counters of an interface that no longer exists."""
         self._last.pop(itf, None)
         self._rates.pop(itf, None)
+        self._deltas.pop(itf, None)
 
 
 def _extract_item_path(item: Any) -> str:

@@ -449,16 +449,13 @@ def test_streamed_delete_handles_dict_elem_paths(lldp_stream):
 def test_streamed_update_reaches_the_report_getter(lldp_stream):
     stream, device = lldp_stream
     cached = CachedDevice(stream)
-    assert (
-        cached.get_lldp_sum()["lldp_nbrs"][0]["Neighbors"][0]["Nbr-System"] == "spine1"
-    )
+    assert cached.get_lldp_sum()["lldp_nbrs"][0].neighbors[0].system_name == "spine1"
     device.push(
         "system/lldp/interface[name=ethernet-1/1]",
         [("neighbor[id=1]/system-name", "spine9")],
     )
     assert wait_for(
-        lambda: cached.get_lldp_sum()["lldp_nbrs"][0]["Neighbors"][0]["Nbr-System"]
-        == "spine9"
+        lambda: cached.get_lldp_sum()["lldp_nbrs"][0].neighbors[0].system_name == "spine9"
     )
 
 
@@ -811,7 +808,7 @@ def test_recording_device_captures_the_paths_a_report_needs():
     device = FakeDevice({LLDP_PATH: LLDP_RESPONSE})
     recorder = RecordingDevice(device)
     result = recorder.get_lldp_sum()
-    assert result["lldp_nbrs"][0]["interface"] == "ethernet-1/1"
+    assert result["lldp_nbrs"][0].name == "ethernet-1/1"
     assert recorder.recorded == [(LLDP_PATH, "state")]
 
 
@@ -864,10 +861,10 @@ def test_ifstats_report_uses_streamed_counter_samples():
     )
     try:
         cached = CachedDevice(stream)
-        rows = cached.get_ifstats()["ifstats"]
-        assert rows[0]["interface"] == "ethernet-1/1"
-        assert rows[0]["oper-state"] == "up"
-        assert rows[0]["in-Kbps"] == 0.0  # no second sample yet
+        records = cached.get_ifstats()["ifstats"]
+        assert records[0].name == "ethernet-1/1"
+        assert records[0].oper == "up"
+        assert records[0].in_kbps == 0.0  # no second sample yet
 
         base = 10_000_000_000
         device.push(
@@ -880,10 +877,50 @@ def test_ifstats_report_uses_streamed_counter_samples():
             [("statistics/in-octets", "126000")],
             timestamp=base + 1_000_000_000,
         )
-        assert wait_for(lambda: cached.get_ifstats()["ifstats"][0]["in-Kbps"] > 0)
-        row = cached.get_ifstats()["ifstats"][0]
+        assert wait_for(lambda: cached.get_ifstats()["ifstats"][0].in_kbps > 0)
+        stats = cached.get_ifstats()["ifstats"][0]
         # 125000 octets in 1s -> 1 000 Kbps
-        assert row["in-Kbps"] == pytest.approx(1000.0)
-        assert row["in-octets"] == 126000
+        assert stats.in_kbps == pytest.approx(1000.0)
+        assert stats.in_octets == 126000
     finally:
         stream.stop()
+
+
+def test_ifstats_report_counts_errors_over_the_sample_not_since_boot():
+    """An error that happened once is not one that is happening now.
+
+    The CLI's two-sample report counts errors between its samples; the server
+    counts them between the last two it streamed, so a check reading either
+    sees the same thing. The totals it keeps are the packet and octet counters.
+    """
+    device = FakeDevice({IFSTATS_PATH: IFSTATS_RESPONSE, IFSTATE_PATH: IFSTATE_RESPONSE})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    stream.ensure_paths(
+        [
+            SubscriptionSpec(IFSTATS_PATH, sample_interval=1),
+            SubscriptionSpec(IFSTATE_PATH, sample_interval=1),
+        ]
+    )
+    try:
+        base = 10_000_000_000
+        counters = dict(IFSTATS_RESPONSE[0]["interface"][0]["statistics"])
+        device.push(
+            "interface[name=ethernet-1/1]",
+            [("statistics", {**counters, "in-error-packets": "40"})],
+            timestamp=base,
+        )
+        device.push(
+            "interface[name=ethernet-1/1]",
+            [("statistics", {**counters, "in-error-packets": "43", "in-packets": "30"})],
+            timestamp=base + 1_000_000_000,
+        )
+        assert wait_for(lambda: cached_stats(stream).in_errors == 3)
+        stats = cached_stats(stream)
+        # The three new ones, not the forty-three since boot; the totals are.
+        assert (stats.in_errors, stats.in_packets, stats.in_pps) == (3, 30, 20.0)
+    finally:
+        stream.stop()
+
+
+def cached_stats(stream: HostStream):
+    return CachedDevice(stream).get_ifstats()["ifstats"][0]

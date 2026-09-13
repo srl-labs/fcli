@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional
 
+from ..records import InterfaceStats
 from .helpers import as_list, first_payload
 
 
@@ -61,7 +62,7 @@ class InterfaceStatsMixin:
         s1 = _parse(resp1)
         s2 = _parse(resp2)
 
-        rows: List[Dict[str, Any]] = []
+        records: List[InterfaceStats] = []
 
         def _delta(name: str, counter: str) -> int:
             # A counter that went backwards was reset (or the interface was
@@ -74,26 +75,24 @@ class InterfaceStatsMixin:
                 continue
             in_bps = round(_delta(name, "in-octets") * 8 / dt)
             out_bps = round(_delta(name, "out-octets") * 8 / dt)
-            in_err = _delta(name, "in-errors")
-            out_err = _delta(name, "out-errors")
-            in_disc = _delta(name, "in-discards")
-            out_disc = _delta(name, "out-discards")
-            # Cumulative counters are always reported (even for idle interfaces)
-            # so tests and agents can read raw packet/octet totals.
-            rows.append(
-                {
-                    "interface": name,
-                    "in-Kbps": round(in_bps / 1000, 1),
-                    "out-Kbps": round(out_bps / 1000, 1),
-                    "in-err": in_err,
-                    "out-err": out_err,
-                    "in-disc": in_disc,
-                    "out-disc": out_disc,
-                    "in-pkts": s2[name]["in-packets"],
-                    "out-pkts": s2[name]["out-packets"],
-                    "in-octets": s2[name]["in-octets"],
-                    "out-octets": s2[name]["out-octets"],
-                }
+            # Idle interfaces are reported too, so the cumulative counters of
+            # every interface can be read whether or not it carried anything.
+            records.append(
+                InterfaceStats(
+                    name=name,
+                    in_kbps=round(in_bps / 1000, 1),
+                    out_kbps=round(out_bps / 1000, 1),
+                    in_pps=round(_delta(name, "in-packets") / dt, 1),
+                    out_pps=round(_delta(name, "out-packets") / dt, 1),
+                    in_errors=_delta(name, "in-errors"),
+                    out_errors=_delta(name, "out-errors"),
+                    in_discards=_delta(name, "in-discards"),
+                    out_discards=_delta(name, "out-discards"),
+                    in_packets=s2[name]["in-packets"],
+                    out_packets=s2[name]["out-packets"],
+                    in_octets=s2[name]["in-octets"],
+                    out_octets=s2[name]["out-octets"],
+                )
             )
 
-        return {"ifstats": rows}
+        return {"ifstats": records}

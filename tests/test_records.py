@@ -26,25 +26,37 @@ from nornir_srl.records import (
     Candidate,
     EthernetSegment,
     Family,
+    Interface,
+    InterfaceStats,
+    LldpInterface,
+    LldpNeighbor,
     MacEntry,
     Neighbor,
+    NeighborCache,
+    NeighborEntry,
     NetworkInstance,
     NextHop,
     Subinterface,
+    SubinterfaceState,
     VxlanDestination,
     VxlanInterface,
     as_dict,
 )
 from nornir_srl.reports import (
+    ARP_TABLE,
     BGP_PEERS_TABLE,
     ES_TABLE,
+    IFSTATS_TABLE,
+    LLDP_TABLE,
     MAC_TABLE,
+    ND_TABLE,
     NI_TABLE,
     REPORTS,
+    SUBIF_TABLE,
     VXLAN_TABLE,
     get_report,
 )
-from nornir_srl.rows import Column, Table, extract, flatten
+from nornir_srl.rows import Column, Table, countdown, extract, flatten
 
 
 def _aggregated(resource, per_host, failed=()):
@@ -185,7 +197,10 @@ def test_a_record_without_sub_records_is_still_a_row():
 def test_the_columns_are_named_once_in_the_order_they_read():
     assert NI_TABLE.column_names[:2] == ["NI", "oper"]
     assert NI_TABLE.column_names[-6:] == ["Subitf", "assoc-ni", "if-oper", "ip-prefix", "mtu", "vlan"]
-    for table in (NI_TABLE, BGP_PEERS_TABLE, MAC_TABLE, ES_TABLE, VXLAN_TABLE):
+    for table in (
+        NI_TABLE, BGP_PEERS_TABLE, MAC_TABLE, ES_TABLE, VXLAN_TABLE,
+        SUBIF_TABLE, IFSTATS_TABLE, LLDP_TABLE, ARP_TABLE, ND_TABLE,
+    ):
         names = table.column_names
         assert len(set(names)) == len(names)
 
@@ -237,6 +252,69 @@ def test_the_vxlan_table_writes_the_destination_list():
     assert row["destinations"] == "(192.168.255.2, 101)"
     bare = VXLAN_TABLE.rows(VxlanInterface("vxlan1.102", "subnet-2"))[0].values
     assert (bare["ing-vni"], bare["destinations"]) == ("-", "-")
+
+
+def test_the_subif_table_lists_addresses_and_leaves_an_unset_mtu_blank():
+    port = Interface(
+        "ethernet-1/10",
+        (
+            SubinterfaceState("ethernet-1/10.0", "routed", "enable", "up", ip_mtu=9214, ipv4=("192.168.1.1/30",)),
+            SubinterfaceState("ethernet-1/10.100", "bridged", "enable", "down", down_reason="port-down", vlan=100),
+        ),
+    )
+    rows = SUBIF_TABLE.rows(port)
+    assert [r.values["Subitf"] for r in rows] == ["ethernet-1/10.0", "ethernet-1/10.100"]
+    assert rows[0].values["Itf"] == "ethernet-1/10" and rows[1].continues
+    assert (rows[0].values["ipv4"], rows[0].values["ipv6"]) == (["192.168.1.1/30"], "")
+    assert (rows[1].values["ip-mtu"], rows[1].values["vlan"], rows[1].values["down-reason"]) == ("", 100, "port-down")
+
+
+def test_the_ifstats_table_shows_the_port_state_only_where_the_sample_had_it():
+    """The CLI's two samples read counters alone; the server streams the state too."""
+    cli = IFSTATS_TABLE.rows(InterfaceStats("ethernet-1/1", in_kbps=2.7, in_errors=1))[0].values
+    assert (cli["oper-state"], cli["down-reason"], cli["in-Kbps"], cli["in-err"]) == ("", "", 2.7, 1)
+    live = IFSTATS_TABLE.rows(InterfaceStats("lag2", oper="down/standby", down_reason="standby-signaling"))[0].values
+    assert (live["oper-state"], live["down-reason"]) == ("down/standby", "standby-signaling")
+
+
+def test_the_lldp_table_is_one_row_per_neighbour():
+    port = LldpInterface("ethernet-1/49", (LldpNeighbor("s1", "ethernet-1/1"), LldpNeighbor("s2", "ethernet-1/1", "to l1")))
+    rows = LLDP_TABLE.rows(port)
+    assert [(r.values["Nbr-System"], r.values["Nbr-port"], r.values["Nbr-port-desc"]) for r in rows] == [
+        ("s1", "ethernet-1/1", ""),
+        ("s2", "ethernet-1/1", "to l1"),
+    ]
+    assert LLDP_TABLE.rows(LldpInterface("ethernet-1/50"))[0].values == {"interface": "ethernet-1/50"}
+
+
+def test_the_arp_and_nd_tables_write_the_time_left_and_join_the_instances():
+    cache = NeighborCache(
+        "irb1.101",
+        ("ipvrf-1", "subnet-1"),
+        (
+            NeighborEntry("10.0.1.2", "00:C1:AB:00:01:21", "dynamic", expires_in=14332),
+            NeighborEntry("10.0.1.254", "00:00:5E:00:01:01", "static"),
+        ),
+    )
+    rows = ARP_TABLE.rows(cache)
+    assert rows[0].values["NI"] == "ipvrf-1, subnet-1"
+    assert [(r.values["IPv4"], r.values["Type"], r.values["expiry"]) for r in rows] == [
+        ("10.0.1.2", "dynamic", "3:58:52s"),
+        ("10.0.1.254", "static", "-"),
+    ]
+    nd = ND_TABLE.rows(
+        NeighborCache("irb1.101", ("ipvrf-1",), (NeighborEntry("2001:db8::10", "00:11:22:33:44:55", "dynamic", "reachable", 25),))
+    )[0].values
+    assert (nd["IPv6"], nd["State"], nd["next_state"]) == ("2001:db8::10", "reachable", "0:00:25s")
+    # The record keeps a number, so a reader can compare rather than parse.
+    assert as_dict(cache)["entries"][0]["expires_in"] == 14332
+
+
+def test_a_countdown_reads_as_the_cli_has_always_written_it():
+    assert countdown(14332) == "3:58:52s"
+    assert countdown(90061) == "1 day, 1:01:01s"
+    assert countdown(-3) == "-1 day, 23:59:57s"
+    assert countdown(None) == "-"
 
 
 # --------------------------------------------------------------------------- #
@@ -359,9 +437,10 @@ def test_the_mcp_server_emits_records_for_a_report_that_has_them(monkeypatch):
 # the registry
 # --------------------------------------------------------------------------- #
 
-CONVERTED = ("mac", "ni", "vxlan", "es", "bgp_peers", "ipv4_rib", "ipv6_rib", "bgp_rib") + tuple(
-    r.name for r in REPORTS if r.name.startswith("bgp_rib_")
-)
+CONVERTED = (
+    "mac", "ni", "vxlan", "es", "bgp_peers", "ipv4_rib", "ipv6_rib", "bgp_rib",
+    "subif", "ifstats", "lldp", "arp", "nd",
+) + tuple(r.name for r in REPORTS if r.name.startswith("bgp_rib_"))
 
 
 @pytest.mark.parametrize("name", CONVERTED)

@@ -32,11 +32,16 @@ from nornir_srl.records import (
     Candidate,
     EthernetSegment,
     Family,
+    Interface,
+    InterfaceStats,
+    LldpInterface,
+    LldpNeighbor,
     Neighbor,
     NetworkInstance,
     Route,
     RouteTable,
     Subinterface,
+    SubinterfaceState,
     VxlanInterface,
 )
 from nornir_srl.reports import REPORTS_BY_NAME
@@ -182,20 +187,14 @@ def test_bgp_checks_survive_a_network_instance_with_no_neighbors():
 
 
 def _subif(node: str = "leaf1", **overrides: Any) -> Dict[str, Any]:
-    subif = {
-        "Subitf": "ethernet-1/1.0",
-        "type": "routed",
-        "admin": "enable",
-        "oper": "up",
-        "down-reason": "",
-        "ip-mtu": 9000,
-    }
-    subif.update(overrides)
-    return {node: [{"Itf": "ethernet-1/1", "subitfs": [subif]}]}
+    subif = SubinterfaceState(
+        "ethernet-1/1.0", type="routed", admin="enable", oper="up", ip_mtu=9000
+    )
+    return {node: [Interface("ethernet-1/1", (replace(subif, **overrides),))]}
 
 
 def test_itf_down_finds_a_subinterface_enabled_but_not_up():
-    state = fabric(subif=_subif(oper="down", **{"down-reason": "port-down"}))
+    state = fabric(subif=_subif(oper="down", down_reason="port-down"))
     findings = run("itf_down", state)
     assert len(findings) == 1
     assert findings[0]["Severity"] == ERROR
@@ -205,7 +204,7 @@ def test_itf_down_finds_a_subinterface_enabled_but_not_up():
 
 def test_itf_down_leaves_a_port_held_down_on_purpose_alone():
     """The standby side of a single-active segment reads as down/standby."""
-    state = fabric(subif=_subif(oper="down/standby", **{"down-reason": "standby-signaling"}))
+    state = fabric(subif=_subif(oper="down/standby", down_reason="standby-signaling"))
     assert run("itf_down", state) == []
 
 
@@ -223,7 +222,7 @@ def test_itf_down_ignores_the_management_interface():
     state = fabric(
         subif={
             "leaf1": [
-                {"Itf": "mgmt0", "subitfs": [{"Subitf": "mgmt0.0", "admin": "enable", "oper": "down"}]}
+                Interface("mgmt0", (SubinterfaceState("mgmt0.0", admin="enable", oper="down"),))
             ]
         }
     )
@@ -231,21 +230,12 @@ def test_itf_down_ignores_the_management_interface():
 
 
 def _ifstats(**overrides: Any) -> Dict[str, Any]:
-    row = {
-        "interface": "ethernet-1/1",
-        "in-Kbps": 12.0,
-        "out-Kbps": 8.0,
-        "in-err": 0,
-        "out-err": 0,
-        "in-disc": 0,
-        "out-disc": 0,
-    }
-    row.update(overrides)
-    return {"leaf1": [row]}
+    stats = InterfaceStats("ethernet-1/1", in_kbps=12.0, out_kbps=8.0)
+    return {"leaf1": [replace(stats, **overrides)]}
 
 
 def test_itf_errors_finds_error_packets():
-    findings = run("itf_errors", fabric(ifstats=_ifstats(**{"in-err": 4})))
+    findings = run("itf_errors", fabric(ifstats=_ifstats(in_errors=4)))
     assert len(findings) == 1
     assert findings[0]["Severity"] == ERROR
     assert findings[0]["Subject"] == "ethernet-1/1"
@@ -253,13 +243,13 @@ def test_itf_errors_finds_error_packets():
 
 
 def test_itf_errors_reports_discards_less_urgently_than_errors():
-    findings = run("itf_errors", fabric(ifstats=_ifstats(**{"out-disc": 7})))
+    findings = run("itf_errors", fabric(ifstats=_ifstats(out_discards=7)))
     assert [f["Severity"] for f in findings] == [WARNING]
     assert "0 in / 7 out discarded packets" in findings[0]["Detail"]
 
 
 def test_itf_errors_reports_errors_and_discards_separately():
-    state = fabric(ifstats=_ifstats(**{"in-err": 1, "in-disc": 2}))
+    state = fabric(ifstats=_ifstats(in_errors=1, in_discards=2))
     assert sorted(f["Severity"] for f in run("itf_errors", state)) == [ERROR, WARNING]
 
 
@@ -272,14 +262,11 @@ def test_itf_errors_says_nothing_about_a_clean_interface():
 # --------------------------------------------------------------------------- #
 
 
-def _lldp(**adjacencies: List[Dict[str, str]]) -> Dict[str, Any]:
+def _lldp(**adjacencies: List[Tuple[str, str, str]]) -> Dict[str, Any]:
     """``_lldp(leaf1=[("ethernet-1/1", "spine1", "ethernet-1/1")])`` per node."""
     return {
         node: [
-            {
-                "interface": local,
-                "Neighbors": [{"Nbr-System": peer, "Nbr-port": peer_port}],
-            }
+            LldpInterface(local, (LldpNeighbor(peer, peer_port),))
             for local, peer, peer_port in links
         ]
         for node, links in adjacencies.items()
@@ -322,16 +309,10 @@ def test_lldp_one_sided_matches_a_short_system_name_to_a_prefixed_inventory():
         reports={
             "lldp": {
                 "clab-dc1-leaf1": [
-                    {
-                        "interface": "ethernet-1/1",
-                        "Neighbors": [{"Nbr-System": "spine1", "Nbr-port": "ethernet-1/1"}],
-                    }
+                    LldpInterface("ethernet-1/1", (LldpNeighbor("spine1", "ethernet-1/1"),))
                 ],
                 "clab-dc1-spine1": [
-                    {
-                        "interface": "ethernet-1/1",
-                        "Neighbors": [{"Nbr-System": "leaf1", "Nbr-port": "ethernet-1/1"}],
-                    }
+                    LldpInterface("ethernet-1/1", (LldpNeighbor("leaf1", "ethernet-1/1"),))
                 ],
             }
         }
@@ -352,14 +333,8 @@ def _link_pair() -> Dict[str, Any]:
 
 
 def _mtu(node: str, mtu: int, index: str = "0") -> Dict[str, Any]:
-    return {
-        node: [
-            {
-                "Itf": "ethernet-1/1",
-                "subitfs": [{"Subitf": f"ethernet-1/1.{index}", "admin": "enable", "oper": "up", "ip-mtu": mtu}],
-            }
-        ]
-    }
+    subif = SubinterfaceState(f"ethernet-1/1.{index}", admin="enable", oper="up", ip_mtu=mtu)
+    return {node: [Interface("ethernet-1/1", (subif,))]}
 
 
 def test_mtu_mismatch_finds_two_ends_that_disagree():
@@ -722,14 +697,14 @@ def test_a_healthy_fabric_produces_nothing():
 def test_findings_come_back_worst_first():
     state = fabric(
         bgp_peers=_peers(state="idle"),
-        ifstats=_ifstats(**{"in-disc": 3}),
+        ifstats=_ifstats(in_discards=3),
     )
     severities = [f.severity for f in run_checks(state)]
     assert severities == [ERROR, WARNING]
 
 
 def test_only_runs_the_checks_asked_for():
-    state = fabric(bgp_peers=_peers(state="idle"), ifstats=_ifstats(**{"in-err": 1}))
+    state = fabric(bgp_peers=_peers(state="idle"), ifstats=_ifstats(in_errors=1))
     findings = run_checks(state, only=["bgp_down"])
     assert {f.check for f in findings} == {"bgp_down"}
 

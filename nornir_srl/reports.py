@@ -37,7 +37,7 @@ from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tupl
 
 from .connections.routing import BGP_RIB_ROUTE_FAM_ALIASES
 from .records import BgpRoute, EthernetSegment, Neighbor, Route, VxlanInterface
-from .rows import Column, Table
+from .rows import Column, Table, countdown
 
 CLI = "cli"
 MCP = "mcp"
@@ -300,6 +300,83 @@ NI_TABLE = Table(
         Column("vlan", "vlan"),
     ),
 )
+
+IFSTATS_TABLE = Table(
+    columns=(
+        Column("interface", "name"),
+        Column("oper-state", "oper"),
+        Column("down-reason", "down_reason"),
+        Column("in-Kbps", "in_kbps"),
+        Column("out-Kbps", "out_kbps"),
+        Column("in-pps", "in_pps"),
+        Column("out-pps", "out_pps"),
+        Column("in-err", "in_errors"),
+        Column("out-err", "out_errors"),
+        Column("in-disc", "in_discards"),
+        Column("out-disc", "out_discards"),
+        Column("in-pkts", "in_packets"),
+        Column("out-pkts", "out_packets"),
+        Column("in-octets", "in_octets"),
+        Column("out-octets", "out_octets"),
+    ),
+)
+
+SUBIF_TABLE = Table(
+    columns=(Column("Itf", "name"),),
+    each="subinterfaces",
+    each_columns=(
+        Column("Subitf", "name"),
+        Column("admin", "admin"),
+        Column("down-reason", "down_reason"),
+        Column("ip-mtu", "ip_mtu"),
+        Column("ipv4", lambda s: _listed(s.ipv4)),
+        Column("ipv6", lambda s: _listed(s.ipv6)),
+        Column("oper", "oper"),
+        Column("type", "type"),
+        Column("vlan", "vlan"),
+    ),
+)
+
+LLDP_TABLE = Table(
+    columns=(Column("interface", "name"),),
+    each="neighbors",
+    each_columns=(
+        Column("Nbr-System", "system_name"),
+        Column("Nbr-port", "port_id"),
+        Column("Nbr-port-desc", "port_description"),
+    ),
+)
+
+#: The ARP and ND tables share their shape; the address family names the
+#: address column, and only ND has a reachability state to show.
+_NEIGHBOR_CACHE_COLUMNS = (
+    Column("interface", "interface"),
+    Column("NI", lambda cache: _joined(cache.nis)),
+)
+
+ARP_TABLE = Table(
+    columns=_NEIGHBOR_CACHE_COLUMNS,
+    each="entries",
+    each_columns=(
+        Column("IPv4", "address"),
+        Column("MAC", "mac"),
+        Column("Type", "origin"),
+        Column("expiry", lambda e: countdown(e.expires_in)),
+    ),
+)
+
+ND_TABLE = Table(
+    columns=_NEIGHBOR_CACHE_COLUMNS,
+    each="entries",
+    each_columns=(
+        Column("IPv6", "address"),
+        Column("MAC", "mac"),
+        Column("State", "state"),
+        Column("Type", "origin"),
+        Column("next_state", lambda e: countdown(e.expires_in)),
+    ),
+)
+
 
 
 def _family_cell(name: str) -> Callable[[Neighbor], str]:
@@ -799,6 +876,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="ifstats",
+        table=IFSTATS_TABLE,
         resource="ifstats",
         key_columns=("Node", "interface"),
         title="Interface Stats",
@@ -815,6 +893,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="subif",
+        table=SUBIF_TABLE,
         resource="subinterface",
         key_columns=("Node", "Subitf"),
         title="Sub-Interfaces",
@@ -1055,6 +1134,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="lldp",
+        table=LLDP_TABLE,
         resource="lldp_nbrs",
         key_columns=("Node", "interface", "Nbr-System", "Nbr-port"),
         title="LLDP Neighbors",
@@ -1069,6 +1149,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="arp",
+        table=ARP_TABLE,
         resource="arp",
         key_columns=("Node", "interface", "IPv4"),
         title="ARP Table",
@@ -1085,6 +1166,7 @@ REPORTS: List[ReportSpec] = [
     ),
     ReportSpec(
         name="nd",
+        table=ND_TABLE,
         resource="nd",
         key_columns=("Node", "interface", "IPv6"),
         title="IPv6 Neighbors",

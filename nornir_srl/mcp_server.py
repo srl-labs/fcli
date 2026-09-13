@@ -569,8 +569,11 @@ def subinterfaces(
 ) -> str:
     """Get sub-interfaces of SR Linux nodes.
 
-    Returns interface name, sub-interface index, type (routed/bridged), admin/oper state,
-    IPv4/IPv6 addresses, VLAN ID, and more.
+    Returns one object per interface per node: node, name and subinterfaces -
+    each with name, type (routed/bridged), admin (enable/disable), oper (up,
+    down, or down/standby for one held down on purpose by its
+    ethernet-segment), down_reason (the root cause, resolved to the parent
+    port), ip_mtu, vlan, ipv4 and ipv6 (the prefixes configured on it).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
@@ -612,10 +615,12 @@ def ifstats(
     Queries interface statistics twice with a configurable interval, then calculates
     the delta to derive rates for each interface.
 
-    Returns per interface: in-Kbps/out-Kbps (rate over the interval), in-err/out-err
-    and in-disc/out-disc (deltas), plus cumulative counters in-pkts/out-pkts and
-    in-octets/out-octets. Idle interfaces are included so raw counters are always
-    available.
+    Returns one object per interface per node: node, name, in_kbps/out_kbps and
+    in_pps/out_pps (rates over the interval), in_errors/out_errors and
+    in_discards/out_discards (how many during the interval), plus the
+    cumulative counters in_packets/out_packets and in_octets/out_octets. Idle
+    interfaces are included so raw counters are always available. oper and
+    down_reason are empty here: the two samples read only the counters.
 
     Args:
         interval: Seconds between the two samples (default 5).
@@ -743,8 +748,9 @@ def lldp_neighbors(
 ) -> str:
     """Get LLDP neighbor information.
 
-    Returns local interface, neighbor system name, and neighbor port ID/description.
-    Useful for understanding physical topology and connectivity.
+    Returns one object per interface per node: node, name and neighbors - each
+    with system_name, port_id and port_description. Useful for understanding
+    physical topology and connectivity.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
@@ -763,7 +769,10 @@ def arp_table(
 ) -> str:
     """Get ARP table entries.
 
-    Returns interface, network instance, IPv4 address, MAC address, type, and expiry time.
+    Returns one object per sub-interface per node: node, interface, nis (the
+    network-instances it is bound to; an irb is in two) and entries - each
+    with address, mac, origin (dynamic/static/evpn...) and expires_in, the
+    seconds until the entry ages out (null for a static entry).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
@@ -782,7 +791,10 @@ def ipv6_neighbors(
 ) -> str:
     """Get IPv6 Neighbor Discovery table entries.
 
-    Returns interface, IPv6 address, MAC address, state, type, and next state time.
+    Returns one object per sub-interface per node: node, interface, nis (the
+    network-instances it is bound to) and entries - each with address, mac,
+    origin, state (reachable/stale/delay...) and expires_in, the seconds until
+    it leaves that state.
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').

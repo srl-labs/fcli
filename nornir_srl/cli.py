@@ -150,17 +150,18 @@ TABLE_THEME = Theme(
 CLI_TABLE_OMIT: Dict[str, FrozenSet[str]] = {
     "bgp_rib": frozenset({"communities"}),
     "bgp_peers": frozenset({"local-address", "local-port"}),
+    # The port state streams alongside the counters on the server; the CLI's
+    # two samples read only the counters, so here these would always be blank.
+    "ifstats": frozenset({"oper-state", "down-reason"}),
 }
 
 
 def _cli_table_omit(name: Optional[str]) -> FrozenSet[str]:
     if not name:
         return frozenset()
-    if name == "bgp_rib" or name.startswith("bgp_rib_"):
+    if name.startswith("bgp_rib_"):
         return CLI_TABLE_OMIT["bgp_rib"]
-    if name == "bgp_peers":
-        return CLI_TABLE_OMIT["bgp_peers"]
-    return frozenset()
+    return CLI_TABLE_OMIT.get(name, frozenset())
 
 
 def _cli_table_columns(name: str, columns: List[str]) -> List[str]:

@@ -387,3 +387,10 @@ def test_cli_table_omits_bgp_peers_local_endpoint_columns():
         ["peer", "local-address", "local-port", "state", "peer-as"],
     )
     assert columns == ["peer", "state", "peer-as"]
+
+
+def test_cli_table_omits_the_port_state_the_cli_ifstats_never_reads():
+    columns = cli._cli_table_columns(
+        "ifstats", ["interface", "oper-state", "down-reason", "in-Kbps", "in-pps"]
+    )
+    assert columns == ["interface", "in-Kbps", "in-pps"]

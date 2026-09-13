@@ -2802,13 +2802,13 @@ def test_get_lag_survives_an_empty_response():
 def test_get_sum_subitf_names_subinterfaces_and_lists_addresses():
     device = _FakeInterfaces({"subinterface": _SUBITF_RESPONSE})
 
-    rows = {r["Itf"]: r for r in device.get_sum_subitf()["subinterface"]}
+    interfaces = {i.name: i for i in device.get_sum_subitf()["subinterface"]}
 
-    assert set(rows) == {"ethernet-1/10", "irb1"}
-    subitf = rows["ethernet-1/10"]["subitfs"][0]
-    assert subitf["Subitf"] == "ethernet-1/10.0"
-    assert subitf["oper"] == "up"
-    assert subitf["ipv4"] == ["192.168.1.1/30"]
+    assert set(interfaces) == {"ethernet-1/10", "irb1"}
+    subitf = interfaces["ethernet-1/10"].subinterfaces[0]
+    assert subitf.name == "ethernet-1/10.0"
+    assert subitf.oper == "up"
+    assert subitf.ipv4 == ("192.168.1.1/30",)
 
 
 def test_get_sum_subitf_survives_an_empty_response():
@@ -2854,12 +2854,11 @@ def test_get_sum_subitf_calls_a_standby_subinterface_standby():
         {"subinterface": subinterfaces, "oper-down-reason": parent_reasons}
     )
 
-    rows = device.get_sum_subitf()["subinterface"]
-    subitf = rows[0]["subitfs"][0]
+    subitf = device.get_sum_subitf()["subinterface"][0].subinterfaces[0]
 
-    assert subitf["Subitf"] == "lag2.101"
-    assert subitf["oper"] == "down/standby"
-    assert subitf["down-reason"] == "standby-signaling"
+    assert subitf.name == "lag2.101"
+    assert subitf.oper == "down/standby"
+    assert subitf.down_reason == "standby-signaling"
 
 
 def test_get_sum_subitf_reports_the_root_cause_of_a_real_fault():
@@ -2891,10 +2890,10 @@ def test_get_sum_subitf_reports_the_root_cause_of_a_real_fault():
         {"subinterface": subinterfaces, "oper-down-reason": parent_reasons}
     )
 
-    subitf = device.get_sum_subitf()["subinterface"][0]["subitfs"][0]
+    subitf = device.get_sum_subitf()["subinterface"][0].subinterfaces[0]
 
-    assert subitf["oper"] == "down"
-    assert subitf["down-reason"] == "port-admin-disabled"
+    assert subitf.oper == "down"
+    assert subitf.down_reason == "port-admin-disabled"
 
 
 def test_get_arp_and_nd_label_entries_with_the_network_instance():
@@ -2985,17 +2984,19 @@ def test_get_arp_and_nd_label_entries_with_the_network_instance():
         {"network-instance": nis, "arp/neighbor": arp, "neighbor-discovery": nd}
     )
 
-    arp_rows = device.get_arp()["arp"]
-    assert len(arp_rows) == 1
-    assert arp_rows[0]["interface"] == "irb1.100"
-    assert arp_rows[0]["NI"] == "ip-vrf-1, mac-vrf-100"
-    assert arp_rows[0]["entries"][0]["IPv4"] == "10.1.100.10"
+    (arp,) = device.get_arp()["arp"]
+    assert arp.interface == "irb1.100"
+    assert arp.nis == ("ip-vrf-1", "mac-vrf-100")
+    assert arp.entries[0].address == "10.1.100.10"
+    assert arp.entries[0].mac == "00:11:22:33:44:55"
+    # No expiration-time on the entry, so no time left to report.
+    assert arp.entries[0].expires_in is None
 
-    nd_rows = device.get_nd()["nd"]
-    assert len(nd_rows) == 1
-    assert nd_rows[0]["interface"] == "irb1.100"
-    assert nd_rows[0]["NI"] == "ip-vrf-1, mac-vrf-100"
-    assert nd_rows[0]["entries"][0]["IPv6"] == "2001:db8::10"
+    (nd,) = device.get_nd()["nd"]
+    assert nd.interface == "irb1.100"
+    assert nd.nis == ("ip-vrf-1", "mac-vrf-100")
+    assert nd.entries[0].address == "2001:db8::10"
+    assert nd.entries[0].state == "reachable"
 
 
 def test_get_arp_reads_a_single_interface_dict_on_the_network_instance():
@@ -3048,6 +3049,6 @@ def test_get_arp_reads_a_single_interface_dict_on_the_network_instance():
         }
     ]
     device = _FakeNeighbors({"network-instance": nis, "arp/neighbor": arp})
-    row = device.get_arp()["arp"][0]
-    assert row["NI"] == "vrf1"
-    assert row["interface"] == "irb1.100"
+    (cache,) = device.get_arp()["arp"]
+    assert cache.nis == ("vrf1",)
+    assert cache.interface == "irb1.100"

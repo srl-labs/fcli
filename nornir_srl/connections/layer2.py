@@ -11,6 +11,8 @@ from ..records import (
     BridgeTable,
     Candidate,
     EthernetSegment,
+    LldpInterface,
+    LldpNeighbor,
     MacEntry,
     NextHop,
     VxlanDestination,
@@ -791,16 +793,26 @@ class Layer2Mixin:
         return ", ".join(hosts)
 
     def get_lldp_sum(self, interface: Optional[str] = "*") -> Dict[str, Any]:
-        path_spec = {
-            "path": f"/system/lldp/interface[name={interface}]/neighbor",
-            "jmespath": '"system/lldp".interface[].{interface:name, Neighbors:neighbor[].{"Nbr-port":"port-id","Nbr-System":"system-name", "Nbr-port-desc":"port-description"}}',
-            "datatype": "state",
-        }
-        resp = self.get(
-            paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
-        )
-        res = jmespath.search(path_spec["jmespath"], first_payload(resp))
-        return {"lldp_nbrs": res}
+        path = f"/system/lldp/interface[name={interface}]/neighbor"
+        resp = self.get(paths=[path], datatype="state")
+        lldp = first_payload(resp).get("system/lldp") or {}
+        interfaces = [
+            LldpInterface(
+                name=str(itf.get("name") or ""),
+                neighbors=tuple(
+                    LldpNeighbor(
+                        system_name=str(nbr.get("system-name") or ""),
+                        port_id=str(nbr.get("port-id") or ""),
+                        port_description=str(nbr.get("port-description") or ""),
+                    )
+                    for nbr in as_list(itf.get("neighbor"))
+                    if isinstance(nbr, dict)
+                ),
+            )
+            for itf in as_list(lldp.get("interface"))
+            if isinstance(itf, dict)
+        ]
+        return {"lldp_nbrs": interfaces}
 
     def get_mac_table(self, network_instance: Optional[str] = "*") -> Dict[str, Any]:
         path = f"/network-instance[name={network_instance}]/bridge-table/mac-table/mac"

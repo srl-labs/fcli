@@ -49,7 +49,11 @@ from nornir_srl.records import (
     BgpVpnInstance,
     BridgeTable,
     Egress,
+    LldpInterface,
+    LldpNeighbor,
     MacEntry,
+    NeighborCache,
+    NeighborEntry,
     NetworkInstance,
     Route,
     RouteNextHop,
@@ -351,18 +355,8 @@ def _leaf_and_dcgw() -> FabricState:
         },
         "ipv6_rib": {"leaf1": [], "dcgw1": []},
         "lldp": {
-            "leaf1": [
-                {
-                    "interface": "ethernet-1/49",
-                    "Neighbors": [{"Nbr-System": "dcgw1", "Nbr-port": "ethernet-1/1"}],
-                }
-            ],
-            "dcgw1": [
-                {
-                    "interface": "ethernet-1/1",
-                    "Neighbors": [{"Nbr-System": "leaf1", "Nbr-port": "ethernet-1/49"}],
-                }
-            ],
+            "leaf1": [LldpInterface("ethernet-1/49", (LldpNeighbor("dcgw1", "ethernet-1/1"),))],
+            "dcgw1": [LldpInterface("ethernet-1/1", (LldpNeighbor("leaf1", "ethernet-1/49"),))],
         },
         "arp": {},
         "nd": {},
@@ -430,12 +424,12 @@ def _dci_over_mpls() -> FabricState:
             ],
         },
         "lldp": {
-            "leaf1": [{"interface": "ethernet-1/1", "Neighbors": [{"Nbr-System": "dcgw1", "Nbr-port": "ethernet-1/1"}]}],
-            "dcgw1": [{"interface": "ethernet-1/5", "Neighbors": [{"Nbr-System": "p1", "Nbr-port": "ethernet-1/1"}]}],
-            "p1": [{"interface": "ethernet-1/2", "Neighbors": [{"Nbr-System": "dcgw3", "Nbr-port": "ethernet-1/5"}]}],
+            "leaf1": [LldpInterface("ethernet-1/1", (LldpNeighbor("dcgw1", "ethernet-1/1"),))],
+            "dcgw1": [LldpInterface("ethernet-1/5", (LldpNeighbor("p1", "ethernet-1/1"),))],
+            "p1": [LldpInterface("ethernet-1/2", (LldpNeighbor("dcgw3", "ethernet-1/5"),))],
             "dcgw3": [],
         },
-        "arp": {"dcgw3": [{"NI": "tenant-a", "interface": "irb0.2", "entries": [{"IPv4": "10.200.2.21", "MAC": "00:C1:AB:00:02:15", "Type": "dynamic"}]}]},
+        "arp": {"dcgw3": [NeighborCache("irb0.2", ("tenant-a",), (NeighborEntry("10.200.2.21", "00:C1:AB:00:02:15", "dynamic"),))]},
         "nd": {},
     }
     return state
@@ -466,13 +460,11 @@ def test_path_confirms_the_neighbour_of_a_delivered_address():
     state = _leaf_and_dcgw()
     state.reports["arp"] = {
         "dcgw1": [
-            {
-                "NI": "ipvrf-l3dci",
-                "interface": "irb0.2",
-                "entries": [
-                    {"IPv4": "10.200.2.23", "MAC": "00:C1:AB:00:02:17", "Type": "dynamic"}
-                ],
-            }
+            NeighborCache(
+                "irb0.2",
+                ("ipvrf-l3dci",),
+                (NeighborEntry("10.200.2.23", "00:C1:AB:00:02:17", "dynamic"),),
+            )
         ]
     }
     hops = lens_path(state, source="leaf1", destination="10.200.2.23", ni="ipvrf-l3dci")
@@ -490,8 +482,8 @@ def test_path_reports_a_loop_with_the_steps_it_took():
         "ipv4_rib": {node: [RouteTable("default", (route,))] for node in ("a", "b")},
         "ipv6_rib": {},
         "lldp": {
-            "a": [{"interface": "ethernet-1/1", "Neighbors": [{"Nbr-System": "b", "Nbr-port": "ethernet-1/1"}]}],
-            "b": [{"interface": "ethernet-1/1", "Neighbors": [{"Nbr-System": "a", "Nbr-port": "ethernet-1/1"}]}],
+            "a": [LldpInterface("ethernet-1/1", (LldpNeighbor("b", "ethernet-1/1"),))],
+            "b": [LldpInterface("ethernet-1/1", (LldpNeighbor("a", "ethernet-1/1"),))],
         },
         "arp": {},
         "nd": {},

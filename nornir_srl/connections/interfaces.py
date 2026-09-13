@@ -4,7 +4,14 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 import jmespath
 
-from ..records import BgpVpnInstance, NetworkInstance, Subinterface, as_int
+from ..records import (
+    BgpVpnInstance,
+    Interface,
+    NetworkInstance,
+    Subinterface,
+    SubinterfaceState,
+    as_int,
+)
 from .down_reason import ParentReasons
 from .helpers import as_list, bgp_evpn_evis, first_payload
 
@@ -37,6 +44,17 @@ def _bgp_vpn_instances(bgp_vpn: Dict[str, Any]) -> Tuple[BgpVpnInstance, ...]:
         )
         for index, inst in enumerate(as_list(bgp_vpn.get("bgp-instance")), start=1)
         if isinstance(inst, dict)
+    )
+
+
+def _prefixes(family: Any) -> Tuple[str, ...]:
+    """The addresses configured under an ``ipv4`` or ``ipv6`` container."""
+    if not isinstance(family, dict):
+        return ()
+    return tuple(
+        str(addr.get("ip-prefix"))
+        for addr in as_list(family.get("address"))
+        if isinstance(addr, dict) and addr.get("ip-prefix")
     )
 
 
@@ -168,17 +186,19 @@ class NetworkInstanceMixin:
         # with the port, so the reason worth showing lives one level up.
         parents = ParentReasons(self.get)
 
-        results = []
+        records = []
         for itf in itf_list:
-            itf_name = itf.get("name", "")
-            subitfs = []
-            for si in itf.get("subinterface", []):
+            itf_name = str(itf.get("name", ""))
+            subinterfaces = []
+            for si in as_list(itf.get("subinterface")):
+                if not isinstance(si, dict):
+                    continue
                 # Construct proper subinterface name
                 index = si.get("index", "")
-                si_name = si.get("name", "")
+                si_name = str(si.get("name", "") or "")
                 if not si_name:
                     si_name = f"{itf_name}.{index}"
-                elif str(si_name).isdigit():
+                elif si_name.isdigit():
                     si_name = f"{itf_name}.{si_name}"
 
                 # A port held in standby by its ethernet-segment is down on
@@ -187,35 +207,19 @@ class NetworkInstanceMixin:
                 own_reason = si.get("oper-down-reason")
                 oper = parents.state(si.get("oper-state"), si_name, own_reason)
 
-                # Extract interesting fields
-                sub_data = {
-                    "Subitf": si_name,
-                    "type": si.get("type"),
-                    "admin": si.get("admin-state"),
-                    "oper": oper,
-                    "down-reason": (
-                        "" if oper == "up" else parents.resolve(si_name, own_reason)
-                    ),
-                    "ip-mtu": si.get("ip-mtu"),
-                    "vlan": jmespath.search('vlan.encap."single-tagged"."vlan-id"', si),
-                }
+                subinterfaces.append(
+                    SubinterfaceState(
+                        name=si_name,
+                        type=str(si.get("type") or ""),
+                        admin=str(si.get("admin-state") or ""),
+                        oper=oper,
+                        down_reason="" if oper == "up" else parents.resolve(si_name, own_reason),
+                        ip_mtu=as_int(si.get("ip-mtu")),
+                        vlan=as_int(jmespath.search('vlan.encap."single-tagged"."vlan-id"', si)),
+                        ipv4=_prefixes(si.get("ipv4")),
+                        ipv6=_prefixes(si.get("ipv6")),
+                    )
+                )
+            records.append(Interface(name=itf_name, subinterfaces=tuple(subinterfaces)))
 
-                # IPv4 details
-                ipv4 = si.get("ipv4")
-                if ipv4:
-                    sub_data["ipv4"] = [
-                        addr.get("ip-prefix") for addr in ipv4.get("address", [])
-                    ]
-
-                # IPv6 details
-                ipv6 = si.get("ipv6")
-                if ipv6:
-                    sub_data["ipv6"] = [
-                        addr.get("ip-prefix") for addr in ipv6.get("address", [])
-                    ]
-
-                subitfs.append(sub_data)
-
-            results.append({"Itf": itf_name, "subitfs": subitfs})
-
-        return {"subinterface": results}
+        return {"subinterface": records}

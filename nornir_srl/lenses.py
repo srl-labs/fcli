@@ -56,7 +56,7 @@ from typing import (
 )
 
 from .aliases import resolve
-from .fabric import FabricState, as_list, out_of_band, parent, text
+from .fabric import FabricState, out_of_band, parent, text
 from .checks import (
     service_disagreements,
     service_facts,
@@ -65,9 +65,9 @@ from .checks import (
     underlay_domains,
     underlay_hosts,
 )
-from .records import BgpVpnInstance, Route, as_dict
+from .records import BgpVpnInstance, NeighborCache, NeighborEntry, Route, as_dict
 from .reports import ALL_SURFACES, ParamSpec
-from .rows import Column
+from .rows import Column, countdown
 
 #: How far a path walk follows the fabric before deciding it is going in
 #: circles. A datacenter fabric is three tiers; anything beyond this is a loop
@@ -432,13 +432,13 @@ def _joined(values: Iterable[Any], limit: int = 4) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _arp_bindings(state: FabricState) -> List[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
-    """Every ARP and ND entry in the fabric, as (node, interface entry, entry)."""
-    bindings = []
-    for report, key in (("arp", "IPv4"), ("nd", "IPv6")):
-        for node, itf, entry in state.sub_items(report, "entries"):
-            bindings.append((node, itf, {**entry, "_addr": entry.get(key), "_report": report}))
-    return bindings
+def _arp_bindings(state: FabricState) -> List[Tuple[str, NeighborCache, NeighborEntry, str]]:
+    """Every ARP and ND entry in the fabric, as (node, cache, entry, report)."""
+    return [
+        (node, cache, entry, report)
+        for report in ("arp", "nd")
+        for node, cache, entry in state.sub_items(report, "entries")
+    ]
 
 
 def _es_names(state: FabricState) -> Dict[str, Tuple[str, ...]]:
@@ -489,21 +489,24 @@ def lens_where(state: FabricState, target: str = "") -> List[Sighting]:
                             prefix=prefix,
                         )
                     )
-        for node, itf, entry in _arp_bindings(state):
-            if _address(entry.get("_addr")) != address:
+        for node, cache, entry, report in _arp_bindings(state):
+            if _address(entry.address) != address:
                 continue
-            bound = _mac(entry.get("MAC"))
+            bound = _mac(entry.mac)
             mac = mac or bound
+            # An ARP entry ages out; an ND entry's timer only moves it to its
+            # next reachability state, which is not an expiry.
+            ages_out = report == "arp" and entry.expires_in is not None
             sightings.append(
                 Sighting(
                     node=node,
-                    ni=str(itf.get("NI", "")),
-                    kind="arp" if entry["_report"] == "arp" else "neighbor",
+                    ni=", ".join(cache.nis),
+                    kind="arp" if report == "arp" else "neighbor",
                     address=str(address),
-                    interface=str(itf.get("interface", "")),
-                    origin=text(entry.get("Type")),
-                    mac=bound or str(entry.get("MAC") or ""),
-                    expiry=str(entry.get("expiry") or ""),
+                    interface=cache.interface,
+                    origin=text(entry.origin),
+                    mac=bound or entry.mac,
+                    expiry=countdown(entry.expires_in) if ages_out else "",
                 )
             )
         if not mac:
@@ -717,32 +720,23 @@ def _lldp_peers(state: FabricState) -> Dict[Tuple[str, str], Tuple[str, str]]:
     """(node, interface) -> the (node, port) on the other end of that cable."""
     index = state.alias_index()
     peers: Dict[Tuple[str, str], Tuple[str, str]] = {}
-    for node, entry in state.items("lldp"):
-        port = str(entry.get("interface", ""))
-        if out_of_band(port):
+    for node, itf, neighbor in state.sub_items("lldp", "neighbors"):
+        if out_of_band(itf.name):
             continue
-        for neighbor in as_list(entry.get("Neighbors")):
-            if not isinstance(neighbor, dict):
-                continue
-            advertised = str(neighbor.get("Nbr-System") or "")
-            resolved = resolve(advertised, index) if advertised else None
-            if resolved:
-                peers[(node, port)] = (resolved, str(neighbor.get("Nbr-port") or ""))
+        resolved = resolve(neighbor.system_name, index) if neighbor.system_name else None
+        if resolved:
+            peers[(node, itf.name)] = (resolved, neighbor.port_id)
     return peers
 
 
 def _neighbor_index(state: FabricState) -> Dict[Tuple[str, str], List[Tuple[str, str, str]]]:
     """(node, address) -> every (interface, MAC, origin) ARP or ND binds it to."""
     index: Dict[Tuple[str, str], List[Tuple[str, str, str]]] = {}
-    for node, itf, entry in _arp_bindings(state):
-        address = _address(entry.get("_addr"))
+    for node, cache, entry, _report in _arp_bindings(state):
+        address = _address(entry.address)
         if address is not None:
             index.setdefault((node, str(address)), []).append(
-                (
-                    str(itf.get("interface", "")),
-                    str(entry.get("MAC") or ""),
-                    text(entry.get("Type")),
-                )
+                (cache.interface, entry.mac, text(entry.origin))
             )
     return index
 
@@ -762,8 +756,8 @@ def _starting_nodes(state: FabricState, source: str, ni: str) -> List[str]:
     # An address starts the walk wherever it is directly attached: an ARP or ND
     # binding for it, or a connected route covering it.
     starts = []
-    for node, itf, entry in _arp_bindings(state):
-        if _address(entry.get("_addr")) == address and node not in starts:
+    for node, _cache, entry, _report in _arp_bindings(state):
+        if _address(entry.address) == address and node not in starts:
             starts.append(node)
     if starts:
         return starts

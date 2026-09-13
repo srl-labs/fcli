@@ -37,15 +37,13 @@ from typing import (
 from .aliases import resolve
 from .fabric import (
     FabricState,
-    as_int as _int,
-    as_list as _as_list,
     collect_fabric_state as _collect,
     index as _index,
     out_of_band as _out_of_band,
     text as _text,
 )
 
-from .records import Neighbor
+from .records import Neighbor, SubinterfaceState
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime, types only
     from nornir.core import Nornir
@@ -190,15 +188,11 @@ def check_bgp_no_routes(state: FabricState) -> List[Finding]:
 # --------------------------------------------------------------------------- #
 
 
-def _subinterfaces(state: FabricState) -> Iterator[Tuple[str, str, Dict[str, Any]]]:
+def _subinterfaces(state: FabricState) -> Iterator[Tuple[str, str, SubinterfaceState]]:
     """Every subinterface in the fabric, as (node, parent interface, subif)."""
-    for node, entry in state.items("subif"):
-        parent = str(entry.get("Itf", ""))
-        if _out_of_band(parent):
-            continue
-        for subif in _as_list(entry.get("subitfs")):
-            if isinstance(subif, dict):
-                yield node, parent, subif
+    for node, itf, subif in state.sub_items("subif", "subinterfaces"):
+        if not _out_of_band(itf.name):
+            yield node, itf.name, subif
 
 
 def check_itf_down(state: FabricState) -> List[Finding]:
@@ -210,17 +204,17 @@ def check_itf_down(state: FabricState) -> List[Finding]:
     """
     findings = []
     for node, _parent_itf, subif in _subinterfaces(state):
-        if _text(subif.get("oper")) != "down":
+        if _text(subif.oper) != "down":
             continue
-        if _text(subif.get("admin")) not in ("enable", "", "up"):
+        if _text(subif.admin) not in ("enable", "", "up"):
             continue
-        reason = str(subif.get("down-reason") or "no reason reported")
+        reason = subif.down_reason or "no reason reported"
         findings.append(
             Finding(
                 check="itf_down",
                 severity=ERROR,
                 node=node,
-                subject=str(subif.get("Subitf", "?")),
+                subject=subif.name or "?",
                 detail=f"admin enabled but oper down: {reason}",
             )
         )
@@ -234,34 +228,31 @@ def check_itf_errors(state: FabricState) -> List[Finding]:
     a finding means it is happening now rather than that it once did.
     """
     findings = []
-    for node, entry in state.items("ifstats"):
-        interface = str(entry.get("interface", ""))
-        if _out_of_band(interface):
+    for node, stats in state.items("ifstats"):
+        if _out_of_band(stats.name):
             continue
-        errors = (_int(entry.get("in-err")) or 0) + (_int(entry.get("out-err")) or 0)
-        discards = (_int(entry.get("in-disc")) or 0) + (_int(entry.get("out-disc")) or 0)
-        if errors:
+        if stats.in_errors or stats.out_errors:
             findings.append(
                 Finding(
                     check="itf_errors",
                     severity=ERROR,
                     node=node,
-                    subject=interface,
+                    subject=stats.name,
                     detail=(
-                        f"{entry.get('in-err', 0)} in / {entry.get('out-err', 0)} out "
+                        f"{stats.in_errors} in / {stats.out_errors} out "
                         "error packets during the sample"
                     ),
                 )
             )
-        if discards:
+        if stats.in_discards or stats.out_discards:
             findings.append(
                 Finding(
                     check="itf_errors",
                     severity=WARNING,
                     node=node,
-                    subject=interface,
+                    subject=stats.name,
                     detail=(
-                        f"{entry.get('in-disc', 0)} in / {entry.get('out-disc', 0)} out "
+                        f"{stats.in_discards} in / {stats.out_discards} out "
                         "discarded packets during the sample"
                     ),
                 )
@@ -288,20 +279,14 @@ def _adjacencies(state: FabricState) -> List[_Link]:
     """Every LLDP adjacency whose neighbour is a node we also have."""
     index = state.alias_index()
     links = []
-    for node, entry in state.items("lldp"):
-        port = str(entry.get("interface", ""))
-        if _out_of_band(port):
+    for node, itf, neighbor in state.sub_items("lldp", "neighbors"):
+        if _out_of_band(itf.name):
             continue
-        for neighbor in _as_list(entry.get("Neighbors")):
-            if not isinstance(neighbor, dict):
-                continue
-            peer_port = str(neighbor.get("Nbr-port") or "")
-            advertised = str(neighbor.get("Nbr-System") or "")
-            if not advertised or _out_of_band(peer_port):
-                continue
-            peer = resolve(advertised, index)
-            if peer and peer != node:
-                links.append(_Link(node, port, peer, peer_port))
+        if not neighbor.system_name or _out_of_band(neighbor.port_id):
+            continue
+        peer = resolve(neighbor.system_name, index)
+        if peer and peer != node:
+            links.append(_Link(node, itf.name, peer, neighbor.port_id))
     return links
 
 
@@ -337,10 +322,8 @@ def check_mtu_mismatch(state: FabricState) -> List[Finding]:
     """
     mtus: Dict[Tuple[str, str], Dict[str, int]] = {}
     for node, parent, subif in _subinterfaces(state):
-        mtu = _int(subif.get("ip-mtu"))
-        if mtu is not None:
-            index = _index(str(subif.get("Subitf", "")))
-            mtus.setdefault((node, parent), {})[index] = mtu
+        if subif.ip_mtu is not None:
+            mtus.setdefault((node, parent), {})[_index(subif.name)] = subif.ip_mtu
 
     findings = []
     compared = set()
@@ -417,9 +400,8 @@ def check_mtu_outlier(state: FabricState) -> List[Finding]:
     # with a deliberate mix is not making a claim this check can read.
     per_node: Dict[str, int] = {}
     for node, _parent_itf, subif in _subinterfaces(state):
-        name = str(subif.get("Subitf", ""))
-        mtu = _int(subif.get("ip-mtu"))
-        if mtu is None or name.startswith(("irb", "system", "lo")):
+        mtu = subif.ip_mtu
+        if mtu is None or subif.name.startswith(("irb", "system", "lo")):
             continue
         seen = per_node.setdefault(node, mtu)
         if seen != mtu:
