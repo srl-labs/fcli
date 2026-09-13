@@ -19,7 +19,7 @@ driven from that list.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -33,7 +33,16 @@ from typing import (
     Tuple,
 )
 
-from .aliases import alias_index, resolve
+from .aliases import resolve
+from .fabric import (
+    FabricState,
+    as_int as _int,
+    as_list as _as_list,
+    collect_fabric_state as _collect,
+    index as _index,
+    out_of_band as _out_of_band,
+    text as _text,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime, types only
     from nornir.core import Nornir
@@ -50,10 +59,6 @@ ERROR = "error"
 WARNING = "warning"
 
 _SEVERITY_ORDER = {ERROR: 0, WARNING: 1}
-
-#: Ports that carry management rather than fabric traffic. A management link is
-#: not part of the topology and its neighbour is usually not in the inventory.
-_OUT_OF_BAND = ("mgmt", "eth0")
 
 
 @dataclass(frozen=True)
@@ -85,77 +90,6 @@ class Check:
     #: What the reports it reads are called in the registry.
     requires: Tuple[str, ...]
     run: Callable[["FabricState"], List[Finding]]
-
-
-@dataclass
-class FabricState:
-    """What the checks see: one report payload per node.
-
-    ``reports[report_name][node]`` is the list a getter returned under its
-    resource key, already unwrapped. A node missing from a report is a node the
-    report could not be collected from, and :attr:`errors` says why.
-    """
-
-    reports: Dict[str, Dict[str, Any]] = field(default_factory=dict)
-    #: Inventory node name -> the hostname it is reached on.
-    hostnames: Dict[str, str] = field(default_factory=dict)
-    #: (report, node) -> why that payload is missing.
-    errors: Dict[Tuple[str, str], str] = field(default_factory=dict)
-
-    def nodes(self, report: str) -> List[str]:
-        """The nodes *report* was collected from, in inventory order."""
-        return list(self.reports.get(report, {}))
-
-    def items(self, report: str) -> Iterator[Tuple[str, Dict[str, Any]]]:
-        """Every top-level entry of *report*, paired with the node it is from."""
-        for node, payload in self.reports.get(report, {}).items():
-            for entry in _as_list(payload):
-                if isinstance(entry, dict):
-                    yield node, entry
-
-    def alias_index(self) -> Dict[str, str]:
-        """Resolver from an advertised system-name to an inventory node."""
-        names = dict.fromkeys(
-            [node for report in self.reports.values() for node in report]
-            + list(self.hostnames)
-        )
-        return alias_index([(node, self.hostnames.get(node, "")) for node in names])
-
-
-# --------------------------------------------------------------------------- #
-# small shared helpers
-# --------------------------------------------------------------------------- #
-
-
-def _as_list(value: Any) -> List[Any]:
-    if value is None:
-        return []
-    return value if isinstance(value, list) else [value]
-
-
-def _text(value: Any) -> str:
-    """*value* as the lowercase string a state comparison wants."""
-    return str(value if value is not None else "").strip().lower()
-
-
-def _out_of_band(port: str) -> bool:
-    return port.strip().lower().startswith(_OUT_OF_BAND)
-
-
-def _parent(subinterface: str) -> str:
-    """``ethernet-1/1.0`` is a subinterface of ``ethernet-1/1``."""
-    return subinterface.rsplit(".", 1)[0]
-
-
-def _index(subinterface: str) -> str:
-    return subinterface.rsplit(".", 1)[-1] if "." in subinterface else ""
-
-
-def _int(value: Any) -> Optional[int]:
-    try:
-        return int(str(value).strip())
-    except (TypeError, ValueError):
-        return None
 
 
 # --------------------------------------------------------------------------- #
@@ -450,6 +384,79 @@ def check_mtu_mismatch(state: FabricState) -> List[Finding]:
 
 
 # --------------------------------------------------------------------------- #
+# fabric-wide consistency
+# --------------------------------------------------------------------------- #
+
+
+def outliers(values: Mapping[str, Any], floor: int = 3) -> Dict[str, Tuple[Any, Any]]:
+    """The entries of *values* that disagree with what most of them say.
+
+    The fault this catches is the one nothing reports as down: every leaf
+    configured the same way except one, which works right up until traffic
+    takes the path through it. Nothing in a per-node table shows that, because
+    each node on its own looks fine - only the fabric read sideways does.
+
+    Returns ``subject -> (its value, the majority value)`` for every subject
+    that is in the minority. *floor* is how many subjects have to agree before
+    a majority means anything: two nodes differing are two opinions, not an
+    outlier and a norm.
+    """
+    counts: Dict[Any, int] = {}
+    for value in values.values():
+        counts[value] = counts.get(value, 0) + 1
+    if len(values) < floor or len(counts) < 2:
+        return {}
+    majority, agreeing = max(counts.items(), key=lambda kv: (kv[1], str(kv[0])))
+    # A plurality is not a norm: with 2/2/1 there is nothing to be an outlier
+    # from, and saying so would be inventing a convention the fabric has not.
+    if agreeing * 2 <= len(values):
+        return {}
+    return {
+        subject: (value, majority)
+        for subject, value in values.items()
+        if value != majority
+    }
+
+
+def check_mtu_outlier(state: FabricState) -> List[Finding]:
+    """A node whose fabric-facing MTU is not the one the rest of the fabric uses.
+
+    ``mtu_mismatch`` compares the two ends of a cable, so it only sees a
+    disagreement where LLDP sees a link. This reads the same values down the
+    whole fabric instead, which catches the leaf configured at the default MTU
+    on a link whose far end has not been brought up yet - before it is carrying
+    anything, rather than after.
+    """
+    # The MTU a node uses on its fabric ports, when it uses just one. A node
+    # with a deliberate mix is not making a claim this check can read.
+    per_node: Dict[str, int] = {}
+    for node, _parent_itf, subif in _subinterfaces(state):
+        name = str(subif.get("Subitf", ""))
+        mtu = _int(subif.get("ip-mtu"))
+        if mtu is None or name.startswith(("irb", "system", "lo")):
+            continue
+        seen = per_node.setdefault(node, mtu)
+        if seen != mtu:
+            per_node[node] = -1  # mixed, so not comparable
+    comparable = {node: mtu for node, mtu in per_node.items() if mtu > 0}
+
+    return [
+        Finding(
+            check="mtu_outlier",
+            severity=WARNING,
+            node=node,
+            subject="ip-mtu",
+            detail=(
+                f"fabric interfaces use ip-mtu {mine}, where {majority} is what "
+                f"{len(comparable) - len(outliers(comparable))} of "
+                f"{len(comparable)} nodes use"
+            ),
+        )
+        for node, (mine, majority) in sorted(outliers(comparable).items())
+    ]
+
+
+# --------------------------------------------------------------------------- #
 # EVPN services
 # --------------------------------------------------------------------------- #
 
@@ -651,6 +658,12 @@ CHECKS: Tuple[Check, ...] = (
         run=check_mtu_mismatch,
     ),
     Check(
+        name="mtu_outlier",
+        title="Nodes whose fabric MTU differs from the rest of the fabric",
+        requires=("subif",),
+        run=check_mtu_outlier,
+    ),
+    Check(
         name="evpn_service_mismatch",
         title="Services whose nodes disagree about VNI or route-targets",
         requires=("ni", "vxlan"),
@@ -677,36 +690,11 @@ def collect_fabric_state(
 ) -> FabricState:
     """Run the reports the checks read over a Nornir inventory.
 
-    One pass over the fabric per report, each threaded the way a single report
-    is. A node that fails one report is still checked against the others. The
-    live server does not use this - it has the state already, and builds a
-    :class:`FabricState` from its streams instead.
+    A thin default over :func:`nornir_srl.fabric.collect_fabric_state`: the
+    checks read a fixed set of reports, so the caller does not have to name
+    them. A lens names its own.
     """
-    from nornir.core.task import Result, Task  # noqa: PLC0415 - optional at import
-
-    from .connections.srlinux import CONNECTION_NAME
-    from .reports import get_report
-
-    state = FabricState()
-    state.hostnames = {
-        name: (host.hostname or name) for name, host in target.inventory.hosts.items()
-    }
-    for report_name in reports:
-        spec = get_report(report_name)
-
-        def task_func(task: "Task", spec=spec) -> "Result":
-            device = task.host.get_connection(CONNECTION_NAME, task.nornir.config)
-            return Result(host=task.host, result=spec.getter(device))
-
-        result = target.run(task=task_func, name=spec.resource, raise_on_error=False)
-        payloads: Dict[str, Any] = {}
-        for node, multi in result.items():
-            if multi.failed:
-                state.errors[(report_name, node)] = str(multi[0].exception)
-                continue
-            payloads[node] = (multi[0].result or {}).get(spec.resource) or []
-        state.reports[report_name] = payloads
-    return state
+    return _collect(target, reports)
 
 
 def run_checks(

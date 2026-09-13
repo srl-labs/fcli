@@ -39,6 +39,8 @@ from . import clab
 from .checks import CHECKS, collect_fabric_state, run_checks
 from .connections.srlinux import CONNECTION_NAME
 from .connections.helpers import clean_structured_key
+from .fabric import collect_fabric_state as collect_lens_state
+from .lenses import get_lens
 from .reports import ReportSpec, get_report
 from .rows import extract
 
@@ -820,6 +822,108 @@ def fabric_checks(
     target = nornir.filter(**i_filter) if i_filter else nornir
     findings = run_checks(collect_fabric_state(target), only=[check] if check else None)
     return json.dumps([f.as_row() for f in findings], indent=2, default=str)
+
+
+def _run_lens(name: str, inv_filter: Optional[str] = None, **params: Any) -> str:
+    """Collect what a lens reads, run it, and return its rows as JSON."""
+    spec = get_lens(name)
+    i_filter, _ = _parse_filters(inv_filter, None)
+    nornir = get_nornir()
+    target = nornir.filter(**i_filter) if i_filter else nornir
+    state = collect_lens_state(target, spec.requires)
+    try:
+        rows = spec.run(state, **params)
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, indent=2)
+    payload: Dict[str, Any] = {"rows": rows}
+    if state.errors:
+        payload["not_collected"] = [
+            {"node": node, "report": report, "error": error}
+            for (report, node), error in sorted(state.errors.items())
+        ]
+    return json.dumps(payload, indent=2, default=str)
+
+
+@mcp.tool()
+def locate_address(address: str, inv_filter: Optional[str] = None) -> str:
+    """Find every node in the fabric that knows about one MAC or IP address.
+
+    Use this instead of reading mac_table or arp_table node by node when the
+    question is 'where is this host'. An IP is resolved through ARP or ND to a
+    MAC first, so either form of address works.
+
+    Returns rows with:
+        Found: 'local' (this node learned it on its own port), 'remote' (it
+            learned it over the overlay from a VTEP or ethernet-segment), 'arp'
+            or 'neighbor' (an address binding that named the MAC), 'duplicate'
+            (more than one node claims it locally, which is expected on an
+            all-active segment and a fault otherwise), or 'not found'.
+        Via: the subinterface, VTEP address or ESI it sits behind.
+        NI, Address, Detail: the instance, the MAC, and how it was learned.
+
+    Args:
+        address: A MAC ('00:C1:AB:00:01:21') or an IP ('10.0.1.51').
+        inv_filter: Inventory filter as comma-separated key=value pairs. Narrowing
+            the inventory narrows the search, so omit it unless the fabric is large.
+    """
+    return _run_lens("where", inv_filter, target=address)
+
+
+@mcp.tool()
+def trace_path(
+    source: str,
+    destination: str,
+    ni: str = "default",
+    inv_filter: Optional[str] = None,
+) -> str:
+    """Walk the route tables hop by hop from a node towards a destination address.
+
+    Computed from the route tables rather than probed, so it works without
+    sending traffic and shows every ECMP branch instead of the one a probe
+    happened to take. A lookup in a VRF that resolves over the overlay hands off
+    to the underlay at the VTEP and the walk continues there, which is how the
+    two tables compose on the wire.
+
+    Use this for 'why does A not reach B': the row where Type is 'no route', or
+    where Peer is empty because no LLDP neighbour answers on the egress port, is
+    where the path stops.
+
+    Returns rows with Hop, Node, NI, Prefix (the route that matched), Type,
+    Next-hop, Egress (interface, or 'vxlan:<vtep>' over the overlay), Peer (the
+    node on the other end of that cable) and Detail.
+
+    Args:
+        source: The node to start from, or an address attached to one.
+        destination: The address being forwarded towards.
+        ni: Network instance to look the destination up in. Defaults to 'default'
+            (the underlay); name the IP-VRF for a tenant address.
+        inv_filter: Inventory filter as comma-separated key=value pairs. A filter
+            that excludes a node the path goes through will truncate the walk there.
+    """
+    return _run_lens(
+        "path", inv_filter, source=source, destination=destination, ni=ni
+    )
+
+
+@mcp.tool()
+def service_detail(name: str, inv_filter: Optional[str] = None) -> str:
+    """Show one network-instance as every node that carries it sees it.
+
+    The transpose of network_instances: one row per node for a single service,
+    so the node whose VNI, route-target or oper-state does not match the others
+    is a column to read down rather than several tables to compare by hand.
+
+    Returns rows with NI, Type, Oper, EVI, VNI, In-RT, Out-RT, Interfaces (with
+    their oper-state), Bound (the instances attached to it), VTEPs, MACs (local
+    versus learned over the overlay) and ES.
+
+    Args:
+        name: Network-instance name, matched as a case-insensitive regex, so
+            'subnet' matches subnet-1 and subnet-2.
+        inv_filter: Inventory filter as comma-separated key=value pairs. Omit it:
+            the point of this tool is to see every node that carries the service.
+    """
+    return _run_lens("service", inv_filter, name=name)
 
 
 # ---- CLI entry point ----

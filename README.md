@@ -443,6 +443,12 @@ Commands:
   arp           Displays ARP table
   nd            Displays IPv6 Neighbors
   routing-pol   Displays Routing Policies (json/yaml only)
+  checks        Runs the fabric sanity checks and lists what they found
+  where         Finds which nodes know about a MAC or IP address
+  path          Walks the route tables hop by hop towards a destination
+  service       Shows one service as every node that carries it sees it
+  snapshot      Keeps a report as it is now, to compare a fabric against later
+  diff          Compares a report against a snapshot, or one node against another
 ```
 
 Two kinds of filter, plus report-specific options:
@@ -600,6 +606,32 @@ One registry drives all three surfaces, so a report cannot drift between CLI, MC
 | LLDP Neighbors | `lldp` | yes | Neighbours per interface |
 | ARP Table | `arp` | yes | IPv4 neighbours per sub-interface |
 | IPv6 Neighbors | `nd` | yes | ND entries per sub-interface |
+| Checks | `checks` | yes | Fabric sanity checks, worst first; exits non-zero on an error |
+
+## Lenses
+
+A report renders one node's state; a check asks the fabric a fixed question. Neither is what you type while troubleshooting, which is closer to *where is this MAC*, *how would this node reach that address*, and *what does this service look like everywhere it exists*. Each of those joins several reports across several nodes, so none of them fits a report getter — a getter is handed one device and cannot see the fabric it sits in.
+
+A **lens** is that shape: it reads the same fabric-wide state the checks read, takes arguments the way a report does, and returns one table. One registry (`nornir_srl/lenses.py`) drives the CLI command and the MCP tool, so a lens cannot drift between them either.
+
+| Lens | CLI | MCP tool | What it answers |
+| --- | --- | --- | --- |
+| Where | `where <mac\|ip>` | `locate_address` | Which node owns an address, which learned it over the overlay, and whether two claim it locally |
+| Path | `path <from> <to>` | `trace_path` | Hop by hop from the route tables, every ECMP branch, handing off from a VRF to the underlay at the VTEP |
+| Service | `service <name>` | `service_detail` | One network-instance, one row per node: EVI, VNI, RTs, interfaces, VTEPs, MAC counts, ES |
+
+```
+# which leaf owns this host, and does anyone else think they do
+fcli -t topo.clab.yml where 00:C1:AB:00:01:21
+
+# why does this tenant address not reach that one
+fcli -t topo.clab.yml path leaf1 10.0.1.4 --ni ipvrf-1
+
+# every node's view of one bridge domain, side by side
+fcli -t topo.clab.yml service subnet-1
+```
+
+`path` is computed from the route tables rather than probed, so it needs no traffic and shows the whole ECMP fan-out instead of the one branch a probe happened to take. Where it cannot go further — no route, or no LLDP neighbour on the egress port — it says so rather than inventing a hop.
 
 ## Tested SR Linux releases
 

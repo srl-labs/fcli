@@ -25,6 +25,8 @@ from .checks import CHECKS, CHECKS_COLUMNS, Finding, collect_fabric_state, run_c
 from .connections.srlinux import CONNECTION_NAME
 from .connections.routing import BGP_RIB_ROUTE_FAM_ALIASES
 from .connections.helpers import clean_structured_key
+from .fabric import collect_fabric_state as collect_lens_state
+from .lenses import LensSpec, get_lens
 from .reports import ReportSpec, get_report
 from .rows import NodeRows, Row, cell, clean_columns, extract, pass_filter
 from .utils.logging_config import setup_logging
@@ -581,6 +583,90 @@ def run_report(
     )
 
 
+def print_lens(
+    spec: LensSpec,
+    rows: List[Dict[str, Any]],
+    *,
+    box_type: Optional[str] = None,
+    f_filter: Optional[Dict[str, str]] = None,
+    output: OutputFormat = OutputFormat.TABLE,
+    errors: Optional[List[str]] = None,
+    subtitle: str = "",
+) -> None:
+    """Print what a lens answered, one section per node."""
+    for error in errors or []:
+        typer.echo(error, err=True)
+    if f_filter:
+        rows = [row for row in rows if pass_filter(row, f_filter)]
+    columns = list(spec.columns)
+    if output != OutputFormat.TABLE:
+        print_structured(["Node", *columns], rows, output)
+        return
+    if not rows:
+        Console(theme=TABLE_THEME).print("[i]No data...[/i]")
+        return
+
+    # Consecutive rows of one node are one section. A lens whose rows are an
+    # ordered walk rather than a list keeps that order: grouping every row of a
+    # node together would pull hop 3 up beside hop 1 and lose the sequence.
+    if spec.group_by_node:
+        rows = sorted(rows, key=lambda r: str(r.get("Node", "")))
+    sections: List[NodeRows] = []
+    for row in rows:
+        node = str(row.get("Node", ""))
+        if not sections or sections[-1].node != node:
+            sections.append(NodeRows(node=node))
+        sections[-1].rows.append(Row({c: row.get(c, "") for c in columns}))
+
+    title = f"[bold]{spec.title}[/bold]"
+    if subtitle:
+        title += f"\n{subtitle}"
+    print_table(title, columns, sections, box_type=box_type)
+
+
+def run_lens(
+    ctx: typer.Context,
+    name: str,
+    field_filter: Optional[List[str]] = None,
+    subtitle: str = "",
+    **params: Any,
+) -> None:
+    """Collect what a lens reads, run it, and print the answer."""
+    spec = get_lens(name)
+    started = time.perf_counter()
+    state = collect_lens_state(ctx.obj["target"], spec.requires)
+    logger.debug(
+        "lens '%s' collected %s from %d node(s) in %.3fs",
+        spec.name,
+        ", ".join(spec.requires),
+        len(ctx.obj["target"].inventory.hosts),
+        time.perf_counter() - started,
+    )
+    try:
+        rows = spec.run(state, **params)
+    except ValueError as exc:
+        # A lens is given an address or a name by hand, so being told it is not
+        # one is an ordinary answer rather than a crash.
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(1) from None
+    print_lens(
+        spec,
+        rows,
+        box_type=ctx.obj["box_type"],
+        f_filter=(
+            {k: v for k, v in (f.split("=") for f in field_filter)}
+            if field_filter
+            else {}
+        ),
+        output=ctx.obj["output"],
+        errors=[
+            f"{node}: {report} not collected: {error}"
+            for (report, node), error in sorted(state.errors.items())
+        ],
+        subtitle=subtitle,
+    )
+
+
 # ------------------------- commands -------------------------
 
 
@@ -949,6 +1035,70 @@ def checks(
     # as the last step of a deployment as well as by hand.
     if any(f.severity == "error" for f in findings):
         raise typer.Exit(1)
+
+
+# ------------------------- lenses -------------------------
+
+
+@app.command()
+def where(
+    ctx: typer.Context,
+    address: str = typer.Argument(
+        ..., help="MAC or IP address to locate, e.g. 00:C1:AB:00:01:21 or 10.0.1.51"
+    ),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Finds which nodes know about a MAC or IP address"""
+    run_lens(
+        ctx,
+        "where",
+        field_filter=field_filter,
+        subtitle=f"Looking for {address}",
+        target=address,
+    )
+
+
+@app.command()
+def path(
+    ctx: typer.Context,
+    source: str = typer.Argument(
+        ..., help="Node to start from, or an address attached to one"
+    ),
+    destination: str = typer.Argument(..., help="Address being forwarded towards"),
+    ni: str = typer.Option(
+        "default",
+        "--ni",
+        "-n",
+        help="Network instance to look the destination up in",
+    ),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Walks the route tables hop by hop towards a destination"""
+    run_lens(
+        ctx,
+        "path",
+        field_filter=field_filter,
+        subtitle=f"{source} -> {destination} in {ni}",
+        source=source,
+        destination=destination,
+        ni=ni,
+    )
+
+
+@app.command()
+def service(
+    ctx: typer.Context,
+    name: str = typer.Argument(..., help="Network-instance name, matched as a regex"),
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Shows one service as every node that carries it sees it"""
+    run_lens(
+        ctx,
+        "service",
+        field_filter=field_filter,
+        subtitle=f"Matching '{name}'",
+        name=name,
+    )
 
 
 # ------------------------- snapshots and comparison -------------------------
