@@ -353,6 +353,30 @@ def test_nothing_is_dropped_while_the_subscription_is_down(es_stream):
     )
 
 
+def test_an_envelope_that_has_gone_quiet_keeps_what_its_last_sample_delivered(es_stream):
+    """A stream that is behind delivers its samples late but whole.
+
+    While no newer ethernet-segment data arrives, the sweep - which every
+    notification runs, whatever it is about - has nothing to say a candidate
+    is gone, however long the clock runs. Once the samples resume without
+    the candidate, it goes.
+    """
+    stream, device = es_stream
+    assert len(_df_candidates(stream)) == 2
+
+    def chatter_until(predicate, timeout):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            device.push("system", [("name/host-name", "leaf1")])
+            time.sleep(0.05)
+            if predicate():
+                return True
+        return predicate()
+
+    assert not chatter_until(lambda: len(_df_candidates(stream)) != 2, timeout=1.0)
+    assert _sample_until(device, ["192.168.255.1"], lambda: len(_df_candidates(stream)) == 1)
+
+
 def test_nothing_is_dropped_before_the_subscription_has_run_a_full_ttl(
     es_stream, monkeypatch
 ):

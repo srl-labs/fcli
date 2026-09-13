@@ -21,6 +21,7 @@ from nornir_srl.connections.helpers import clean_structured_key
 from nornir_srl.records import (
     Association,
     BgpPeers,
+    BgpVpnInstance,
     BridgeTable,
     Candidate,
     EthernetSegment,
@@ -96,6 +97,13 @@ def test_a_mac_behind_a_segment_reads_the_esi():
     assert entry.vtep == "" and entry.vni is None
 
 
+def test_a_mac_learned_over_evpn_mpls_is_remote_too():
+    """A gateway's WAN side learns MACs from a far-end PE with a label, not a VTEP."""
+    entry = MacEntry.read("00:00:00:00:01:14", "far-end:192.0.2.7 nh-tag:172799368578 label:310001", "evpn")
+    assert not entry.local
+    assert (entry.far_end, entry.label, entry.vtep, entry.interface) == ("192.0.2.7", 310001, "", "")
+
+
 def test_an_empty_destination_is_still_an_entry():
     assert MacEntry.read("00:00:00:00:00:01", None, None) == MacEntry("00:00:00:00:00:01", "", "")
 
@@ -123,8 +131,7 @@ LEAF_NI = NetworkInstance(
     oper="up",
     overlays=("vxlan1.101",),
     evis=("101",),
-    import_rts=("100:101",),
-    export_rts=("100:101",),
+    instances=(BgpVpnInstance(1, ("100:101",), ("100:101",)),),
     interfaces=(
         Subinterface("irb1.101", "up", prefixes=(), mtu=9000, associated=("ipvrf-1",)),
         Subinterface("lag1.100", "up", vlan=100, mtu=9214),
@@ -152,6 +159,18 @@ def test_a_record_with_sub_records_is_one_row_each_inheriting_its_own_columns():
     assert rows[1].cells(group=True)["vlan"] == 100
     assert rows[0].values["assoc-ni"] == "ipvrf-1"
     assert rows[1].values["assoc-ni"] == ""
+
+
+def test_a_gateway_s_route_targets_are_kept_per_instance_and_shown_together():
+    gateway = NetworkInstance(
+        "ipvrf-l3dci", "ip-vrf", "up",
+        instances=(
+            BgpVpnInstance(1, ("3000:3000",), ("3000:3000",)),
+            BgpVpnInstance(2, ("65000:3000",), ("65000:3000",), rd="192.0.2.8:13000"),
+        ),
+    )
+    assert gateway.import_rts == ("3000:3000", "65000:3000")
+    assert NI_TABLE.rows(gateway)[0].values["In-RT"] == "3000:3000, 65000:3000"
 
 
 def test_a_record_without_sub_records_is_still_a_row():
@@ -300,6 +319,7 @@ def test_flatten_uses_the_table_and_labels_the_node():
 def test_a_record_is_a_plain_object_with_its_lists_intact():
     obj = as_dict(LEAF_NI)
     assert obj["overlays"] == ["vxlan1.101"]
+    assert obj["instances"] == [{"id": 1, "import_rts": ["100:101"], "export_rts": ["100:101"], "rd": ""}]
     assert obj["interfaces"][0] == {
         "name": "irb1.101", "oper": "up", "prefixes": [], "mtu": 9000, "vlan": None,
         "associated": ["ipvrf-1"],

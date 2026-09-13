@@ -80,6 +80,7 @@
     topoZoomFit: el("topo-zoom-fit"),
     topoExportDrawio: el("topo-export-drawio"),
     servicesTreeView: el("services-tree-view"),
+    pathGraphView: el("path-graph-view"),
     viewModeBtn: el("view-mode-btn"),
     headRow: el("head-row"),
     filterRow: el("filter-row"),
@@ -142,6 +143,9 @@
     colFilters: new Map(),
     colWidths: new Map(),
     reportParams: new Map(), // the selected report's own arguments, e.g. the RIB LPM address
+    tree: null, // a lens's answer as cards, alongside its rows
+    records: null, // a lens's answer as the objects it found
+    graph: null, // a lens's answer as a graph, where it has one (the path walk)
     sort: { column: null, dir: 1 },
     windowSize: WINDOW_STEP,
     paused: false,
@@ -290,6 +294,16 @@
   // way 'fcli ipv4-rib -a' does. The server applies them to the state it is
   // already streaming, so a change reconnects the stream rather than
   // re-rendering the rows in hand.
+  function isLens(report) {
+    return Boolean(report && report.kind === "lens");
+  }
+
+  // The arguments a lens cannot answer without, still to be typed.
+  function missingParams() {
+    const specs = (state.report && state.report.params) || [];
+    return specs.filter((spec) => spec.required && !state.reportParams.get(spec.name));
+  }
+
   function renderReportParams() {
     dom.reportParams.replaceChildren();
     const specs = (state.report && state.report.params) || [];
@@ -300,7 +314,7 @@
 
       const name = document.createElement("span");
       name.className = "muted";
-      name.textContent = spec.label;
+      name.textContent = spec.required ? `${spec.label} *` : spec.label;
 
       const input = document.createElement("input");
       input.className = "input";
@@ -308,6 +322,7 @@
       input.placeholder = spec.placeholder || "";
       input.autocomplete = "off";
       input.spellcheck = false;
+      input.required = Boolean(spec.required);
       input.value = state.reportParams.get(spec.name) || "";
       if (spec.help) input.title = spec.help;
 
@@ -321,6 +336,7 @@
         else state.reportParams.delete(spec.name);
         updateFilterUI();
         connect();
+        syncCurrentVisit();
       });
 
       field.append(name, input);
@@ -406,9 +422,24 @@
       if (savedRefresh) dom.refresh.value = savedRefresh;
     } catch (_err) {}
 
-    const wanted = location.hash.replace(/^#/, "");
+    // A lens is asked something, and a walk worth sharing is one with its
+    // arguments in the link: #path?source=leaf1&destination=10.0.0.1&ni=vrf.
+    const [wanted, query] = location.hash.replace(/^#/, "").split("?", 2);
     const initial = state.reports.find((r) => r.name === wanted) || state.reports[0];
-    if (initial) selectReport(initial);
+    if (initial) {
+      selectReport(initial);
+      if (query && (initial.params || []).length) {
+        const given = new URLSearchParams(query);
+        for (const spec of initial.params) {
+          const value = (given.get(spec.name) || "").trim();
+          if (value) state.reportParams.set(spec.name, value);
+        }
+        renderReportParams();
+        updateFilterUI();
+        connect();
+        syncCurrentVisit();
+      }
+    }
   }
 
   function renderReportList() {
@@ -1841,6 +1872,7 @@
       name: state.report.name,
       title: state.report.title,
       filters: [...state.colFilters.entries()],
+      params: [...state.reportParams.entries()],
       viewMode: state.viewMode,
     };
   }
@@ -1878,12 +1910,20 @@
     dom.navForward.title = next ? `Forward to ${next.title}` : "Forward";
   }
 
+  // The fragment names the page, and for a lens carries what it was asked.
+  function pageUrl(snap) {
+    const params = new URLSearchParams();
+    for (const [name, value] of snap.params || []) params.set(name, value);
+    const query = params.toString();
+    return "#" + snap.name + (query ? "?" + query : "");
+  }
+
   function syncCurrentVisit() {
     if (!state.report || state.navIndex < 0) return;
     const snap = currentNavSnap();
     snap.id = state.navStack[state.navIndex].id;
     state.navStack[state.navIndex] = snap;
-    history.replaceState({ page: snap }, "", "#" + snap.name);
+    history.replaceState({ page: snap }, "", pageUrl(snap));
   }
 
   function recordVisit() {
@@ -1893,12 +1933,12 @@
     if (current && navPageKey(current) === navPageKey(snap)) {
       snap.id = current.id;
       state.navStack[state.navIndex] = snap;
-      history.replaceState({ page: snap }, "", "#" + snap.name);
+      history.replaceState({ page: snap }, "", pageUrl(snap));
       updateNavButtons();
       return;
     }
     snap.id = ++navSeq;
-    const url = "#" + snap.name;
+    const url = pageUrl(snap);
     if (state.navIndex < 0) {
       state.navStack = [snap];
       state.navIndex = 0;
@@ -1989,6 +2029,7 @@
       // A panel draws itself from its own endpoint instead of a table stream.
       dom.tableWrap.hidden = true;
       dom.servicesTreeView.hidden = true;
+      dom.pathGraphView.hidden = true;
       dom.viewModeBtn.hidden = true;
       dom.columnsBtn.hidden = true;
       dom.exportBtn.hidden = true;
@@ -2013,13 +2054,20 @@
       dom.topologyView.hidden = true;
       dom.columnsBtn.hidden = false;
       dom.exportBtn.hidden = false;
-      dom.compareBtn.hidden = false;
-      if (["bridge_domains", "services", "routers"].includes(report.name)) {
+      // A lens answers a question asked now; there is nothing to keep and
+      // compare a later answer against.
+      dom.compareBtn.hidden = isLens(report);
+      state.tree = null;
+      state.records = null;
+      state.graph = null;
+      if (hasTreeView(report)) {
+        const modes = viewModes(report);
         if (!(snap && snap.viewMode)) {
-          state.viewMode = localStorage.getItem(`fcli-viewmode-${report.name}`) || "tree";
+          state.viewMode = localStorage.getItem(`fcli-viewmode-${report.name}`) || modes[0];
         }
+        if (!modes.includes(state.viewMode)) state.viewMode = modes[0];
         dom.viewModeBtn.hidden = false;
-        dom.viewModeBtn.textContent = state.viewMode === "tree" ? "📊 Table View" : "🌲 Services View";
+        dom.viewModeBtn.textContent = viewModeLabel();
       } else {
         dom.viewModeBtn.hidden = true;
       }
@@ -2027,6 +2075,34 @@
       connect();
     }
     if (!fromPop) recordVisit();
+  }
+
+  function hasTreeView(report) {
+    return Boolean(
+      report && (isLens(report) || ["bridge_domains", "services", "routers"].includes(report.name))
+    );
+  }
+
+  // The lens that walks a path is drawn as one; the other lenses and the
+  // services pages fold into cards. The button names the view it switches to.
+  function hasGraphView(report) {
+    return isLens(report) && report.name === "path";
+  }
+
+  function viewModes(report) {
+    return hasGraphView(report) ? ["graph", "tree", "table"] : ["tree", "table"];
+  }
+
+  function nextViewMode() {
+    const modes = viewModes(state.report);
+    return modes[(modes.indexOf(state.viewMode) + 1) % modes.length];
+  }
+
+  function viewModeLabel() {
+    const next = nextViewMode();
+    if (next === "table") return "📊 Table View";
+    if (next === "graph") return "🗺 Path View";
+    return isLens(state.report) ? "🌲 Tree View" : "🌲 Services View";
   }
 
   /* ------------------------------------------------------------- stream */
@@ -2045,6 +2121,19 @@
     // A comparison is a verdict on two renderings; a stream pushing a third
     // over it would present as live something that is not.
     if (state.diff) return;
+    // A lens has nothing to answer until it has been asked something.
+    const missing = missingParams();
+    if (missing.length) {
+      setLive("", "waiting");
+      state.columns = [];
+      state.rows = [];
+      state.tree = null;
+      state.graph = null;
+      dom.errors.hidden = true;
+      dom.rowCount.textContent = `enter ${missing.map((spec) => spec.label.toLowerCase()).join(" and ")}`;
+      renderBody();
+      return;
+    }
     const params = queryParams();
     params.set("refresh", dom.refresh.value);
     const source = new EventSource(
@@ -2073,6 +2162,9 @@
     const columnsChanged = table.columns.join(" ") !== state.columns.join(" ");
     state.columns = table.columns;
     state.rows = table.rows;
+    state.tree = table.tree || null;
+    state.records = table.records || null;
+    state.graph = table.graph || null;
     state.errors = table.errors || [];
     if (columnsChanged) {
       state.identityColumn = null;
@@ -4040,6 +4132,384 @@
     executePendingJump();
   }
 
+  /* ---------------------------------------------------------- lens tree */
+
+  // The state a card, an entry or an item carries: 'up', 'warn', 'down' or
+  // nothing, mapped onto the classes the services cards use.
+  const LENS_CARD_STATE = { up: "up", warn: "degraded", down: "down" };
+  const LENS_BADGE_CLASS = { up: "state-badge-up", warn: "state-badge-warn", down: "state-badge-down" };
+  const LENS_PILL_CLASS = { up: "pill-up", warn: "pill-degraded", down: "pill-down" };
+
+  function lensPill(text, kind) {
+    const pill = document.createElement("span");
+    pill.className = "pill";
+    if (kind && LENS_PILL_CLASS[kind]) pill.classList.add(LENS_PILL_CLASS[kind]);
+    pill.textContent = text;
+    return pill;
+  }
+
+  function lensStateBadge(kind, text) {
+    const badge = document.createElement("span");
+    badge.className = `bd-state-badge ${LENS_BADGE_CLASS[kind] || ""}`.trim();
+    badge.textContent = text;
+    return badge;
+  }
+
+  // One detail line of an item: a label and a value, or pills for a list;
+  // a pill of its own state where the value said so.
+  function lensDetailRow(detail) {
+    const row = document.createElement("div");
+    row.className = "bd-detail-row";
+    const label = document.createElement("strong");
+    label.className = "bd-detail-label";
+    label.textContent = `${detail.label}:`;
+    row.append(label);
+    if (Array.isArray(detail.value)) {
+      const group = document.createElement("div");
+      group.className = "pill-group";
+      for (const item of detail.value) {
+        const [text, kind] = Array.isArray(item) ? item : [item, detail.state];
+        group.append(lensPill(String(text), kind));
+      }
+      row.append(group);
+    } else {
+      const value = document.createElement("span");
+      value.className = "bd-detail-value";
+      if (detail.state && LENS_PILL_CLASS[detail.state]) {
+        value.append(lensPill(String(detail.value), detail.state));
+      } else {
+        value.textContent = String(detail.value);
+      }
+      row.append(value);
+    }
+    return row;
+  }
+
+  function lensItem(item) {
+    const block = document.createElement("div");
+    block.className = "bd-vrf";
+    const header = document.createElement("div");
+    header.className = "bd-vrf-header";
+    const title = document.createElement("span");
+    title.className = "bd-vrf-title";
+    title.textContent = item.title;
+    header.append(title);
+    if (item.state) header.append(lensStateBadge(item.state, item.state.toUpperCase()));
+    block.append(header);
+    const details = document.createElement("div");
+    details.className = "bd-details";
+    for (const detail of item.details || []) details.append(lensDetailRow(detail));
+    block.append(details);
+    return block;
+  }
+
+  function lensEntry(cardKey, entry) {
+    const nodeKey = `${cardKey}:node:${entry.title}`;
+    const collapsed = state.collapsedNodes.has(nodeKey);
+    const node = document.createElement("div");
+    node.className = "bd-node";
+    node.dataset.node = entry.title;
+    node.dataset.nodeKey = nodeKey;
+    if (collapsed) node.classList.add("is-collapsed");
+
+    const title = document.createElement("div");
+    title.className = "bd-node-title";
+    title.setAttribute("role", "button");
+    title.setAttribute("tabindex", "0");
+    title.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    const chevron = document.createElement("span");
+    chevron.className = "bd-node-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    chevron.textContent = "▼";
+    const name = document.createElement("span");
+    name.textContent = entry.title;
+    title.append(chevron, name);
+    if (entry.state) {
+      const badge = lensStateBadge(entry.state, entry.state.toUpperCase());
+      badge.className = `bd-node-state ${LENS_BADGE_CLASS[entry.state] || ""}`.trim();
+      title.append(badge);
+    }
+    if (entry.badge) {
+      const count = document.createElement("span");
+      count.className = "bd-node-count";
+      count.textContent = entry.badge;
+      title.append(count);
+    }
+    node.append(title);
+
+    const content = document.createElement("div");
+    content.className = "bd-node-content";
+    if (collapsed) content.hidden = true;
+    for (const item of entry.items || []) content.append(lensItem(item));
+    node.append(content);
+
+    const toggle = () => {
+      const isCollapsed = node.classList.toggle("is-collapsed");
+      content.hidden = isCollapsed;
+      title.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
+      if (isCollapsed) state.collapsedNodes.add(nodeKey);
+      else state.collapsedNodes.delete(nodeKey);
+    };
+    title.addEventListener("click", (e) => {
+      if (e.target.closest("a, button")) return;
+      toggle();
+    });
+    title.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggle();
+      }
+    });
+    return node;
+  }
+
+  function lensCard(card, index) {
+    const cardKey = `lens:${state.report.name}:${index}:${card.title}`;
+    const collapsed = state.collapsedCards.has(cardKey);
+    const el = document.createElement("div");
+    el.className = `bd-card bd-state-${LENS_CARD_STATE[card.state] || "unknown"}`;
+    el.dataset.cardKey = cardKey;
+    if (collapsed) el.classList.add("is-collapsed");
+
+    const header = document.createElement("div");
+    header.className = "bd-header";
+    header.setAttribute("role", "button");
+    header.setAttribute("tabindex", "0");
+    header.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    const top = document.createElement("div");
+    top.className = "bd-header-top";
+    const chevron = document.createElement("span");
+    chevron.className = "bd-chevron";
+    chevron.setAttribute("aria-hidden", "true");
+    chevron.textContent = "▼";
+    const icon = document.createElement("span");
+    icon.className = "bd-icon";
+    icon.textContent = card.icon || "🔎";
+    const title = document.createElement("span");
+    title.className = "bd-title";
+    title.textContent = card.title;
+    top.append(chevron, icon, title);
+    if (card.state) top.append(lensStateBadge(card.state, card.state.toUpperCase()));
+    if (card.badge) {
+      const badge = document.createElement("span");
+      badge.className = "bd-badge-count";
+      badge.textContent = card.badge;
+      top.append(badge);
+    }
+    header.append(top);
+    if (card.subtitle) {
+      const sub = document.createElement("div");
+      sub.className = "bd-header-sub";
+      const text = document.createElement("span");
+      text.className = "bd-rt-label";
+      text.textContent = card.subtitle;
+      sub.append(text);
+      header.append(sub);
+    }
+    el.append(header);
+
+    const body = document.createElement("div");
+    body.className = "bd-body";
+    if (collapsed) body.hidden = true;
+    for (const entry of card.entries || []) body.append(lensEntry(cardKey, entry));
+    el.append(body);
+
+    const toggle = () => {
+      const isCollapsed = el.classList.toggle("is-collapsed");
+      body.hidden = isCollapsed;
+      header.setAttribute("aria-expanded", isCollapsed ? "false" : "true");
+      if (isCollapsed) state.collapsedCards.add(cardKey);
+      else state.collapsedCards.delete(cardKey);
+    };
+    header.addEventListener("click", (e) => {
+      if (e.target.closest("a, button")) return;
+      toggle();
+    });
+    header.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        toggle();
+      }
+    });
+    return el;
+  }
+
+  // What a lens found, as cards: one per thing found, the nodes inside it,
+  // and under each node what that node reports - the same fold the
+  // services pages give a fabric.
+  function renderLensTree(cards) {
+    dom.servicesTreeView.replaceChildren();
+    if (!cards.length) {
+      const p = document.createElement("p");
+      p.className = "empty";
+      const missing = missingParams();
+      p.textContent = missing.length
+        ? `Enter ${missing.map((spec) => spec.label.toLowerCase()).join(" and ")} above to ask.`
+        : "Nothing found.";
+      dom.servicesTreeView.append(p);
+      return;
+    }
+    dom.servicesTreeView.append(renderTreeControls());
+    cards.forEach((card, index) => dom.servicesTreeView.append(lensCard(card, index)));
+  }
+
+  /* ---------------------------------------------------------- path graph */
+
+  const PATH_BOX = { w: 168, h: 46, colGap: 96, rowGap: 22, top: 30, left: 12 };
+
+  function pathSvg(name, attrs, text) {
+    const node = document.createElementNS("http://www.w3.org/2000/svg", name);
+    for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+    if (text !== undefined) node.textContent = text;
+    return node;
+  }
+
+  function pathTrim(text, max) {
+    const value = String(text || "");
+    return value.length > max ? value.slice(0, max - 1) + "…" : value;
+  }
+
+  // The walk as a picture: one column per hop, a box per lookup, an edge to
+  // each lookup it leads to - so ECMP fans out across a column and converges
+  // where branches meet, and a branch that dies goes to a red stop.
+  function renderPathGraph(graph) {
+    dom.pathGraphView.replaceChildren();
+    if (!graph || !graph.nodes.length) {
+      const p = document.createElement("p");
+      p.className = "empty";
+      const missing = missingParams();
+      p.textContent = missing.length
+        ? `Enter ${missing.map((spec) => spec.label.toLowerCase()).join(" and ")} above to walk the path.`
+        : "Nothing to draw.";
+      dom.pathGraphView.append(p);
+      return;
+    }
+
+    // Layout: columns by hop, rows in the order the server listed them.
+    const hops = [...new Set(graph.nodes.map((n) => n.hop))].sort((a, b) => a - b);
+    const column = new Map(hops.map((hop, index) => [hop, index]));
+    const rowsOf = new Map();
+    const place = new Map();
+    for (const node of graph.nodes) {
+      const row = rowsOf.get(node.hop) || 0;
+      rowsOf.set(node.hop, row + 1);
+      place.set(node.id, {
+        x: PATH_BOX.left + column.get(node.hop) * (PATH_BOX.w + PATH_BOX.colGap),
+        y: PATH_BOX.top + row * (PATH_BOX.h + PATH_BOX.rowGap),
+      });
+    }
+    const width = PATH_BOX.left * 2 + hops.length * (PATH_BOX.w + PATH_BOX.colGap) - PATH_BOX.colGap;
+    const height = PATH_BOX.top + Math.max(...rowsOf.values()) * (PATH_BOX.h + PATH_BOX.rowGap);
+
+    const summary = document.createElement("div");
+    summary.className = "path-graph-summary";
+    const reached = graph.nodes.filter((n) => n.outcomes.includes("neighbor") || n.outcomes.includes("local-ip")).length;
+    const stopped = graph.nodes.filter((n) => n.state === "down").length;
+    const parts = [
+      `to <strong>${graph.destination}</strong>`,
+      `<strong>${hops.length}</strong> hop${hops.length === 1 ? "" : "s"}`,
+      `<strong>${graph.nodes.length}</strong> lookups`,
+      `<strong>${reached}</strong> reached`,
+    ];
+    if (stopped) parts.push(`<strong>${stopped}</strong> stopped`);
+    summary.innerHTML = parts.join(" · ");
+    dom.pathGraphView.append(summary);
+
+    const svg = pathSvg("svg", {
+      class: "path-graph",
+      width,
+      height,
+      viewBox: `0 0 ${width} ${height}`,
+      role: "img",
+      "aria-label": `Path to ${graph.destination}`,
+    });
+    const defs = pathSvg("defs", {});
+    for (const kind of ["", "up", "down"]) {
+      const marker = pathSvg("marker", {
+        id: `path-arrow-${kind || "plain"}`,
+        viewBox: "0 0 10 10",
+        refX: 9,
+        refY: 5,
+        markerWidth: 7,
+        markerHeight: 7,
+        orient: "auto-start-reverse",
+      });
+      marker.append(pathSvg("path", { d: "M0,0 L10,5 L0,10 z", class: `path-arrow ${kind ? "path-arrow-" + kind : ""}`.trim() }));
+      defs.append(marker);
+    }
+    svg.append(defs);
+
+    for (const hop of hops) {
+      const x = PATH_BOX.left + column.get(hop) * (PATH_BOX.w + PATH_BOX.colGap) + PATH_BOX.w / 2;
+      svg.append(pathSvg("text", { x, y: 16, "text-anchor": "middle", class: "path-hop-label" }, `hop ${hop}`));
+    }
+
+    // Labels of the edges leaving one box are spread along their curves,
+    // or the ones fanning out of a leaf would print over each other.
+    const leaving = new Map();
+    for (const edge of graph.edges) leaving.set(edge.from, (leaving.get(edge.from) || 0) + 1);
+    const labelled = new Map();
+    for (const edge of graph.edges) {
+      const from = place.get(edge.from);
+      const to = place.get(edge.to);
+      if (!from || !to) continue;
+      const siblings = leaving.get(edge.from) || 1;
+      const index = labelled.get(edge.from) || 0;
+      labelled.set(edge.from, index + 1);
+      const x1 = from.x + PATH_BOX.w;
+      const y1 = from.y + PATH_BOX.h / 2;
+      const x2 = to.x;
+      const y2 = to.y + PATH_BOX.h / 2;
+      const bend = Math.max(30, (x2 - x1) / 2);
+      const d = `M${x1},${y1} C${x1 + bend},${y1} ${x2 - bend},${y2} ${x2},${y2}`;
+      const kind = edge.state === "up" || edge.state === "down" ? edge.state : "";
+      svg.append(
+        pathSvg("path", {
+          d,
+          class: `path-edge ${kind ? "path-edge-" + kind : ""}`.trim(),
+          "marker-end": `url(#path-arrow-${kind || "plain"})`,
+        })
+      );
+      if (edge.label) {
+        // Near the source, where edges leaving one box are still apart, and
+        // further along for each next sibling.
+        const t = siblings > 1 ? 0.2 + (0.35 * index) / (siblings - 1) : 0.28;
+        const lx = x1 + (x2 - x1) * t;
+        const ly = y1 + (y2 - y1) * t - 5;
+        const text = pathTrim(edge.label, 24);
+        const bg = pathSvg("rect", {
+          x: lx - text.length * 3.1 - 3,
+          y: ly - 9,
+          width: text.length * 6.2 + 6,
+          height: 12,
+          rx: 3,
+          class: "path-edge-label-bg",
+        });
+        svg.append(bg, pathSvg("text", { x: lx, y: ly, "text-anchor": "middle", class: "path-edge-label" }, text));
+      }
+    }
+
+    for (const node of graph.nodes) {
+      const at = place.get(node.id);
+      const group = pathSvg("g", { transform: `translate(${at.x},${at.y})` });
+      const title = pathSvg("title", {}, [node.title, node.subtitle, ...(node.details || [])].filter(Boolean).join("\n"));
+      group.append(
+        title,
+        pathSvg("rect", {
+          width: PATH_BOX.w,
+          height: PATH_BOX.h,
+          class: `path-box ${node.state ? "path-box-" + node.state : ""}`.trim(),
+        }),
+        pathSvg("text", { x: 10, y: node.subtitle ? 19 : 28, class: "path-box-title" }, pathTrim(node.title, 22)),
+      );
+      if (node.subtitle) {
+        group.append(pathSvg("text", { x: 10, y: 35, class: "path-box-sub" }, pathTrim(node.subtitle, 27)));
+      }
+      svg.append(group);
+    }
+    dom.pathGraphView.append(svg);
+  }
+
   function renderBody() {
     // Overview and Topology own the main area; a table would be drawn over them.
     if (state.report && isPanelReport(state.report.name)) return;
@@ -4054,13 +4524,37 @@
       state.viewMode === "tree"
     ) {
       dom.tableWrap.hidden = true;
+      dom.pathGraphView.hidden = true;
       dom.servicesTreeView.hidden = false;
       renderBridgeDomainsTree(rows);
       dom.rowCount.textContent = `${rows.length} service entry/entries`;
       return;
     }
 
+    if (!state.diff && hasGraphView(state.report) && state.viewMode === "graph") {
+      dom.tableWrap.hidden = true;
+      dom.servicesTreeView.hidden = true;
+      dom.pathGraphView.hidden = false;
+      renderPathGraph(state.graph);
+      if (state.rows.length) {
+        dom.rowCount.textContent = `${state.graph ? state.graph.nodes.length : 0} lookup(s), ${state.rows.length} row(s)`;
+      }
+      return;
+    }
+    dom.pathGraphView.hidden = true;
+
+    if (!state.diff && isLens(state.report) && state.viewMode === "tree") {
+      dom.tableWrap.hidden = true;
+      dom.servicesTreeView.hidden = false;
+      renderLensTree(state.tree || []);
+      if (state.rows.length) {
+        dom.rowCount.textContent = `${state.tree ? state.tree.length : 0} card(s), ${state.rows.length} row(s)`;
+      }
+      return;
+    }
+
     dom.servicesTreeView.hidden = true;
+    dom.pathGraphView.hidden = true;
     dom.tableWrap.hidden = false;
 
     if (state.sort.column) {
@@ -4090,11 +4584,10 @@
         if (changes && changes[column]) td.classList.add("diff-cell");
         let stateClass = STATE_CLASSES[String(value).toLowerCase()];
         if (state.report && state.report.name === "bgp_peers" && column.toLowerCase().includes("state")) {
-          if (String(value).toLowerCase() === "established") {
-            stateClass = "state-established";
-          } else {
-            stateClass = "state-down";
-          }
+          // The table shows an established session as 'up'; anything else
+          // is a session still trying.
+          const session = String(value).toLowerCase();
+          stateClass = session === "up" || session === "established" ? "state-established" : "state-down";
         }
         if (stateClass) td.classList.add(stateClass);
         else if (isNumeric(value) && value !== "") td.classList.add("num");
@@ -4129,6 +4622,11 @@
 
   async function exportPayload() {
     return { columns: visibleColumns(), rows: filteredRows() };
+  }
+
+  // What -o json gives on the CLI: the records, not the table's cells.
+  function exportRecords() {
+    return isLens(state.report) && Array.isArray(state.records) ? state.records : null;
   }
 
   function downloadText(filename, mime, text) {
@@ -4174,7 +4672,8 @@
         for (const row of rows) lines.push(columns.map((c) => escape(row[c])).join(","));
         downloadText(`${base}.csv`, "text/csv", lines.join("\n"));
       } else if (format === "json") {
-        downloadText(`${base}.json`, "application/json", JSON.stringify(rows, null, 2));
+        const payload = exportRecords() || rows;
+        downloadText(`${base}.json`, "application/json", JSON.stringify(payload, null, 2));
       } else {
         const yaml = rows
           .map((row) => {
@@ -4435,13 +4934,13 @@
   }
 
   dom.viewModeBtn.addEventListener("click", () => {
-    state.viewMode = state.viewMode === "tree" ? "table" : "tree";
+    state.viewMode = nextViewMode();
     if (state.report) {
       try {
         localStorage.setItem(`fcli-viewmode-${state.report.name}`, state.viewMode);
       } catch (_err) {}
     }
-    dom.viewModeBtn.textContent = state.viewMode === "tree" ? "📊 Table View" : "🌲 Services View";
+    dom.viewModeBtn.textContent = viewModeLabel();
     renderBody();
   });
 

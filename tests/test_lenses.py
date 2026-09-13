@@ -35,12 +35,27 @@ from nornir_srl.lenses import (
     Interface,
     Service,
     Sighting,
+    coerce_lens_params,
     get_lens,
+    graph_path,
     lens_path,
     lens_service,
     lens_where,
+    tree_path,
+    tree_service,
+    tree_where,
 )
-from nornir_srl.records import BridgeTable, Egress, MacEntry, Route, RouteNextHop, RouteTable, as_dict
+from nornir_srl.records import (
+    BgpVpnInstance,
+    BridgeTable,
+    Egress,
+    MacEntry,
+    NetworkInstance,
+    Route,
+    RouteNextHop,
+    RouteTable,
+    as_dict,
+)
 from nornir_srl.reports import REPORTS_BY_NAME
 from tests.system.replay import Recording, recording_paths
 
@@ -136,6 +151,26 @@ def test_where_resolves_an_ip_through_arp(state: FabricState):
     assert arp[0].node == LEAF
     assert ":" in arp[0].mac, "the binding does not report the MAC it resolved to"
     assert arp[0].address == "100.64.1.16"
+
+
+def test_where_finds_an_address_a_node_has_configured(state: FabricState):
+    """A system address is nobody's neighbour; it is somebody's own."""
+    sightings = lens_where(state, "192.168.255.1")
+    configured = _of_kind(sightings, "configured")
+    assert [(s.node, s.ni, s.interface, s.prefix) for s in configured] == [
+        (LEAF, "default", "system0.0", "192.168.255.1/32")
+    ]
+    assert get_lens("where").row(configured[0])["Detail"] == "192.168.255.1/32 configured on system0.0"
+    # It resolved to no MAC, and that is the whole answer rather than nothing.
+    assert not _of_kind(sightings, "not-found")
+
+
+def test_where_answers_an_ip_nothing_has_rather_than_saying_nothing(state: FabricState):
+    """An IP with no interface and no binding used to come back as an empty list."""
+    (only,) = lens_where(state, "203.0.113.9")
+    assert only.kind == "not-found" and only.address == "203.0.113.9"
+    assert only.searched == len(state.nodes("ni"))
+    assert "no ARP or ND entry" in get_lens("where").row(only)["Detail"]
 
 
 def test_where_says_so_when_nothing_has_it(state: FabricState):
@@ -247,15 +282,15 @@ def test_path_delivers_an_attached_address_locally(state: FabricState):
 
 def test_path_hands_a_vrf_lookup_off_to_the_underlay(state: FabricState):
     hops = lens_path(state, source=LEAF, destination="10.0.1.4", ni="ipvrf-1")
-    overlay = _with(hops, "overlay")
+    overlay = _with(hops, "tunnel")
     assert overlay, "a route resolved over the overlay does not report its tunnel"
     assert overlay[0].ni == "ipvrf-1"
-    assert overlay[0].egress == f"vxlan:{overlay[0].vtep}"
+    assert (overlay[0].tunnel, overlay[0].egress) == ("vxlan", f"vxlan:{overlay[0].endpoint}")
     # and the walk continues in the underlay, towards that VTEP
     underlay = [h for h in hops if h.ni == "default"]
     assert underlay, "the walk does not continue in the default instance"
     assert underlay[0].prefix.startswith("192.168.255.")
-    assert underlay[0].address == overlay[0].vtep
+    assert underlay[0].address == overlay[0].endpoint
 
 
 def test_path_reports_a_destination_nothing_routes_to(state: FabricState):
@@ -341,19 +376,90 @@ def test_path_continues_in_vrf_after_vtep_is_reached():
         _leaf_and_dcgw(), source="leaf1", destination="10.200.2.23", ni="ipvrf-l3dci"
     )
     assert [(h.hop, h.node, h.ni, h.outcome) for h in hops] == [
-        (1, "leaf1", "ipvrf-l3dci", "overlay"),
+        (1, "leaf1", "ipvrf-l3dci", "tunnel"),
         (2, "leaf1", "default", "forwarded"),
-        (3, "dcgw1", "default", "vtep-reached"),
+        (3, "dcgw1", "default", "endpoint-reached"),
         (4, "dcgw1", "ipvrf-l3dci", "delivered"),
         (5, "dcgw1", "ipvrf-l3dci", "no-neighbor"),
     ]
     overlay, underlay, vtep, delivered, last = hops
-    assert overlay.vtep == "192.168.255.2"
+    assert (overlay.tunnel, overlay.endpoint) == ("vxlan", "192.168.255.2")
     # The underlay leg looks the VTEP up, not the destination.
     assert underlay.address == "192.168.255.2" and underlay.peer == "dcgw1"
     assert vtep.route_type == "host" and vtep.resumes_in == "ipvrf-l3dci"
     assert delivered.route_type == "local" and delivered.egress == "irb0.2"
     assert last.address == "10.200.2.23"
+
+
+def _dci_over_mpls() -> FabricState:
+    """A leaf, a DC gateway and a WAN gateway: VXLAN to the first, LDP to the second.
+
+    dcgw1 carries the tenant in ``ipvrf-l3dci`` and sends it over an LDP
+    tunnel to dcgw3's WAN loopback 192.0.3.7; dcgw3 calls the same VRF
+    ``tenant-a`` - only the route-target ties the two - and has the
+    destination attached there.
+    """
+    state = FabricState()
+    state.hostnames = {"leaf1": "leaf1", "dcgw1": "dcgw1", "p1": "p1", "dcgw3": "dcgw3"}
+    state.reports = {
+        "ipv4_rib": {
+            "leaf1": [
+                RouteTable("ipvrf-l3dci", (_route("10.200.2.0/24", "bgp-evpn", _via("192.0.2.8", Egress("tunnel", "192.0.2.8/32", tunnel="vxlan"))),)),
+                RouteTable("default", (_route("192.0.2.8/32", "bgp", _via("", Egress("interface", "ethernet-1/1.0"))),)),
+            ],
+            "dcgw1": [
+                RouteTable("default", (
+                    _route("192.0.2.8/32", "host", _via("", Egress("interface", "system0.0"))),
+                    _route("192.0.3.7/32", "isis", _via("10.255.0.1", Egress("interface", "ethernet-1/5.0"))),
+                )),
+                RouteTable("ipvrf-l3dci", (_route("10.200.2.0/24", "bgp-ipvpn", _via("192.0.3.7", Egress("tunnel", "192.0.3.7/32", tunnel="ldp"))),)),
+            ],
+            "p1": [RouteTable("default", (_route("192.0.3.7/32", "isis", _via("10.255.0.6", Egress("interface", "ethernet-1/2.0"))),))],
+            "dcgw3": [
+                RouteTable("default", (_route("192.0.3.7/32", "host", _via("", Egress("interface", "lo0.0"))),)),
+                RouteTable("tenant-a", (_route("10.200.2.0/24", "local", _via("", Egress("interface", "irb0.2"))),)),
+            ],
+        },
+        "ipv6_rib": {},
+        "ni": {
+            "dcgw1": [NetworkInstance("ipvrf-l3dci", "ip-vrf", "up", instances=(
+                BgpVpnInstance(1, ("3000:3000",), ("3000:3000",)), BgpVpnInstance(2, ("65000:3000",), ("65000:3000",))))],
+            "dcgw3": [
+                NetworkInstance("tenant-b", "ip-vrf", "up", instances=(BgpVpnInstance(2, ("65000:3001",), ("65000:3001",)),)),
+                NetworkInstance("tenant-a", "ip-vrf", "up", instances=(BgpVpnInstance(2, ("65000:3000",), ("65000:3000",)),)),
+            ],
+        },
+        "lldp": {
+            "leaf1": [{"interface": "ethernet-1/1", "Neighbors": [{"Nbr-System": "dcgw1", "Nbr-port": "ethernet-1/1"}]}],
+            "dcgw1": [{"interface": "ethernet-1/5", "Neighbors": [{"Nbr-System": "p1", "Nbr-port": "ethernet-1/1"}]}],
+            "p1": [{"interface": "ethernet-1/2", "Neighbors": [{"Nbr-System": "dcgw3", "Nbr-port": "ethernet-1/5"}]}],
+            "dcgw3": [],
+        },
+        "arp": {"dcgw3": [{"NI": "tenant-a", "interface": "irb0.2", "entries": [{"IPv4": "10.200.2.21", "MAC": "00:C1:AB:00:02:15", "Type": "dynamic"}]}]},
+        "nd": {},
+    }
+    return state
+
+
+def test_path_follows_mpls_to_the_far_gateway_and_resumes_in_its_vrf():
+    """VXLAN to the DC gateway, LDP to the WAN gateway, into the VRF that
+    imports the route-target - not the same name - and out to the host."""
+    hops = lens_path(_dci_over_mpls(), source="leaf1", destination="10.200.2.21", ni="ipvrf-l3dci")
+    assert [(h.hop, h.node, h.ni, h.outcome) for h in hops] == [
+        (1, "leaf1", "ipvrf-l3dci", "tunnel"),
+        (2, "leaf1", "default", "forwarded"),
+        (3, "dcgw1", "default", "endpoint-reached"),
+        (4, "dcgw1", "ipvrf-l3dci", "tunnel"),
+        (5, "dcgw1", "default", "forwarded"),
+        (6, "p1", "default", "forwarded"),
+        (7, "dcgw3", "default", "endpoint-reached"),
+        (8, "dcgw3", "tenant-a", "delivered"),
+        (9, "dcgw3", "tenant-a", "neighbor"),
+    ]
+    mpls = hops[3]
+    assert (mpls.tunnel, mpls.endpoint, mpls.egress) == ("ldp", "192.0.3.7", "ldp:192.0.3.7")
+    assert hops[6].resumes_in == "tenant-a", "the far-end VRF is found by route-target"
+    assert hops[8].mac == "00:C1:AB:00:02:15"
 
 
 def test_path_confirms_the_neighbour_of_a_delivered_address():
@@ -562,7 +668,7 @@ def test_every_hop_outcome_has_a_detail():
     from nornir_srl.lenses import _HOP_DETAIL  # noqa: PLC0415 - the map is the test
 
     documented = {
-        "forwarded", "dead-end", "overlay", "vtep-reached", "delivered", "local-ip",
+        "forwarded", "dead-end", "tunnel", "endpoint-reached", "delivered", "local-ip",
         "neighbor", "no-neighbor", "no-route", "loop", "too-long",
     }
     assert set(_HOP_DETAIL) == documented
@@ -604,6 +710,149 @@ def test_a_long_list_says_how_much_it_left_out():
 
 
 # --------------------------------------------------------------------------- #
+# the tree: what the browser makes of the records
+# --------------------------------------------------------------------------- #
+
+
+def test_where_folds_sightings_into_a_card_per_address_with_a_node_inside():
+    sightings = lens_where(_two_leaves_owning("00:C1:AB:00:01:21"), "00:C1:AB:00:01:21")
+    (card,) = tree_where(sightings)
+    assert card.title == "00:C1:AB:00:01:21"
+    assert card.subtitle == "duplicate on 2 nodes"
+    assert (card.state, card.badge) == ("warn", "2 nodes")
+    assert [e.title for e in card.entries] == ["l1", "l2"]
+    (item,) = card.entries[0].items
+    assert (item.title, item.state) == ("duplicate in subnet-1", "warn")
+    by_label = {d.label: d for d in item.details}
+    assert by_label["Interface"].value == "lag1.100"
+    assert (by_label["Also learned locally on"].value, by_label["Also learned locally on"].state) == (("l2",), "warn")
+
+
+def test_where_says_not_found_as_a_card_with_nothing_inside(state: FabricState):
+    (card,) = tree_where(lens_where(state, "00:00:00:00:00:01"))
+    assert (card.badge, card.state, card.entries) == ("not found", "down", ())
+    assert "searched" in card.subtitle
+
+
+def test_where_keeps_the_address_binding_and_the_mac_as_separate_cards(state: FabricState):
+    cards = tree_where(lens_where(state, "100.64.1.16"))
+    assert cards[0].title == "100.64.1.16" and cards[0].state == "up"
+    assert cards[0].entries[0].items[0].title == "arp in default"
+
+
+def test_path_folds_the_walk_into_a_card_per_hop():
+    hops = lens_path(_leaf_and_dcgw(), source="leaf1", destination="10.200.2.23", ni="ipvrf-l3dci")
+    cards = tree_path(hops)
+    assert [c.title for c in cards] == ["Hop 1", "Hop 2", "Hop 3", "Hop 4", "Hop 5"]
+    assert [c.subtitle for c in cards] == ["1 tunnel", "1 forwarded", "1 endpoint-reached", "1 delivered", "1 no-neighbor"]
+    # A hop that only goes on has no verdict; reaching and being delivered are
+    # good; a walk that stops is a fault.
+    assert [c.state for c in cards] == ["", "", "up", "up", "down"]
+    assert [e.title for c in cards for e in c.entries] == ["leaf1", "leaf1", "dcgw1", "dcgw1", "dcgw1"]
+    overlay = cards[0].entries[0].items[0]
+    assert overlay.title == "ipvrf-l3dci: 10.200.2.0/24"
+    assert {d.label: d.value for d in overlay.details}["Egress"] == "vxlan:192.168.255.2"
+
+
+def test_path_graph_draws_the_walk_hop_by_hop_with_its_fan_out(state: FabricState):
+    """Every ECMP branch out of the leaf is an edge, and they converge on the spine."""
+    graph = graph_path(lens_path(state, source=LEAF, destination="192.168.255.4"))
+    assert graph["destination"] == "192.168.255.4"
+    first = [n for n in graph["nodes"] if n["hop"] == 1]
+    assert [n["title"] for n in first] == [LEAF]
+    out = [e for e in graph["edges"] if e["from"] == first[0]["id"]]
+    assert len(out) > 1, "the fan-out out of the leaf is not drawn"
+    assert {e["label"] for e in out} == {h.egress for h in lens_path(state, source=LEAF, destination="192.168.255.4") if h.hop == 1}
+    spine = next(n for n in graph["nodes"] if n["node"] == SPINE)
+    assert any(e["to"] == spine["id"] for e in out)
+    # The branch towards the spine that is not recorded goes out of its port
+    # to a stop, drawn red; a lookup that found no route at all has no edge out.
+    stops = [n for n in graph["nodes"] if n["title"] == "no neighbour"]
+    assert stops and all(n["state"] == "down" for n in stops)
+    assert any(e["to"] == stops[0]["id"] and e["state"] == "down" for e in out)
+    assert not any(e["from"] == stops[0]["id"] for e in graph["edges"])
+
+
+def test_path_graph_follows_the_dci_walk_into_the_host():
+    graph = graph_path(lens_path(_dci_over_mpls(), source="leaf1", destination="10.200.2.21", ni="ipvrf-l3dci"))
+    assert [n["title"] for n in graph["nodes"]] == [
+        "leaf1", "leaf1", "dcgw1", "dcgw1", "dcgw1", "p1", "dcgw3", "dcgw3", "10.200.2.21",
+    ]
+    labels = [e["label"] for e in graph["edges"]]
+    assert labels == [
+        "vxlan:192.0.2.8", "ethernet-1/1.0", "into ipvrf-l3dci", "ldp:192.0.3.7",
+        "ethernet-1/5.0", "ethernet-1/2.0", "into tenant-a", "irb0.2",
+    ]
+    host = graph["nodes"][-1]
+    assert (host["subtitle"], host["state"]) == ("00:C1:AB:00:02:15 on irb0.2", "up")
+    # An underlay lookup says what it is chasing; a VRF lookup does not repeat the destination.
+    assert graph["nodes"][1]["subtitle"] == "default · 192.0.2.8"
+    assert graph["nodes"][0]["subtitle"] == "ipvrf-l3dci"
+
+
+def test_path_graph_of_nothing_is_empty():
+    assert graph_path([]) == {"nodes": [], "edges": [], "destination": ""}
+
+
+def test_service_folds_the_transpose_into_a_card_per_service_and_flags_disagreement():
+    agree = Service("l1", "subnet-1", "mac-vrf", "up", ("101",), (101,), ("100:101",), ("100:101",), (Interface("lag1.100", "up"),), (), ("192.168.255.2",), 1, 2, ())
+    differ = Service("l2", "subnet-1", "mac-vrf", "down", ("101",), (102,), ("100:101",), ("100:101",), (), (), (), 0, 0, ())
+    (card,) = tree_service([agree, differ])
+    assert card.title == "subnet-1" and card.icon == "🌉"
+    assert card.subtitle == "mac-vrf, EVI 101 - nodes disagree on VNI"
+    assert (card.state, card.badge) == ("down", "2 nodes")
+    assert [(e.title, e.state) for e in card.entries] == [("l1", "up"), ("l2", "down")]
+    details = {d.label: d for d in card.entries[0].items[0].details}
+    assert details["Interfaces"].value == (("lag1.100", "up"),)
+    assert details["MACs"].value == "1 local / 2 remote"
+    assert card.state == "down"
+    assert tree_service([agree])[0].state == "up"
+
+
+def test_service_tree_does_not_hold_nodes_in_different_underlays_to_each_other():
+    dc1 = Service("leaf1", "bd", "mac-vrf", "up", ("201",), (201,), ("65000:201",), ("65000:201",), (), (), (), 0, 0, (),
+                  instances=(BgpVpnInstance(1, ("65000:201",), ("65000:201",)),), site="1")
+    dc2 = Service("leaf5", "bd", "mac-vrf", "up", ("202",), (202,), ("65000:202",), ("65000:202",), (), (), (), 0, 0, (),
+                  instances=(BgpVpnInstance(1, ("65000:202",), ("65000:202",)),), site="2")
+    (card,) = tree_service([dc1, dc2])
+    assert card.subtitle == "mac-vrf, EVI 201, in 2 underlays"
+    assert card.state == "up"
+    assert {d.label: d.value for d in card.entries[0].items[0].details}["Underlay"] == "1"
+
+
+def test_service_lens_numbers_the_underlays_a_service_is_carried_in(state: FabricState):
+    """One recorded fabric is one underlay, so no site is numbered."""
+    assert {s.site for s in lens_service(state, "subnet-1")} == {""}
+
+
+def test_service_tree_lets_a_gateway_carry_its_wan_side_instance():
+    leaf = Service("leaf1", "ipvrf-1", "ip-vrf", "up", ("3000",), (3000,), ("3000:3000",), ("3000:3000",), (), (), (), 0, 0, (),
+                   instances=(BgpVpnInstance(1, ("3000:3000",), ("3000:3000",)),))
+    gateway = Service("dcgw1", "ipvrf-1", "ip-vrf", "up", ("3000",), (3000,), ("3000:3000", "65000:3000"), ("3000:3000", "65000:3000"), (), (), (), 0, 0, (),
+                      instances=(BgpVpnInstance(1, ("3000:3000",), ("3000:3000",)), BgpVpnInstance(2, ("65000:3000",), ("65000:3000",))))
+    (card,) = tree_service([leaf, gateway])
+    assert "disagree" not in card.subtitle and card.state == "up"
+
+
+def test_every_lens_has_a_tree_and_the_params_it_cannot_do_without():
+    for lens in LENSES:
+        assert callable(lens.tree)
+        assert any(p.required for p in lens.params), f"lens '{lens.name}' requires nothing"
+        assert lens.on("server")
+
+
+def test_a_lens_refuses_to_be_asked_nothing():
+    with pytest.raises(ValueError, match="needs address"):
+        coerce_lens_params(get_lens("where"), {})
+    assert coerce_lens_params(get_lens("path"), {"source": "leaf1", "destination": "10.0.0.1"}) == {
+        "source": "leaf1",
+        "destination": "10.0.0.1",
+    }
+    with pytest.raises(ValueError, match="not an IP address"):
+        coerce_lens_params(get_lens("path"), {"source": "leaf1", "destination": "nowhere"})
+
+
+# --------------------------------------------------------------------------- #
 # records as objects: what -o json and the MCP tools emit
 # --------------------------------------------------------------------------- #
 
@@ -642,7 +891,7 @@ def test_a_record_has_a_field_for_every_kind_it_documents():
         names = {f.name for f in fields(record)}
         assert "node" in names or record is Interface
     assert {"also_on", "searched", "segments", "expiry"} <= {f.name for f in fields(Sighting)}
-    assert {"resumes_in", "vtep", "visited", "mac"} <= {f.name for f in fields(Hop)}
+    assert {"resumes_in", "tunnel", "endpoint", "visited", "mac"} <= {f.name for f in fields(Hop)}
 
 
 # --------------------------------------------------------------------------- #

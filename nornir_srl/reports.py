@@ -90,6 +90,9 @@ class ParamSpec:
     help: str = ""
     #: ``text``, or ``address`` for one that has to parse as an IP address.
     kind: str = "text"
+    #: True where nothing can be answered without it: a report renders in full
+    #: without any of its parameters, but a lens is a question about something.
+    required: bool = False
 
     def as_dict(self) -> Dict[str, Any]:
         return {
@@ -98,6 +101,7 @@ class ParamSpec:
             "placeholder": self.placeholder,
             "help": self.help,
             "kind": self.kind,
+            "required": self.required,
         }
 
     def coerce(self, value: Any) -> Optional[str]:
@@ -588,9 +592,32 @@ def _bgp_rib_table_for(route_fam: Optional[str] = None, route_type: Optional[str
     return table
 
 
+def _network_instance_subscriptions(interval: int) -> Tuple[SubscriptionSpec, ...]:
+    """What a network-instance is, as the instance and service reports read it.
+
+    Enough to name and type it, see what is bound to it and what it
+    advertises with. Not the whole subtree: that carries every route table
+    and BGP RIB of the node, which on a spine is the bulk of its state and
+    enough to put the node's entire stream behind - and then LLDP and routes
+    go stale on it too. The getters still ask for ``/network-instance[name=*]``
+    and are answered from what these subscriptions put under it.
+    """
+    return (
+        SubscriptionSpec("/network-instance[name=*]/type", datatype="all", sample_interval=interval),
+        SubscriptionSpec("/network-instance[name=*]/oper-state", sample_interval=interval),
+        SubscriptionSpec("/network-instance[name=*]/interface", datatype="all", sample_interval=interval),
+        SubscriptionSpec("/network-instance[name=*]/vxlan-interface", datatype="all", sample_interval=interval),
+        SubscriptionSpec("/network-instance[name=*]/protocols/bgp/router-id", datatype="all", sample_interval=interval),
+        SubscriptionSpec("/network-instance[name=*]/protocols/bgp-vpn", datatype="all", sample_interval=interval),
+        SubscriptionSpec("/network-instance[name=*]/protocols/bgp-evpn", datatype="all", sample_interval=interval),
+    )
+
+
 #: Every service report reads the same two trees.
 _SERVICE_SUBSCRIPTIONS: Tuple[SubscriptionSpec, ...] = (
-    SubscriptionSpec("/network-instance[name=*]", datatype="all", sample_interval=20),
+    *_network_instance_subscriptions(20),
+    # The BGP sessions a service tile lists.
+    SubscriptionSpec("/network-instance[name=*]/protocols/bgp/neighbor", datatype="all", sample_interval=20),
     SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=20),
     # A member reported 'port-down' is explained by its parent port, and that
     # is what says whether a standby ethernet-segment or a fault put it there.
@@ -827,7 +854,7 @@ REPORTS: List[ReportSpec] = [
         sample_interval=30,
         subscribe=(
             SubscriptionSpec("/interface[name=*]/subinterface", datatype="all", sample_interval=30),
-            SubscriptionSpec("/network-instance[name=*]", datatype="all", sample_interval=30),
+            *_network_instance_subscriptions(30),
         ),
     ),
     ReportSpec(
@@ -988,7 +1015,7 @@ REPORTS: List[ReportSpec] = [
         sample_interval=30,
         subscribe=(
             SubscriptionSpec("/interface[name=irb*]/subinterface", datatype="all", sample_interval=30),
-            SubscriptionSpec("/network-instance[name=*]", datatype="config", sample_interval=30),
+            SubscriptionSpec("/network-instance[name=*]/interface", datatype="config", sample_interval=30),
         ),
     ),
     ReportSpec(
@@ -1051,7 +1078,9 @@ REPORTS: List[ReportSpec] = [
         mcp_name="arp_table",
         subscribe=(
             SubscriptionSpec("/interface[name=*]/subinterface[index=*]/ipv4/arp/neighbor", datatype="all"),
-            SubscriptionSpec("/network-instance[name=*]", datatype="config"),
+            # Which instance a subinterface is in: the interface lists, not the
+            # subtree, which would stream every BGP RIB along with them.
+            SubscriptionSpec("/network-instance[name=*]/interface", datatype="config"),
         ),
     ),
     ReportSpec(
@@ -1065,7 +1094,7 @@ REPORTS: List[ReportSpec] = [
         mcp_name="ipv6_neighbors",
         subscribe=(
             SubscriptionSpec("/interface[name=*]/subinterface[index=*]/ipv6/neighbor-discovery/neighbor", datatype="all"),
-            SubscriptionSpec("/network-instance[name=*]", datatype="config"),
+            SubscriptionSpec("/network-instance[name=*]/interface", datatype="config"),
         ),
     ),
     ReportSpec(

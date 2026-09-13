@@ -4,30 +4,40 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple
 import jmespath
 
-from ..records import NetworkInstance, Subinterface, as_int
+from ..records import BgpVpnInstance, NetworkInstance, Subinterface, as_int
 from .down_reason import ParentReasons
 from .helpers import as_list, bgp_evpn_evis, first_payload
 
 
-def _route_targets(bgp_vpn: Dict[str, Any], direction: str) -> Tuple[str, ...]:
-    """The ``import`` or ``export`` route-targets of a network-instance.
+def _route_targets(inst: Dict[str, Any], direction: str) -> Tuple[str, ...]:
+    """The ``import`` or ``export`` route-targets of one bgp-vpn instance.
 
     Where a policy sets them instead of a target list, the policy's name is
     what there is to show.
     """
-    targets: List[str] = []
-    for inst in as_list(bgp_vpn.get("bgp-instance")):
-        if not isinstance(inst, dict):
-            continue
-        policy = inst.get(f"{direction}-policy")
-        if policy:
-            targets.extend(as_list(policy))
-            continue
-        for rt in as_list((inst.get("route-target") or {}).get(f"{direction}-rt")):
-            target = rt.get("target") if isinstance(rt, dict) else rt
-            if target:
-                targets.append(str(target).replace("target:", ""))
+    policy = inst.get(f"{direction}-policy")
+    if policy:
+        return tuple(str(p) for p in as_list(policy))
+    targets = []
+    for rt in as_list((inst.get("route-target") or {}).get(f"{direction}-rt")):
+        target = rt.get("target") if isinstance(rt, dict) else rt
+        if target:
+            targets.append(str(target).replace("target:", ""))
     return tuple(sorted(set(targets)))
+
+
+def _bgp_vpn_instances(bgp_vpn: Dict[str, Any]) -> Tuple[BgpVpnInstance, ...]:
+    """The bgp-vpn instances of a network-instance, each with its own targets."""
+    return tuple(
+        BgpVpnInstance(
+            id=as_int(inst.get("id")) or index,
+            import_rts=_route_targets(inst, "import"),
+            export_rts=_route_targets(inst, "export"),
+            rd=str((inst.get("route-distinguisher") or {}).get("rd") or ""),
+        )
+        for index, inst in enumerate(as_list(bgp_vpn.get("bgp-instance")), start=1)
+        if isinstance(inst, dict)
+    )
 
 
 class NetworkInstanceMixin:
@@ -106,8 +116,7 @@ class NetworkInstanceMixin:
                     # virtual ethernet-segment names to say which
                     # network-instance it serves.
                     evis=tuple(bgp_evpn_evis(ni).values()),
-                    import_rts=_route_targets(bgp_vpn, "import"),
-                    export_rts=_route_targets(bgp_vpn, "export"),
+                    instances=_bgp_vpn_instances(bgp_vpn),
                     interfaces=tuple(interfaces),
                 )
             )

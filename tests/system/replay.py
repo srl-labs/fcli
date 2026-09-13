@@ -26,6 +26,7 @@ from nornir_srl.reports import REPORTS_BY_NAME, ReportSpec
 from nornir_srl.connections.helpers import clean_structured_key
 from nornir_srl.rows import clean_columns, flatten
 from nornir_srl.server.devices import MixinDevice
+from nornir_srl.server.tree import select_path, split_path
 
 FIXTURE_ROOT = Path(__file__).resolve().parent.parent / "fixtures" / "releases"
 
@@ -316,8 +317,15 @@ class ReplayDevice(MixinDevice):
             key = (path, datatype or "config")
             self.requested.append(key)
             recorded = self._calls.get(key)
+            narrow = None
             if not recorded:
-                raise ReplayError(path, datatype or "config")
+                # A getter that has since learned to ask for less than it used
+                # to is answered from what the device gave for the wider path,
+                # cut down the way the device would have cut it.
+                narrow = self._recorded_ancestor(path, datatype or "config")
+                if narrow is None:
+                    raise ReplayError(path, datatype or "config")
+                key, recorded = narrow, self._calls[narrow]
             index = min(self._cursor.get(key, 0), len(recorded) - 1)
             self._cursor[key] = index + 1
             call = recorded[index]
@@ -325,8 +333,23 @@ class ReplayDevice(MixinDevice):
                 raise RecordedGnmiError(call.error or "", call.grpc_code)
             # A copy, because several getters enrich the response in place and a
             # recording is replayed by more than one test.
-            response.extend(copy.deepcopy(call.response or []))
+            payload = copy.deepcopy(call.response or [])
+            if narrow is not None:
+                payload = [
+                    {env: select_path(value, path, env) for env, value in notification.items()}
+                    for notification in payload
+                ]
+            response.extend(payload)
         return response
+
+    def _recorded_ancestor(self, path: str, datatype: str) -> Optional[Tuple[str, str]]:
+        """The longest recorded path *path* lies under, with the same datatype."""
+        elems = split_path(path)
+        for cut in range(len(elems) - 1, 0, -1):
+            candidate = ("/" + "/".join(elems[:cut]), datatype)
+            if candidate in self._calls:
+                return candidate
+        return None
 
 
 def flatten_report(

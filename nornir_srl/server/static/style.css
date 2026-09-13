@@ -1346,6 +1346,12 @@ th.filtered::after {
   flex-shrink: 0;
 }
 
+/* A lens detail that is one value rather than pills: a sentence, an address. */
+.bd-detail-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .bd-detail-section {
   display: flex;
   flex-direction: column;
@@ -2317,4 +2323,112 @@ button.pill-jump:focus-visible {
 .chat-form .btn.stop {
   border-color: var(--err);
   color: var(--err);
+}
+
+
+/* ----------------------------------------------------------- path graph */
+
+/* The Path lens drawn as a walk: one column per hop, a box per lookup, an
+   edge to each lookup it leads to. Wide walks scroll sideways. */
+.path-graph-wrap {
+  padding: 12px 16px 16px;
+  overflow: auto;
+}
+
+.path-graph-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  align-items: center;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.path-graph-summary strong {
+  color: var(--text);
+}
+
+.path-graph {
+  display: block;
+  font-family: inherit;
+}
+
+.path-hop-label {
+  fill: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.path-box {
+  fill: var(--panel);
+  stroke: var(--border);
+  stroke-width: 1.2;
+  rx: 8;
+}
+
+.path-box-up {
+  stroke: var(--ok);
+  stroke-width: 1.8;
+}
+
+.path-box-warn {
+  stroke: var(--warn);
+  stroke-width: 1.8;
+}
+
+.path-box-down {
+  stroke: var(--err);
+  stroke-width: 1.8;
+  stroke-dasharray: 5 3;
+}
+
+.path-box-title {
+  fill: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.path-box-sub {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.path-edge {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 1.6;
+}
+
+.path-edge-up {
+  stroke: var(--ok);
+}
+
+.path-edge-down {
+  stroke: var(--err);
+  stroke-dasharray: 5 3;
+}
+
+.path-edge-label {
+  fill: var(--muted);
+  font-size: 10px;
+}
+
+.path-edge-label-bg {
+  fill: var(--bg);
+  opacity: 0.9;
+}
+
+.path-arrow {
+  fill: var(--border);
+}
+
+.path-arrow-up {
+  fill: var(--ok);
+}
+
+.path-arrow-down {
+  fill: var(--err);
 }

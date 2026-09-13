@@ -546,9 +546,11 @@ def network_instances(
 
     Returns one object per network-instance per node: node, name, type
     (ip-vrf/mac-vrf/default), oper, router_id, overlays (its vxlan-interfaces),
-    evis, import_rts, export_rts, and interfaces - each with name, oper,
-    prefixes, mtu, vlan and associated (for an irb, the other instances it is
-    in: the ip-vrf a mac-vrf's irb routes into).
+    evis, instances (each bgp-vpn instance with id, import_rts, export_rts and
+    rd - a DCI gateway has two, the DC side and the WAN side), and
+    interfaces - each with name, oper, prefixes, mtu, vlan and associated (for
+    an irb, the other instances it is in: the ip-vrf a mac-vrf's irb routes
+    into).
 
     Args:
         inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
@@ -902,14 +904,16 @@ def locate_address(address: str, inv_filter: Optional[str] = None) -> str:
     MAC first, so either form of address works.
 
     Returns {"records": [...]}, one record per place the address is known, with:
-        kind: 'local' (this node learned it on its own port), 'remote' (it
-            learned it over the overlay from a VTEP or ethernet-segment), 'arp'
-            or 'neighbor' (an address binding that named the MAC), 'duplicate'
-            (this node learned it locally and so did the nodes in also_on,
-            which is expected on an all-active segment and a fault otherwise),
-            or 'not-found'.
+        kind: 'configured' (the IP is this node's own: a loopback, a system
+            address, an irb gateway), 'local' (this node learned the MAC on its
+            own port), 'remote' (it learned it over the overlay from a VTEP or
+            ethernet-segment), 'arp' or 'neighbor' (an address binding that
+            named the MAC), 'duplicate' (this node learned it locally and so
+            did the nodes in also_on, which is expected on an all-active
+            segment and a fault otherwise), or 'not-found'.
         node, ni, address: where it was seen, and the IP or MAC seen.
         interface, vtep, esi: what it sits on - exactly one is set.
+        prefix: for 'configured', the prefix as configured.
         origin: how the entry got there ('learnt', 'evpn', 'static', 'dynamic').
         mac, expiry: for 'arp'/'neighbor', the MAC the binding resolved to.
         overlay, vni: for 'remote', the overlay it was learned over.
@@ -937,9 +941,9 @@ def trace_path(
 
     Computed from the route tables rather than probed, so it works without
     sending traffic and shows every ECMP branch instead of the one a probe
-    happened to take. A lookup in a VRF that resolves over the overlay hands off
-    to the underlay at the VTEP and the walk continues there, which is how the
-    two tables compose on the wire.
+    happened to take. A lookup in a VRF that resolves onto a tunnel hands off
+    to the underlay towards its endpoint and resumes in the VRF at the far end,
+    so a DCI path traces VXLAN to the gateway, MPLS across, and VXLAN again.
 
     Use this for 'why does A not reach B': the hop whose outcome is 'no-route'
     or 'dead-end' is where the path stops.
@@ -949,17 +953,19 @@ def trace_path(
         hop, node, ni, address: where the lookup was done and what was looked
             up - the destination, or the VTEP being chased through the underlay.
         outcome: 'forwarded' (out of egress to peer, where the walk goes on),
-            'dead-end' (no LLDP neighbour on egress, so it cannot), 'overlay'
-            (resolved to a tunnel, continuing in the underlay towards vtep),
-            'vtep-reached' (the underlay delivered the VTEP, resuming in
-            resumes_in), 'delivered' (the destination is attached here),
-            'local-ip' (it is this node's own address), 'neighbor' or
-            'no-neighbor' (whether ARP/ND has the delivered address),
-            'no-route', 'loop' or 'too-long'.
+            'dead-end' (no LLDP neighbour on egress, so it cannot), 'tunnel'
+            (resolved onto a tunnel - vxlan to a VTEP, ldp or sr-isis to a
+            far-end gateway - continuing in the underlay towards endpoint),
+            'endpoint-reached' (the underlay delivered the endpoint; the packet
+            is decapsulated and looked up in resumes_in, the VRF there),
+            'delivered' (the destination is attached here), 'local-ip' (it is
+            this node's own address), 'neighbor' or 'no-neighbor' (whether
+            ARP/ND has the delivered address), 'no-route', 'loop' or 'too-long'.
         prefix, route_type, next_hops: the route that matched.
         egress: the subinterface, or 'vxlan:<vtep>' over the overlay.
         peer, peer_port: the node on the other end of that cable.
-        vtep, resumes_in, mac, origin, visited: filled for the outcomes named.
+        tunnel, endpoint, resumes_in, mac, origin, visited: filled for the
+            outcomes named.
     Plus "not_collected" when a node's report could not be read.
 
     Args:
@@ -984,9 +990,12 @@ def service_detail(name: str, inv_filter: Optional[str] = None) -> str:
     is a column to read down rather than several tables to compare by hand.
 
     Returns {"records": [...]}, one record per node carrying the instance, with
-    node, ni, type, oper, evis, vnis, import_rts, export_rts, interfaces (each
-    with name and oper), bound (the instances attached to it), vteps,
-    local_macs, remote_macs and segments (its ethernet-segments). Plus
+    node, ni, type, oper, evis, vnis, import_rts, export_rts (the union over
+    its bgp-vpn instances, which are listed in instances with their own),
+    interfaces (each with name and oper), bound (the instances attached to
+    it), vteps, local_macs, remote_macs, segments (its ethernet-segments) and
+    site (the underlay the node is in, numbered, when the service is carried
+    in more than one - nodes in different underlays never have to agree). Plus
     "not_collected" when a node's report could not be read.
 
     Args:

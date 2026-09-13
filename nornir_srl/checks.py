@@ -30,6 +30,7 @@ from typing import (
     Mapping,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 
@@ -446,57 +447,220 @@ def check_mtu_outlier(state: FabricState) -> List[Finding]:
 # --------------------------------------------------------------------------- #
 
 
+def service_facts(vni: str, instances: Sequence[Any]) -> Dict[str, Any]:
+    """What one node thinks a service looks like, by the name of each fact.
+
+    The route-targets are one fact per bgp-vpn instance: a gateway carries a
+    second instance for its WAN side, with route-targets the leaves never
+    see, and that is not the two of them disagreeing.
+    """
+    facts: Dict[str, Any] = {"VNI": vni}
+    for inst in instances:
+        which = f" of bgp-instance {inst.id}" if inst.id != 1 else ""
+        facts[f"import route-target{which}"] = _rt_set(inst.import_rts)
+        facts[f"export route-target{which}"] = _rt_set(inst.export_rts)
+    return facts
+
+
+def service_disagreements(by_node: Mapping[str, Dict[str, Any]]) -> List[Tuple[str, Dict[str, Any]]]:
+    """The facts the nodes carrying one service do not agree on.
+
+    Each fact is compared among the nodes that have it: a fact only a
+    gateway's second instance has is compared between the gateways.
+    """
+    disagreements = []
+    for fact in dict.fromkeys(name for facts in by_node.values() for name in facts):
+        values = {node: facts[fact] for node, facts in by_node.items() if fact in facts}
+        if len(values) < 2 or len({_describe(v) for v in values.values()}) < 2:
+            continue
+        disagreements.append((fact, values))
+    return disagreements
+
+
+def system_addresses(state: FabricState) -> Dict[str, Set[str]]:
+    """Each node's own loopback addresses: what the others see it as in the underlay."""
+    found: Dict[str, Set[str]] = {}
+    for node, instance, itf in state.sub_items("ni", "interfaces"):
+        if instance.name != "default" or not itf.name.startswith(("system0", "lo")):
+            continue
+        for prefix in itf.prefixes:
+            found.setdefault(node, set()).add(prefix.split("/", 1)[0])
+    return found
+
+
+def underlay_hosts(state: FabricState) -> Dict[str, Set[str]]:
+    """The host routes in each node's default instance: the loopbacks it can reach."""
+    hosts: Dict[str, Set[str]] = {}
+    for report in ("ipv4_rib", "ipv6_rib"):
+        for node, table, route in state.sub_items(report, "routes"):
+            if table.ni != "default":
+                continue
+            address, _, length = route.prefix.partition("/")
+            if length in ("32", "128"):
+                hosts.setdefault(node, set()).add(address)
+    return hosts
+
+
+def underlay_domains(
+    nodes: Sequence[str],
+    system: Mapping[str, Set[str]],
+    hosts: Mapping[str, Set[str]],
+    gateways: Set[str] = frozenset(),
+) -> List[List[str]]:
+    """*nodes* grouped by the underlay they share, as the services page tells sites apart.
+
+    Two nodes share an underlay when each has the other's system address as a
+    host route in ``default``: that is what lets their VTEPs reach each other,
+    and nodes that cannot are never one service however they are named.
+    Gateways learn each other's loopbacks over the WAN, so between two of
+    them that says nothing while the set has other nodes in it; a set of
+    gateways alone is the WAN side itself and keeps those edges. Without any
+    route table to go on - a state collected without the RIBs - every node is
+    taken to be in one underlay, which is what the question used to assume.
+    """
+    names = sorted(nodes)
+    if not any(hosts.get(name) for name in names):
+        return [names] if names else []
+    skip_gateway_pairs = any(name not in gateways for name in names)
+
+    def sees(observer: str, other: str) -> bool:
+        return any(ip in hosts.get(observer, ()) for ip in system.get(other, ()))
+
+    parent = {name: name for name in names}
+
+    def find(name: str) -> str:
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    for index, a in enumerate(names):
+        for b in names[index + 1 :]:
+            if skip_gateway_pairs and a in gateways and b in gateways:
+                continue
+            if sees(a, b) and sees(b, a):
+                parent[find(b)] = find(a)
+    domains: Dict[str, List[str]] = {}
+    for name in names:
+        domains.setdefault(find(name), []).append(name)
+    return sorted(domains.values())
+
+
+def service_groups(by_node: Mapping[str, Dict[str, Any]]) -> List[List[str]]:
+    """The nodes carrying one name, grouped into the services they actually are.
+
+    Two nodes carry the same service when they import a common route-target
+    on it: that is what lets their routes reach each other. A name that
+    splits into several such groups is one service per site - a bridge
+    domain each datacenter has its own of, stitched through an ip-vrf - or
+    one node with a mistyped target; either way the groups are compared
+    within themselves, not against each other. Nodes with no route-target
+    at all are one group of their own.
+    """
+    targets = {node: set(facts.get("import route-target") or ()) for node, facts in by_node.items()}
+    groups: List[List[str]] = []
+    for node in sorted(targets):
+        mine = targets[node]
+        joined = [
+            group
+            for group in groups
+            if any(mine & targets[other] or (not mine and not targets[other]) for other in group)
+        ]
+        members = [node] + [member for group in joined for member in group]
+        groups = [group for group in groups if group not in joined] + [sorted(members)]
+    return sorted(groups)
+
+
 def check_evpn_service_mismatch(state: FabricState) -> List[Finding]:
     """Nodes that disagree about a service they both carry.
 
     A mac-vrf stretched across two leaves has to use the same VNI and the same
-    route-targets on both, or the two halves quietly never join up.
+    route-targets on both, or the two halves quietly never join up. Compared
+    among the nodes that share an underlay, because nodes that cannot reach
+    each other's VTEPs are never one service whatever they are named; per
+    bgp-vpn instance, so a gateway's WAN-side instance is held against the
+    other gateways rather than against the leaves; and among the nodes that
+    share a route-target, so two services under one name in one underlay is
+    a warning about the split rather than an error about every node.
     """
     # vxlan-interface -> the VNI it sends on, per node.
     vnis: Dict[Tuple[str, str], Any] = {}
     for node, vxlan in state.items("vxlan"):
         vnis[(node, vxlan.name)] = vxlan.vni
 
-    # Service name -> {node: what that node thinks the service looks like}.
+    # Service name -> {node: what that node thinks the service looks like},
+    # and which nodes carry it as a gateway, with a WAN-side instance too.
     services: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    gateways: Dict[str, Set[str]] = {}
     for node, instance in state.items("ni"):
         if _text(instance.type) not in ("mac-vrf", "ip-vrf"):
             continue
-        services.setdefault(instance.name, {})[node] = {
-            "vni": ", ".join(
-                str(vnis.get((node, overlay), "?")) for overlay in instance.overlays
-            ),
-            "import-rt": _rt_set(instance.import_rts),
-            "export-rt": _rt_set(instance.export_rts),
-        }
+        services.setdefault(instance.name, {})[node] = service_facts(
+            ", ".join(str(vnis.get((node, overlay), "?")) for overlay in instance.overlays),
+            instance.instances,
+        )
+        if len(instance.instances) > 1:
+            gateways.setdefault(instance.name, set()).add(node)
+    system, hosts = system_addresses(state), underlay_hosts(state)
 
-    findings = []
-    for name, by_node in sorted(services.items()):
-        if len(by_node) < 2:
-            continue
-        for attribute, label in (
-            ("vni", "VNI"),
-            ("import-rt", "import route-target"),
-            ("export-rt", "export route-target"),
-        ):
-            values = {node: facts[attribute] for node, facts in by_node.items()}
-            distinct = {_describe(value) for value in values.values()}
-            if len(distinct) < 2:
-                continue
+    def disagree(name: str, nodes: Sequence[str], facts_of: Callable[[str], Dict[str, Any]]) -> Iterator[Finding]:
+        by_node = {node: facts_of(node) for node in nodes}
+        for fact, values in service_disagreements(by_node):
             for node in sorted(values):
-                others = sorted(set(by_node) - {node})
-                findings.append(
-                    Finding(
-                        check="evpn_service_mismatch",
-                        severity=ERROR,
-                        node=node,
-                        subject=name,
-                        detail=(
-                            f"{label} {_describe(values[node])}, against "
-                            + ", ".join(
-                                f"{other} {_describe(values[other])}" for other in others
+                others = sorted(set(values) - {node})
+                yield Finding(
+                    check="evpn_service_mismatch",
+                    severity=ERROR,
+                    node=node,
+                    subject=name,
+                    detail=(
+                        f"{fact} {_describe(values[node])}, against "
+                        + ", ".join(f"{other} {_describe(values[other])}" for other in others)
+                    ),
+                )
+
+    findings: List[Finding] = []
+    for name, by_node in sorted(services.items()):
+        wan = gateways.get(name, set())
+        for domain in underlay_domains(list(by_node), system, hosts, wan):
+            local = {node: by_node[node] for node in domain}
+            groups = service_groups(local)
+            if len(groups) > 1:
+                targets = {node: local[node].get("import route-target") for node in local}
+                for group in groups:
+                    elsewhere = sorted(set(local) - set(group))
+                    for node in group:
+                        findings.append(
+                            Finding(
+                                check="evpn_service_mismatch",
+                                severity=WARNING,
+                                node=node,
+                                subject=name,
+                                detail=(
+                                    f"import route-target {_describe(targets[node])}, while "
+                                    + ", ".join(f"{other} {_describe(targets[other])}" for other in elsewhere)
+                                    + " in the same underlay: two services under one name, or a mistyped target"
+                                ),
                             )
-                        ),
+                        )
+            for group in groups:
+                # The DC side: everything but what a gateway's other instances carry.
+                findings.extend(
+                    disagree(
+                        name,
+                        group,
+                        lambda node: {f: v for f, v in local[node].items() if "bgp-instance" not in f},
+                    )
+                )
+        # The WAN side is a service among the gateways of every underlay,
+        # reached over the WAN, so they are one domain of their own for it.
+        if len(wan) > 1:
+            for domain in underlay_domains(sorted(wan), system, hosts, wan):
+                findings.extend(
+                    disagree(
+                        name,
+                        domain,
+                        lambda node: {f: v for f, v in by_node[node].items() if "bgp-instance" in f},
                     )
                 )
     return findings
@@ -642,7 +806,8 @@ CHECKS: Tuple[Check, ...] = (
     Check(
         name="evpn_service_mismatch",
         title="Services whose nodes disagree about VNI or route-targets",
-        requires=("ni", "vxlan"),
+        # The RIBs say which nodes share an underlay, and so can disagree at all.
+        requires=("ni", "vxlan", "ipv4_rib", "ipv6_rib"),
         run=check_evpn_service_mismatch,
     ),
     Check(

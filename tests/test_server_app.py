@@ -13,6 +13,7 @@ from nornir import InitNornir
 from starlette.testclient import TestClient
 
 from nornir_srl.checks import CHECKS_COLUMNS, REQUIRED_REPORTS
+from nornir_srl.lenses import get_lens, lenses_for
 from nornir_srl.reports import SERVER, get_report, reports_for
 from nornir_srl.rows import flatten, get_fields, is_scalar
 from nornir_srl.server.app import (
@@ -1046,10 +1047,21 @@ def test_the_asset_version_follows_the_assets(tmp_path, monkeypatch):
 def test_reports_endpoint_lists_every_report(client):
     test_client, _devices = client
     payload = test_client.get("/api/reports").json()
-    assert {r["name"] for r in payload["reports"]} == {
+    assert {r["name"] for r in payload["reports"] if r.get("kind") != "lens"} == {
         r.name for r in reports_for(SERVER)
     }
     assert all(r["title"] and r["description"] for r in payload["reports"])
+
+
+def test_reports_endpoint_lists_the_lenses_as_what_they_are(client):
+    """A lens is offered next to the reports, marked as a question with arguments."""
+    test_client, _devices = client
+    payload = test_client.get("/api/reports").json()
+    lenses = {r["name"]: r for r in payload["reports"] if r.get("kind") == "lens"}
+    assert set(lenses) == {lens.name for lens in lenses_for(SERVER)} == {"where", "path", "service"}
+    assert all(r["category"] == "Lenses" for r in lenses.values())
+    required = {name: [p["name"] for p in r["params"] if p["required"]] for name, r in lenses.items()}
+    assert required == {"where": ["target"], "path": ["source", "destination"], "service": ["name"]}
 
 
 def test_reports_endpoint_returns_topo_name(fabric):
@@ -1166,6 +1178,7 @@ def test_reports_endpoint_describes_the_arguments_a_report_takes(client):
             "placeholder": "LPM lookup, e.g. 10.0.0.1",
             "help": "Longest prefix matching this address, per node and route table",
             "kind": "address",
+            "required": False,
         }
     ]
     assert by_name["lldp"]["params"] == []
@@ -1412,7 +1425,7 @@ async def test_stream_stops_when_the_store_is_stopping(store):
     chunks = [
         chunk
         async for chunk in table_events(
-            fabric_store, get_report("lldp"), None, 0.01, never_disconnects
+            fabric_store, "lldp", lambda: fabric_store.table(get_report("lldp")), 0.01, never_disconnects
         )
     ]
     assert chunks == []
@@ -1431,7 +1444,7 @@ async def test_stream_reports_a_render_failure_as_an_error_event(store, monkeypa
     assert events[0][1]["error"] == "render exploded"
 
 
-async def _collect(fabric_store, report, stop_after):
+async def _collect(fabric_store, report, stop_after, render=None):
     """Drive table_events for *stop_after* ticks and parse what it yielded."""
     ticks = {"n": 0}
 
@@ -1440,7 +1453,9 @@ async def _collect(fabric_store, report, stop_after):
         return ticks["n"] > stop_after
 
     events = []
-    async for chunk in table_events(fabric_store, report, None, 0.01, is_disconnected):
+    if render is None:
+        render = lambda: fabric_store.table(report)  # noqa: E731 - what the route builds
+    async for chunk in table_events(fabric_store, report.name, render, 0.01, is_disconnected):
         text = chunk.decode()
         if text.startswith(":"):
             events.append(("keep-alive", None))
@@ -1501,3 +1516,86 @@ def test_overview_does_not_count_a_standby_port_as_down(store):
     assert down_count("standby-signaling") == 0
     assert down_count("min-links-not-met") == 1
 
+
+
+# --------------------------------------------------------------------------- #
+# lenses
+# --------------------------------------------------------------------------- #
+
+
+def test_a_lens_answers_once_with_rows_records_and_a_tree(client):
+    """A lens is asked the way a report is, and answers in the same shape plus
+    the records and the hierarchy the browser draws them as."""
+    test_client, _devices = client
+    resp = test_client.get("/api/report/path", params={"source": "leaf1", "destination": "10.1.1.5"})
+    assert resp.status_code == 200, resp.json()
+    answer = resp.json()
+    assert answer["report"] == "path" and answer["title"] == "Path"
+    assert answer["columns"][:3] == ["Node", "Hop", "NI"]
+    assert [row["Type"] for row in answer["rows"]] == ["local", "no-neighbor"]
+    assert [r["outcome"] for r in answer["records"]] == ["delivered", "no-neighbor"]
+    assert answer["nodes"] == 2 and answer["errors"] == []
+    # Hierarchically: one card per hop, the node reached at it, one item per
+    # lookup - the delivery, then the last mile that found no neighbour.
+    delivered, last_mile = answer["tree"]
+    assert (delivered["title"], delivered["badge"], delivered["state"]) == ("Hop 1", "1 node", "up")
+    (leaf,) = delivered["entries"]
+    assert (leaf["title"], leaf["badge"], leaf["state"]) == ("leaf1", "1 lookup", "up")
+    assert leaf["items"][0]["title"] == "default: 10.1.1.0/24"
+    assert leaf["items"][0]["details"][0] == {"label": "Outcome", "value": "delivered", "state": "up"}
+    assert (last_mile["title"], last_mile["state"]) == ("Hop 2", "down")
+    assert last_mile["entries"][0]["items"][0]["title"] == "default: 10.1.1.5"
+    # And as a graph: the delivery box leads to the host box.
+    graph = answer["graph"]
+    assert [n["title"] for n in graph["nodes"]] == ["leaf1", "10.1.1.5"]
+    assert [(e["label"], e["state"]) for e in graph["edges"]] == [("ethernet-1/1.0", "up")]
+
+
+def test_a_lens_without_a_graph_answers_none_for_it(client):
+    test_client, _devices = client
+    resp = test_client.get("/api/report/where", params={"target": "00:00:00:00:00:01"})
+    assert resp.json()["graph"] is None
+
+
+def test_a_lens_missing_the_argument_it_needs_is_a_bad_request(client):
+    test_client, _devices = client
+    resp = test_client.get("/api/report/where")
+    assert resp.status_code == 400
+    assert "needs address" in resp.json()["error"]
+
+
+def test_a_lens_that_cannot_answer_is_a_bad_request_rather_than_a_failure(client):
+    test_client, _devices = client
+    resp = test_client.get("/api/report/service", params={"name": "no-such-service"})
+    assert resp.status_code == 400
+    assert "no network-instance matching" in resp.json()["error"]
+
+
+def test_a_lens_reports_nothing_found_as_an_answer(client):
+    test_client, _devices = client
+    resp = test_client.get("/api/report/where", params={"target": "00:00:00:00:00:01"})
+    assert resp.status_code == 200
+    (card,) = resp.json()["tree"]
+    assert (card["badge"], card["state"], card["entries"]) == ("not found", "down", [])
+    assert "2 searched" in card["subtitle"]
+
+
+@pytest.mark.anyio
+async def test_a_lens_streams_like_a_report(store):
+    fabric_store, _devices = store
+    lens = get_lens("where")
+    render = lambda: fabric_store.lens_table(lens, None, {"target": "00:00:00:00:00:01"})  # noqa: E731
+    events = await _collect(fabric_store, lens, stop_after=1, render=render)
+    assert events[0][0] == "table"
+    assert events[0][1]["tree"][0]["badge"] == "not found"
+
+
+@pytest.mark.anyio
+async def test_a_stream_passes_a_question_it_cannot_answer_on_as_an_error(store):
+    """A ValueError is the lens saying so, which the browser shows as such."""
+    fabric_store, _devices = store
+    lens = get_lens("service")
+    render = lambda: fabric_store.lens_table(lens, None, {"name": "no-such-service"})  # noqa: E731
+    events = await _collect(fabric_store, lens, stop_after=1, render=render)
+    assert events[0][0] == "error"
+    assert "no network-instance matching" in events[0][1]["error"]

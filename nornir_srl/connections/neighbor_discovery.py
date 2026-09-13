@@ -50,8 +50,15 @@ class NeighborDiscoveryMixin:
         raise NotImplementedError
 
     def _ni_names_by_subitf(self) -> Dict[str, str]:
-        """Map ``<interface>.<index>`` to the network-instances that bind it."""
-        ni_itfs = self.get(paths=["/network-instance[name=*]"], datatype="config")
+        """Map ``<interface>.<index>`` to the network-instances that bind it.
+
+        Only the interface lists are asked for. On the server a Get is served
+        from what is subscribed, and a subscription to the whole
+        network-instance subtree streams every node's BGP RIBs and statistics
+        along with it - enough to fall behind on, and then everything on that
+        node's stream goes stale.
+        """
+        ni_itfs = self.get(paths=["/network-instance[name=*]/interface"], datatype="config")
         ni_itf_map: Dict[str, List[str]] = {}
         for ni in as_list(first_payload(ni_itfs).get("network-instance")):
             if not isinstance(ni, dict):

@@ -13,7 +13,7 @@ the same way a check does, takes arguments the way a report does, and returns
 what it found the way both do. :data:`LENSES` is the single registry, so a lens
 is defined once and the CLI command and the MCP tool are generated from it.
 
-A lens answers in two layers. The function itself returns *records* - one
+A lens answers in layers. The function itself returns *records* - one
 :class:`Sighting`, :class:`Hop` or :class:`Service` per thing found - holding
 the answer as data: a list of VTEPs is a list, a count is a number, and what
 kind of thing was found is a field rather than a word to match on. That is what
@@ -22,10 +22,13 @@ fields rather than a sentence to parse. The table is built from those records by
 the lens's :attr:`~LensSpec.columns`: each :class:`Column` names itself and says
 how a record fills it, so a column name lives in exactly one place, and the
 sentence in a ``Detail`` cell is composed for a reader rather than parsed by one.
+The browser reads the same records as a hierarchy - :class:`Card` by thing
+found, :class:`Entry` by node, :class:`Item` by record - built by the lens's
+:attr:`~LensSpec.tree`, the way the services pages fold a fabric into cards.
 
 Adding one means writing a record type, a function over a :class:`FabricState`
-that returns a list of them, the columns that render one, and an entry in
-:data:`LENSES`.
+that returns a list of them, the columns and the tree that render one, and an
+entry in :data:`LENSES`.
 
 A lens reads the records of :mod:`nornir_srl.records` where a report returns
 them, and the item dicts of a report that does not yet - the route tables,
@@ -46,6 +49,7 @@ from typing import (
     FrozenSet,
     Iterable,
     List,
+    Mapping,
     Optional,
     Sequence,
     Tuple,
@@ -53,8 +57,16 @@ from typing import (
 
 from .aliases import resolve
 from .fabric import FabricState, as_list, out_of_band, parent, text
-from .records import Route, as_dict
-from .reports import INTERACTIVE, ParamSpec
+from .checks import (
+    service_disagreements,
+    service_facts,
+    service_groups,
+    system_addresses,
+    underlay_domains,
+    underlay_hosts,
+)
+from .records import BgpVpnInstance, Route, as_dict
+from .reports import ALL_SURFACES, ParamSpec
 from .rows import Column
 
 #: How far a path walk follows the fabric before deciding it is going in
@@ -77,23 +89,27 @@ class Sighting:
 
     node: str
     ni: str
-    #: ``arp`` or ``neighbor``: an address binding that named the MAC.
-    #: ``local``: a bridge-table entry learned on this node's own port.
-    #: ``remote``: one learned over the overlay, from a VTEP or behind a
-    #: segment. ``duplicate``: learned locally here and on :attr:`also_on` as
-    #: well. ``not-found``: no node has it.
+    #: ``configured``: the address is a subinterface's own - a loopback, a
+    #: system address, an irb gateway. ``arp`` or ``neighbor``: an address
+    #: binding that named the MAC. ``local``: a bridge-table entry learned on
+    #: this node's own port. ``remote``: one learned over the overlay, from a
+    #: VTEP or behind a segment. ``duplicate``: learned locally here and on
+    #: :attr:`also_on` as well. ``not-found``: no node has it.
     kind: str
     #: The IP a binding was found for, or the MAC.
     address: str
-    #: What the entry is on: the subinterface a binding or a local entry was
-    #: learned on, the VTEP a remote one came from, or the segment it is
-    #: behind. Exactly one of the three is set for anything that was found.
+    #: What the entry is on: the subinterface an address is configured on or a
+    #: binding or a local entry was learned on, the VTEP a remote one came
+    #: from, or the segment it is behind. Exactly one of the three is set for
+    #: anything that was found.
     interface: str = ""
     vtep: str = ""
     esi: str = ""
     #: How the entry got there, as the table says it: ``learnt``, ``evpn``,
     #: ``static``, ``dynamic``.
     origin: str = ""
+    #: ``configured``: the prefix as it is configured, ``192.0.2.3/32``.
+    prefix: str = ""
     #: ``arp``/``neighbor``: the MAC the binding resolved to, and when it goes.
     mac: str = ""
     expiry: str = ""
@@ -122,18 +138,20 @@ class Hop:
     hop: int
     node: str
     ni: str
-    #: The address looked up here: the destination, or the VTEP the walk is
-    #: chasing through the underlay on behalf of a VRF.
+    #: The address looked up here: the destination, or the tunnel endpoint
+    #: the walk is chasing through the underlay on behalf of a VRF.
     address: str
     #: What the walk did with the lookup.
     #: ``forwarded``: out of :attr:`egress` to :attr:`peer`, where it goes on.
     #: ``dead-end``: out of an interface with no LLDP neighbour, so it cannot.
-    #: ``overlay``: resolved to a tunnel; it goes on in the underlay towards
-    #: :attr:`vtep`. ``vtep-reached``: the underlay delivered the VTEP; it
-    #: resumes in :attr:`resumes_in`. ``delivered``: the destination is
-    #: attached here. ``local-ip``: it is this node's own address.
-    #: ``neighbor``/``no-neighbor``: whether ARP or ND has the delivered
-    #: address. ``no-route``, ``loop``, ``too-long``: where a walk gives up.
+    #: ``tunnel``: resolved to a tunnel - VXLAN to a VTEP, LDP or SR to a
+    #: far-end PE - and goes on in the underlay towards :attr:`endpoint`.
+    #: ``endpoint-reached``: the underlay delivered the tunnel endpoint; the
+    #: packet is decapsulated and looked up again in :attr:`resumes_in`.
+    #: ``delivered``: the destination is attached here. ``local-ip``: it is
+    #: this node's own address. ``neighbor``/``no-neighbor``: whether ARP or
+    #: ND has the delivered address. ``no-route``, ``loop``, ``too-long``:
+    #: where a walk gives up.
     outcome: str
     #: The route the lookup matched, as the route table has it.
     prefix: str = ""
@@ -144,9 +162,13 @@ class Hop:
     #: The node on the other end of that cable, and its port.
     peer: str = ""
     peer_port: str = ""
-    #: ``overlay``: the VTEP the tunnel leads to.
-    vtep: str = ""
-    #: ``vtep-reached``: the network-instance the walk picks up again in.
+    #: ``tunnel``: its kind - ``vxlan``, ``ldp``, ``sr-isis`` - and the
+    #: address it leads to.
+    tunnel: str = ""
+    endpoint: str = ""
+    #: ``endpoint-reached``: the network-instance the walk picks up again in.
+    #: Chosen by name where the far end has one, else by the route-target the
+    #: origin's instance exports, since a gateway need not call it the same.
     resumes_in: str = ""
     #: ``neighbor``: the MAC the binding resolved to, and how it was learned.
     mac: str = ""
@@ -187,6 +209,97 @@ class Service:
     remote_macs: int
     #: The ethernet-segments associated with it.
     segments: Tuple[str, ...]
+    #: Its bgp-vpn instances, each with its own route-targets; a gateway has
+    #: two. :attr:`import_rts` and :attr:`export_rts` are their union.
+    instances: Tuple[BgpVpnInstance, ...] = ()
+    #: Which underlay the node is in, numbered from ``1``, when the service is
+    #: carried in more than one - the way the services page tells sites
+    #: apart. Nodes in different underlays never have to agree.
+    site: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# the hierarchy: how records read as cards
+# --------------------------------------------------------------------------- #
+
+#: What a card, an entry or an item says about itself: ``up``, ``warn``,
+#: ``down``, or nothing where there is no verdict to give.
+_UP, _WARN, _DOWN = "up", "warn", "down"
+_SEVERITY = {"": 0, _UP: 1, _WARN: 2, _DOWN: 3}
+
+
+def _worst(states: Iterable[str]) -> str:
+    return max(states, key=lambda s: _SEVERITY.get(s, 0), default="")
+
+
+@dataclass(frozen=True)
+class Detail:
+    """One line of an item: a label and a value.
+
+    A tuple value is shown as pills; each of those is a string, or a
+    ``(text, state)`` pair where the pill has a state of its own.
+    """
+
+    label: str
+    value: Any
+    state: str = ""
+
+
+@dataclass(frozen=True)
+class Item:
+    """One record, under the node that reports it."""
+
+    title: str
+    state: str = ""
+    details: Tuple[Detail, ...] = ()
+
+
+@dataclass(frozen=True)
+class Entry:
+    """One node's part of a card."""
+
+    title: str
+    state: str = ""
+    badge: str = ""
+    items: Tuple[Item, ...] = ()
+
+
+@dataclass(frozen=True)
+class Card:
+    """One thing a lens found - an address, a hop, a service - across the fabric."""
+
+    title: str
+    subtitle: str = ""
+    icon: str = ""
+    state: str = ""
+    badge: str = ""
+    entries: Tuple[Entry, ...] = ()
+
+
+def _entries(
+    records: Iterable[Any], item: Callable[[Any], Item], noun: str, sort: bool = True
+) -> Tuple[Entry, ...]:
+    """The records grouped by node, each node's state the worst of its items."""
+    by_node: Dict[str, List[Any]] = {}
+    for record in records:
+        by_node.setdefault(record.node, []).append(record)
+    nodes = sorted(by_node) if sort else list(by_node)
+    entries = []
+    for node in nodes:
+        items = tuple(item(record) for record in by_node[node])
+        entries.append(
+            Entry(
+                title=node or "-",
+                state=_worst(i.state for i in items),
+                badge=_count(len(items), noun),
+                items=items,
+            )
+        )
+    return tuple(entries)
+
+
+def _count(number: int, noun: str) -> str:
+    return f"{number} {noun}{'' if number == 1 else 's'}"
 
 
 # --------------------------------------------------------------------------- #
@@ -211,10 +324,15 @@ class LensSpec:
     columns: Tuple[Column, ...]
     #: Called as ``run(state, **params)``; returns the records.
     run: Callable[..., List[Any]]
+    #: How the records read as cards, for the browser.
+    tree: Callable[[List[Any]], List[Card]]
+    #: How they read as a graph, where the answer is one: a walk from a
+    #: source to a destination, drawn hop by hop with its fan-out.
+    graph: Optional[Callable[[List[Any]], Dict[str, Any]]] = None
     params: Tuple[ParamSpec, ...] = ()
     #: MCP tool name, where a more explicit one reads better for an agent.
     mcp_name: Optional[str] = None
-    surfaces: FrozenSet[str] = INTERACTIVE
+    surfaces: FrozenSet[str] = ALL_SURFACES
     #: False when consecutive rows of one node are one answer rather than a
     #: list of them, and the table should keep them in the order produced.
     group_by_node: bool = True
@@ -239,6 +357,34 @@ class LensSpec:
 
     def rows(self, records: Iterable[Any]) -> List[Dict[str, Any]]:
         return [self.row(record) for record in records]
+
+    def as_dict(self) -> Dict[str, Any]:
+        """What the browser needs to offer the lens: the same shape as a report."""
+        return {
+            "name": self.name,
+            "kind": "lens",
+            "title": self.title,
+            "description": self.description,
+            "category": "Lenses",
+            "params": [p.as_dict() for p in self.params],
+            "key_columns": [],
+        }
+
+
+def coerce_lens_params(lens: LensSpec, raw: Mapping[str, Any]) -> Dict[str, Any]:
+    """The parameters *lens* declares, out of a surface's raw input.
+
+    Like :func:`~nornir_srl.reports.coerce_params`, but a lens is a question
+    about something, so a parameter it needs is an error to leave out.
+    """
+    params: Dict[str, Any] = {}
+    for spec in lens.params:
+        value = spec.coerce(raw.get(spec.name, ""))
+        if value is not None:
+            params[spec.name] = value
+        elif spec.required:
+            raise ValueError(f"{lens.title} needs {spec.label.lower()}: {spec.help.lower()}")
+    return params
 
 
 # --------------------------------------------------------------------------- #
@@ -324,9 +470,25 @@ def lens_where(state: FabricState, target: str = "") -> List[Sighting]:
     if not mac and address is None:
         raise ValueError(f"'{wanted}' is neither a MAC nor an IP address")
 
-    # An IP is only ever a way of naming a MAC here: resolve it, report the
-    # bindings that did so, and carry on with what they resolved to.
+    # An IP is first of all somebody's own: a loopback, a system address, the
+    # gateway of an irb. Beyond that it is a way of naming a MAC: resolve it
+    # through ARP or ND, report the bindings that did so, and carry on with
+    # what they resolved to.
     if address is not None:
+        for node, instance, itf in state.sub_items("ni", "interfaces"):
+            for prefix in itf.prefixes:
+                network = _network(prefix)
+                if network is not None and _address(prefix.split("/", 1)[0]) == address:
+                    sightings.append(
+                        Sighting(
+                            node=node,
+                            ni=instance.name,
+                            kind="configured",
+                            address=str(address),
+                            interface=itf.name,
+                            prefix=prefix,
+                        )
+                    )
         for node, itf, entry in _arp_bindings(state):
             if _address(entry.get("_addr")) != address:
                 continue
@@ -345,6 +507,11 @@ def lens_where(state: FabricState, target: str = "") -> List[Sighting]:
                 )
             )
         if not mac:
+            if not sightings:
+                nodes = set(state.nodes("ni")) | set(state.nodes("arp")) | set(state.nodes("nd"))
+                sightings.append(
+                    Sighting(node="", ni="", kind="not-found", address=str(address), searched=len(nodes))
+                )
             return sightings
 
     segments = _es_names(state)
@@ -365,11 +532,12 @@ def lens_where(state: FabricState, target: str = "") -> List[Sighting]:
                 table.ni,
                 "remote",
                 mac,
-                vtep=entry.vtep,
+                # Over MPLS there is no VTEP: the far-end PE is what it sits behind.
+                vtep=entry.vtep or entry.far_end,
                 esi=entry.esi,
                 origin=text(entry.type),
-                overlay=entry.overlay,
-                vni=entry.vni,
+                overlay=entry.overlay or ("mpls" if entry.far_end else ""),
+                vni=entry.vni if entry.vni is not None else entry.label,
                 segments=segments.get(entry.esi, ()) if entry.esi else (),
             )
         )
@@ -409,7 +577,14 @@ def _sighting_detail(sighting: Sighting) -> str:
         detail = f"{sighting.mac or '?'}, {sighting.origin}"
         return detail + (f", expires {sighting.expiry}" if sighting.expiry else "")
     if sighting.kind == "not-found":
-        return f"no node reports it in any bridge table ({sighting.searched} searched)"
+        if _mac(sighting.address):
+            return f"no node reports it in any bridge table ({sighting.searched} searched)"
+        return (
+            "no interface has it and no ARP or ND entry names it "
+            f"({sighting.searched} nodes searched)"
+        )
+    if sighting.kind == "configured":
+        return f"{sighting.prefix} configured on {sighting.interface}"
     detail = sighting.origin
     if sighting.vtep:
         detail += f", overlay {sighting.overlay}"
@@ -431,6 +606,79 @@ WHERE_COLUMNS: Tuple[Column, ...] = (
     Column("Via", lambda s: s.interface or s.vtep or s.esi),
     Column("Detail", _sighting_detail),
 )
+
+_SIGHTING_STATE = {
+    "configured": _UP,
+    "local": _UP,
+    "arp": _UP,
+    "neighbor": _UP,
+    "duplicate": _WARN,
+    "not-found": _DOWN,
+}
+
+
+def _sighting_item(s: Sighting) -> Item:
+    details: List[Detail] = []
+    if s.prefix:
+        details.append(Detail("Prefix", s.prefix))
+    if s.interface:
+        details.append(Detail("Interface", s.interface))
+    if s.vtep:
+        details.append(Detail("VTEP", s.vtep))
+    if s.esi:
+        details.append(Detail("ESI", s.esi))
+        details.append(Detail("Segment", tuple(s.segments) or "not local", "" if s.segments else _WARN))
+    if s.overlay:
+        details.append(Detail("Overlay", f"{s.overlay} vni {s.vni}" if s.vni is not None else s.overlay))
+    if s.mac:
+        details.append(Detail("MAC", s.mac))
+    if s.origin:
+        details.append(Detail("Origin", s.origin))
+    if s.expiry:
+        details.append(Detail("Expires", s.expiry))
+    if s.also_on:
+        details.append(
+            Detail(
+                "Also learned locally on",
+                tuple(s.also_on),
+                _WARN,
+            )
+        )
+        details.append(
+            Detail("Note", "expected on an all-active segment, a move or a duplicate otherwise")
+        )
+    return Item(
+        title=f"{s.kind} in {s.ni}" if s.ni else s.kind,
+        state=_SIGHTING_STATE.get(s.kind, ""),
+        details=tuple(details),
+    )
+
+
+def tree_where(sightings: List[Sighting]) -> List[Card]:
+    """One card per address the answer is about: the IP looked up, the MAC found."""
+    cards = []
+    for address in dict.fromkeys(s.address for s in sightings):
+        found = [s for s in sightings if s.address == address]
+        if all(s.kind == "not-found" for s in found):
+            cards.append(
+                Card(title=address, subtitle=_sighting_detail(found[0]), icon="🔍", state=_DOWN, badge="not found")
+            )
+            continue
+        kinds: Dict[str, int] = {}
+        for s in found:
+            kinds[s.kind] = kinds.get(s.kind, 0) + 1
+        entries = _entries(found, _sighting_item, "sighting")
+        cards.append(
+            Card(
+                title=address,
+                subtitle=", ".join(f"{kind} on {_count(n, 'node')}" for kind, n in kinds.items()),
+                icon="📍",
+                state=_worst(e.state for e in entries),
+                badge=_count(len(entries), "node"),
+                entries=entries,
+            )
+        )
+    return cards
 
 
 # --------------------------------------------------------------------------- #
@@ -533,9 +781,40 @@ def _starting_nodes(state: FabricState, source: str, ni: str) -> List[str]:
 
 #: One lookup still to do: the node and network-instance to do it in, the
 #: address to look up, the hop it is on, the steps taken to get there, and -
-#: when it is an underlay leg chasing a VTEP on behalf of a VRF - the
-#: network-instance and address to resume with once the VTEP is reached.
-_Pending = Tuple[str, str, Any, int, Tuple[str, ...], Optional[Tuple[str, Any]]]
+#: when it is an underlay leg chasing a tunnel endpoint on behalf of a VRF -
+#: the node and network-instance the tunnel was taken from and the address
+#: to resume with once the endpoint is reached.
+_Pending = Tuple[str, str, Any, int, Tuple[str, ...], Optional[Tuple[str, str, Any]]]
+
+
+def _resume_instance(state: FabricState, node: str, origin_node: str, origin_ni: str, address: Any) -> str:
+    """The network-instance a tunnel's payload is looked up in at its far end.
+
+    A leaf's VTEP and a gateway's WAN loopback both land the packet in a VRF
+    of the node that owns them. Most fabrics call that VRF the same on every
+    node, but a gateway stitching two datacenters need not: what ties the two
+    together is the route-target the origin's instance exports and the far
+    end's imports. Failing both, the VRF that has a route to the address.
+    """
+    instances = {inst.name: inst for n, inst in state.items("ni") if n == node}
+    if origin_ni in instances or not instances:
+        return origin_ni
+    origin = next((inst for n, inst in state.items("ni") if n == origin_node and inst.name == origin_ni), None)
+    exported = {rt for inst in (origin.instances if origin else ()) for rt in inst.export_rts}
+    vrfs = [inst for inst in instances.values() if text(inst.type) == "ip-vrf"]
+    by_target = [
+        inst
+        for inst in vrfs
+        if exported & {rt for bgp in inst.instances for rt in bgp.import_rts}
+    ]
+    candidates = by_target or vrfs
+    with_route = [
+        inst
+        for inst in candidates
+        if _lpm(_routes(state, _rib_report(address), node, inst.name), address) is not None
+    ]
+    chosen = with_route or candidates
+    return chosen[0].name if chosen else origin_ni
 
 
 def lens_path(
@@ -552,11 +831,13 @@ def lens_path(
     continues there. ECMP is followed on every branch, so the table shows the
     whole fan-out rather than one arbitrary path through it.
 
-    A lookup in a VRF that resolves over the overlay hands the walk back to the
+    A lookup in a VRF that resolves onto a tunnel hands the walk back to the
     underlay: the walk switches to the default instance and continues towards
-    the VTEP, which is how the two tables actually compose on the wire. When
-    the VTEP is reached, the walk resumes in the original VRF on the remote
-    node, which is how a DCI path traces end-to-end.
+    the tunnel's endpoint - a VTEP over VXLAN, a far-end gateway over LDP or
+    SR-MPLS - which is how the two tables actually compose on the wire. When
+    the endpoint is reached the packet is decapsulated and the walk resumes
+    in the VRF there, so a DCI path traces end to end: VXLAN to the DC
+    gateway, MPLS across to the far gateway, VXLAN again to the leaf.
 
     The final hop of a delivered destination includes the ARP or ND entry for
     it, confirming the host is reachable, or noting when no binding exists.
@@ -572,9 +853,17 @@ def lens_path(
     pending: List[_Pending] = [
         (node, ni, target, 1, (), None) for node in _starting_nodes(state, source, ni)
     ]
+    # ECMP branches fan out and converge again: every spine leads to the same
+    # gateway, every gateway to the same far end. A lookup already made on
+    # another branch is one answer, reported where it was first reached.
+    made: set = set()
     while pending:
         node, instance, address, hop, seen, resume = pending.pop(0)
-        step = f"{node}/{instance}"
+        # A walk is going in circles when it looks the same address up in the
+        # same place twice on one branch; a gateway's underlay is walked once
+        # towards its VTEP and again towards the far gateway, and that is no
+        # loop.
+        step = f"{node}/{instance}" if address == target else f"{node}/{instance}@{address}"
         here = dict(hop=hop, node=node, ni=instance, address=str(address))
         if hop > MAX_HOPS or step in seen:
             hops.append(
@@ -583,6 +872,12 @@ def lens_path(
                 else Hop(**here, outcome="too-long")
             )
             continue
+        # Another branch converging on a lookup already made is not a loop
+        # but not news either.
+        lookup = (node, instance, str(address), (resume[1], str(resume[2])) if resume else None)
+        if lookup in made:
+            continue
+        made.add(lookup)
 
         route = _lpm(_routes(state, report, node, instance), address)
         if route is None:
@@ -599,24 +894,38 @@ def lens_path(
             next_hops=tuple(nh.address or nh.resolving_route for nh in route.next_hops),
         )
 
-        # A route that resolved over the overlay names its tunnels rather than
-        # an interface. The walk hands off to the underlay there: one branch
-        # per VTEP, looked up again in the default instance, which is how the
-        # two route tables actually compose on the wire.
-        tunnels = [hop for hop in leaves if hop.kind == "tunnel" and hop.tunnel == "vxlan"]
+        # A route that resolved onto a tunnel names it rather than an
+        # interface: VXLAN to a VTEP from a leaf, LDP or SR-MPLS to a far-end
+        # gateway from a DCGW. The walk hands off to the underlay there: one
+        # branch per endpoint, looked up again in the default instance, which
+        # is how the two route tables actually compose on the wire.
+        tunnels = [hop for hop in leaves if hop.kind == "tunnel" and _address(hop.value.split("/", 1)[0])]
         if tunnels:
             for tunnel in tunnels:
-                vtep = tunnel.value.split("/", 1)[0]
+                endpoint = tunnel.value.split("/", 1)[0]
                 hops.append(
-                    Hop(**here, **matched, outcome="overlay", egress=f"vxlan:{vtep}", vtep=vtep)
-                )
-                address_of_vtep = _address(vtep)
-                if address_of_vtep is not None:
-                    # Carry the VRF and destination along, so the walk can
-                    # resume in the VRF once the VTEP is reached.
-                    pending.append(
-                        (node, "default", address_of_vtep, hop + 1, seen + (step,), (instance, address))
+                    Hop(
+                        **here,
+                        **matched,
+                        outcome="tunnel",
+                        egress=f"{tunnel.tunnel}:{endpoint}",
+                        tunnel=tunnel.tunnel,
+                        endpoint=endpoint,
                     )
+                )
+                # Carry the VRF and destination along, so the walk can resume
+                # in the VRF once the endpoint is reached. A tunnel taken on
+                # the way to another's endpoint keeps the outer one.
+                pending.append(
+                    (
+                        node,
+                        "default",
+                        _address(endpoint),
+                        hop + 1,
+                        seen + (step,),
+                        resume if resume is not None else (node, instance, address),
+                    )
+                )
             continue
 
         # Anything else the route leaves through is looked up against LLDP by
@@ -628,12 +937,14 @@ def lens_path(
             # destination is the node itself.
             attached = egress or [""]
             if resume is not None:
-                # The underlay delivered the VTEP: resume in the VRF on the
-                # node that owns it.
-                resume_ni, resume_address = resume
+                # The underlay delivered the tunnel endpoint: the packet is
+                # decapsulated and looked up in the VRF on the node that owns
+                # it - the one the origin's VRF sends to, whatever it is called.
+                origin_node, origin_ni, resume_address = resume
+                resume_ni = _resume_instance(state, node, origin_node, origin_ni, resume_address)
                 for interface in attached:
                     hops.append(
-                        Hop(**here, **matched, outcome="vtep-reached", egress=interface, resumes_in=resume_ni)
+                        Hop(**here, **matched, outcome="endpoint-reached", egress=interface, resumes_in=resume_ni)
                     )
                 pending.append((node, resume_ni, resume_address, hop + 1, seen + (step,), None))
                 continue
@@ -687,8 +998,8 @@ _HOP_DETAIL: Dict[str, Callable[[Hop], str]] = {
     "dead-end": lambda h: (
         f"no LLDP neighbour on {parent(h.egress)}, the path stops being traceable here"
     ),
-    "overlay": lambda h: f"over the overlay, continuing to VTEP {h.vtep} in default",
-    "vtep-reached": lambda h: f"VTEP reached, continuing in {h.resumes_in}",
+    "tunnel": lambda h: f"over {h.tunnel} to {h.endpoint}, continuing in default",
+    "endpoint-reached": lambda h: f"tunnel endpoint reached, continuing in {h.resumes_in}",
     "delivered": lambda h: f"delivered here, {h.route_type} on {h.egress or 'this node'}",
     "local-ip": lambda h: f"locally configured on {h.egress or 'this node'}",
     "neighbor": lambda h: f"{h.mac} on {h.egress}, {h.origin}",
@@ -713,6 +1024,173 @@ PATH_COLUMNS: Tuple[Column, ...] = (
     Column("Peer", lambda h: f"{h.peer} {h.peer_port}".strip()),
     Column("Detail", lambda h: _HOP_DETAIL[h.outcome](h)),
 )
+
+#: What each outcome says about the walk: reaching or being delivered is
+#: good, a hop that only goes on says nothing yet, and a stop is a fault.
+_HOP_STATE = {
+    "delivered": _UP,
+    "local-ip": _UP,
+    "neighbor": _UP,
+    "endpoint-reached": _UP,
+    "dead-end": _DOWN,
+    "no-route": _DOWN,
+    "no-neighbor": _DOWN,
+    "loop": _DOWN,
+    "too-long": _DOWN,
+}
+
+
+def _hop_item(h: Hop) -> Item:
+    details = [Detail("Outcome", h.outcome, _HOP_STATE.get(h.outcome, ""))]
+    if h.route_type:
+        details.append(Detail("Route", f"{h.prefix} ({h.route_type})"))
+    if h.next_hops:
+        details.append(Detail("Next-hop", tuple(h.next_hops)))
+    if h.mac:
+        details.append(Detail("MAC", f"{h.mac} ({h.origin})" if h.origin else h.mac))
+    if h.egress:
+        details.append(Detail("Egress", h.egress))
+    if h.peer:
+        details.append(Detail("Peer", f"{h.peer} {h.peer_port}".strip()))
+    if h.tunnel:
+        details.append(Detail("Tunnel", f"{h.tunnel} to {h.endpoint}"))
+    if h.resumes_in:
+        details.append(Detail("Resumes in", h.resumes_in))
+    sentence = _HOP_DETAIL[h.outcome](h)
+    if sentence:
+        details.append(Detail("Detail", sentence))
+    return Item(
+        title=f"{h.ni}: {h.prefix or h.address}",
+        state=_HOP_STATE.get(h.outcome, ""),
+        details=tuple(details),
+    )
+
+
+def graph_path(hops: List[Hop]) -> Dict[str, Any]:
+    """The walk as a graph: one box per lookup, an edge to each lookup it leads to.
+
+    Boxes sit in the column of their hop, so ECMP fans out across a column
+    and converges again where branches meet: every leaf's underlay lookup
+    leads to the same two spines, both spines to the same gateway. What a
+    lookup did says where the packet goes next - out of a port to the LLDP
+    peer, into a tunnel and so into the underlay on the same node, out of a
+    tunnel and so into the VRF, off an attached interface and so to the host -
+    and that is the edge. A lookup that stopped the walk has no edge out.
+    """
+    if not hops:
+        return {"nodes": [], "edges": [], "destination": ""}
+    # The first hop looked up the destination; the underlay legs look up
+    # tunnel endpoints on its behalf.
+    destination = hops[0].address
+    boxes: Dict[Tuple[int, str, str, str], Dict[str, Any]] = {}
+    for h in hops:
+        key = (h.hop, h.node, h.ni, h.address)
+        box = boxes.get(key)
+        if box is None:
+            last_mile = h.outcome in _LAST_MILE
+            box = boxes[key] = {
+                "id": _box_id(*key),
+                "hop": h.hop,
+                "node": h.node,
+                "ni": h.ni,
+                "address": h.address,
+                "title": h.address if last_mile else h.node,
+                "subtitle": "" if last_mile else (h.ni if h.address == destination else f"{h.ni} · {h.address}"),
+                "state": "",
+                "outcomes": [],
+                "details": [],
+            }
+        box["outcomes"].append(h.outcome)
+        box["state"] = _worst([box["state"], _HOP_STATE.get(h.outcome, "")])
+        line = _HOP_DETAIL[h.outcome](h)
+        if h.outcome == "neighbor":
+            box["subtitle"] = f"{h.mac} on {h.egress}"
+        elif h.outcome == "local-ip":
+            box["subtitle"] = f"own address on {h.egress}" if h.egress else "own address"
+        elif h.outcome == "no-neighbor":
+            box["subtitle"] = "no ARP/ND entry"
+        if line and line not in box["details"]:
+            box["details"].append(line)
+
+    by_place: Dict[Tuple[str, str, str], List[Tuple[int, str, str, str]]] = {}
+    for key in boxes:
+        by_place.setdefault(key[1:], []).append(key)
+
+    def successor(h: Hop, node: str, ni: str, address: str) -> Optional[str]:
+        """The box a lookup leads to: at the next hop, or wherever another
+        branch reached the same place first."""
+        candidates = by_place.get((node, ni, address), [])
+        exact = [key for key in candidates if key[0] == h.hop + 1]
+        chosen = exact or sorted(candidates)
+        return _box_id(*chosen[0]) if chosen else None
+
+    edges: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+    stops: List[Dict[str, Any]] = []
+    for h in hops:
+        source = _box_id(h.hop, h.node, h.ni, h.address)
+        if h.outcome == "forwarded":
+            to, label = successor(h, h.peer, h.ni, h.address), h.egress
+        elif h.outcome == "tunnel":
+            to, label = successor(h, h.node, "default", h.endpoint), h.egress
+        elif h.outcome == "endpoint-reached":
+            to, label = successor(h, h.node, h.resumes_in, destination), f"into {h.resumes_in}"
+        elif h.outcome == "delivered":
+            to, label = successor(h, h.node, h.ni, destination), h.egress
+        elif h.outcome == "dead-end":
+            # A branch that dies on a port is still a branch of the fan-out:
+            # it goes out of the port to nowhere the walk can see.
+            to, label = f"{h.hop + 1}:stop/{h.node}/{h.egress}", h.egress
+            if not any(stop["id"] == to for stop in stops):
+                stops.append(
+                    {
+                        "id": to,
+                        "hop": h.hop + 1,
+                        "node": "",
+                        "ni": "",
+                        "address": h.address,
+                        "title": "no neighbour",
+                        "subtitle": f"on {parent(h.egress)}",
+                        "state": _DOWN,
+                        "outcomes": ["dead-end"],
+                        "details": [_HOP_DETAIL["dead-end"](h)],
+                    }
+                )
+        else:
+            continue
+        if to is None:
+            continue
+        edges.setdefault((source, to, label), {"from": source, "to": to, "label": label, "state": _HOP_STATE.get(h.outcome, "")})
+    return {
+        "destination": destination,
+        "nodes": [boxes[key] for key in sorted(boxes)] + sorted(stops, key=lambda stop: stop["id"]),
+        "edges": list(edges.values()),
+    }
+
+
+def _box_id(hop: int, node: str, ni: str, address: str) -> str:
+    return f"{hop}:{node}/{ni}@{address}"
+
+
+def tree_path(hops: List[Hop]) -> List[Card]:
+    """One card per hop of the walk, the nodes reached at it inside."""
+    cards = []
+    for number in sorted({h.hop for h in hops}):
+        at = [h for h in hops if h.hop == number]
+        entries = _entries(at, _hop_item, "lookup", sort=False)
+        outcomes: Dict[str, int] = {}
+        for h in at:
+            outcomes[h.outcome] = outcomes.get(h.outcome, 0) + 1
+        cards.append(
+            Card(
+                title=f"Hop {number}",
+                subtitle=", ".join(f"{n} {outcome}" for outcome, n in outcomes.items()),
+                icon="🧭",
+                state=_worst(e.state for e in entries),
+                badge=_count(len(entries), "node"),
+                entries=entries,
+            )
+        )
+    return cards
 
 
 # --------------------------------------------------------------------------- #
@@ -776,6 +1254,7 @@ def lens_service(state: FabricState, name: str = "") -> List[Service]:
                 local_macs=local,
                 remote_macs=len(entries) - local,
                 segments=tuple(sorted(set(segments.get((node, instance.name), [])))),
+                instances=instance.instances,
             )
         )
 
@@ -784,7 +1263,20 @@ def lens_service(state: FabricState, name: str = "") -> List[Service]:
             f"no network-instance matching '{wanted}' on any of the "
             f"{len(state.nodes('ni'))} node(s) collected"
         )
-    return services
+
+    # Which underlay each node carries the service in: nodes whose VTEPs
+    # cannot reach each other are never one service, however it is named.
+    system, hosts = system_addresses(state), underlay_hosts(state)
+    sited: List[Service] = []
+    for name in dict.fromkeys(s.ni for s in services):
+        mine = [s for s in services if s.ni == name]
+        gateways = {s.node for s in mine if len(s.instances) > 1}
+        domains = underlay_domains([s.node for s in mine], system, hosts, gateways)
+        site = {node: str(index) for index, domain in enumerate(domains, start=1) for node in domain}
+        sited.extend(
+            replace(s, site=site[s.node] if len(domains) > 1 else "") for s in mine
+        )
+    return sited
 
 
 SERVICE_COLUMNS: Tuple[Column, ...] = (
@@ -807,7 +1299,99 @@ SERVICE_COLUMNS: Tuple[Column, ...] = (
         ),
     ),
     Column("ES", lambda s: _joined(s.segments)),
+    Column("Site", "site"),
 )
+
+
+def _service_item(s: Service) -> Item:
+    details = [
+        Detail("Type", s.type),
+        Detail("Oper", s.oper, _UP if text(s.oper) == "up" else _DOWN),
+    ]
+    if s.evis:
+        details.append(Detail("EVI", tuple(s.evis)))
+    if s.vnis:
+        details.append(Detail("VNI", tuple(str(v) for v in s.vnis)))
+    if s.import_rts:
+        details.append(Detail("Import RT", tuple(s.import_rts)))
+    if s.export_rts:
+        details.append(Detail("Export RT", tuple(s.export_rts)))
+    if s.interfaces:
+        details.append(
+            Detail(
+                "Interfaces",
+                tuple((i.name, _UP if i.oper == "up" else _DOWN) for i in s.interfaces),
+            )
+        )
+    if s.bound:
+        details.append(Detail("Bound", tuple(s.bound)))
+    if s.vteps:
+        details.append(Detail("VTEPs", tuple(s.vteps)))
+    if s.local_macs or s.remote_macs:
+        details.append(Detail("MACs", f"{s.local_macs} local / {s.remote_macs} remote"))
+    if s.segments:
+        details.append(Detail("Ethernet segments", tuple(s.segments)))
+    if s.site:
+        details.append(Detail("Underlay", s.site))
+    return Item(title=s.ni, state=_UP if text(s.oper) == "up" else _DOWN, details=tuple(details))
+
+
+def tree_service(services: List[Service]) -> List[Card]:
+    """One card per network-instance, every node that carries it inside.
+
+    A card is marked when the nodes disagree about what the service is: a
+    VNI or a route-target that differs on one of them is the thing the
+    transpose exists to show.
+    """
+    cards = []
+    for name in dict.fromkeys(s.ni for s in services):
+        mine = [s for s in services if s.ni == name]
+        entries = _entries(mine, _service_item, "instance")
+        # The same questions the evpn_service_mismatch check asks, within
+        # each underlay the service is carried in: which nodes are one
+        # service, by the route-target they share, and whether those agree on
+        # it - fact by fact and instance by instance, so a gateway's WAN side
+        # is not a disagreement with the leaves.
+        facts = {s.node: service_facts(", ".join(map(str, s.vnis)), s.instances) for s in mine}
+        sites = dict.fromkeys(s.site for s in mine)
+        split: List[str] = []
+        disputed: List[str] = []
+        for site in sites:
+            within = {s.node: facts[s.node] for s in mine if s.site == site}
+            groups = service_groups(within)
+            if len(groups) > 1:
+                split.append(
+                    "; ".join(
+                        f"{_joined(within[group[0]].get('import route-target') or ()) or 'none'} on {_joined(group)}"
+                        for group in groups
+                    )
+                )
+            disputed.extend(
+                fact
+                for group in groups
+                for fact, _values in service_disagreements({node: within[node] for node in group})
+            )
+        kind = mine[0].type
+        subtitle = kind
+        if mine[0].evis:
+            subtitle += f", EVI {_joined(mine[0].evis)}"
+        if len(sites) > 1:
+            subtitle += f", in {len(sites)} underlays"
+        if split:
+            subtitle += " - two services under one name in one underlay, by route-target: " + " / ".join(split)
+        if disputed:
+            subtitle += " - nodes disagree on " + ", ".join(dict.fromkeys(disputed))
+        cards.append(
+            Card(
+                title=name,
+                subtitle=subtitle,
+                icon="🌉" if kind == "mac-vrf" else "🔀" if kind == "ip-vrf" else "📦",
+                state=_worst([*(e.state for e in entries), _WARN if disputed or split else ""]),
+                badge=_count(len(entries), "node"),
+                entries=entries,
+            )
+        )
+    return cards
 
 
 # --------------------------------------------------------------------------- #
@@ -819,19 +1403,21 @@ LENSES: Tuple[LensSpec, ...] = (
         name="where",
         title="Where",
         description=(
-            "Locates a MAC or IP address across the fabric: which node owns it, "
-            "which nodes learned it over the overlay, and whether more than one "
-            "claims it locally."
+            "Locates a MAC or IP address across the fabric: which node has it "
+            "configured or owns it, which nodes learned it over the overlay, "
+            "and whether more than one claims it locally."
         ),
-        requires=("mac", "arp", "nd", "es"),
+        requires=("ni", "mac", "arp", "nd", "es"),
         columns=WHERE_COLUMNS,
         run=lens_where,
+        tree=tree_where,
         params=(
             ParamSpec(
                 name="target",
                 label="Address",
                 placeholder="00:C1:AB:00:01:21 or 10.0.1.51",
                 help="The MAC or IP address to locate",
+                required=True,
             ),
         ),
         mcp_name="locate_address",
@@ -841,18 +1427,22 @@ LENSES: Tuple[LensSpec, ...] = (
         title="Path",
         description=(
             "Walks the route tables hop by hop from a node or address towards a "
-            "destination, following every ECMP branch and handing off from a VRF "
-            "to the underlay at the VTEP."
+            "destination, following every ECMP branch and every tunnel: VXLAN to "
+            "the VTEP, MPLS to the far-end gateway, and back into the VRF there."
         ),
-        requires=("ipv4_rib", "ipv6_rib", "lldp", "arp", "nd"),
+        # ``ni`` says which VRF a tunnel lands in at its far end.
+        requires=("ni", "ipv4_rib", "ipv6_rib", "lldp", "arp", "nd"),
         columns=PATH_COLUMNS,
         run=lens_path,
+        tree=tree_path,
+        graph=graph_path,
         params=(
             ParamSpec(
                 name="source",
                 label="From",
                 placeholder="leaf1 or 10.0.1.51",
                 help="The node or attached address the walk starts from",
+                required=True,
             ),
             ParamSpec(
                 name="destination",
@@ -860,6 +1450,7 @@ LENSES: Tuple[LensSpec, ...] = (
                 placeholder="10.0.2.51",
                 help="The address being forwarded towards",
                 kind="address",
+                required=True,
             ),
             ParamSpec(
                 name="ni",
@@ -879,15 +1470,18 @@ LENSES: Tuple[LensSpec, ...] = (
             "EVI, VNI, route-targets, bound interfaces, VTEP peers, MAC counts "
             "and ethernet-segments, one row per node."
         ),
-        requires=("ni", "vxlan", "mac", "es"),
+        # The RIBs say which nodes share an underlay, and so can disagree at all.
+        requires=("ni", "vxlan", "mac", "es", "ipv4_rib", "ipv6_rib"),
         columns=SERVICE_COLUMNS,
         run=lens_service,
+        tree=tree_service,
         params=(
             ParamSpec(
                 name="name",
                 label="Service",
                 placeholder="subnet-1",
                 help="Network-instance name, matched as a case-insensitive regex",
+                required=True,
             ),
         ),
         mcp_name="service_detail",
@@ -922,6 +1516,11 @@ __all__ = [
     "PATH_COLUMNS",
     "SERVICE_COLUMNS",
     "WHERE_COLUMNS",
+    "Card",
+    "Detail",
+    "Entry",
+    "Item",
+    "coerce_lens_params",
     "Hop",
     "Interface",
     "LensSpec",
@@ -933,4 +1532,8 @@ __all__ = [
     "lens_service",
     "lens_where",
     "lenses_for",
+    "graph_path",
+    "tree_path",
+    "tree_service",
+    "tree_where",
 ]

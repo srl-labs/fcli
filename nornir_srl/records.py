@@ -51,15 +51,20 @@ def as_int(value: Any) -> Optional[int]:
 # --------------------------------------------------------------------------- #
 
 #: A bridge-table destination as SR Linux writes the leaf: a bare subinterface
-#: or ``irb-interface`` for a local entry; for a remote one the overlay
-#: interface and then either the VTEP that owns it or the ethernet-segment it
-#: sits behind, ``vxlan-interface:vxlan1.101 vtep:192.168.255.2 vni:101``.
+#: or ``irb-interface`` for a local entry; for one learned over VXLAN the
+#: overlay interface and then either the VTEP that owns it or the
+#: ethernet-segment it sits behind, ``vxlan-interface:vxlan1.101
+#: vtep:192.168.255.2 vni:101``.
 _DESTINATION = re.compile(
     r"vxlan-interface:(?P<overlay>\S+)"
     r"(?:\s+vtep:(?P<vtep>\S+))?"
     r"(?:\s+vni:(?P<vni>\d+))?"
     r"(?:\s+esi:(?P<esi>\S+))?"
 )
+
+#: One learned over EVPN-MPLS, as a gateway's WAN side has them: the far-end
+#: PE and the label it is sent with, ``far-end:192.0.2.7 nh-tag:1727 label:310001``.
+_FAR_END = re.compile(r"far-end:(?P<far_end>\S+)(?:\s+nh-tag:\S+)?(?:\s+label:(?P<label>\d+))?")
 
 
 @dataclass(frozen=True)
@@ -72,36 +77,48 @@ class MacEntry:
     #: How it got there: ``learnt``, ``evpn``, ``evpn-static``, ``irb-interface``...
     type: str
     #: The destination read apart. A local entry names the subinterface it was
-    #: learned on (``irb-interface`` for the node's own gateway MAC); a remote
-    #: one names the overlay interface and either the VTEP it came from or the
-    #: segment it sits behind.
+    #: learned on (``irb-interface`` for the node's own gateway MAC); one
+    #: learned over VXLAN names the overlay interface and either the VTEP it
+    #: came from or the segment it sits behind; one learned over EVPN-MPLS
+    #: names the far-end PE and the label.
     interface: str = ""
     overlay: str = ""
     vtep: str = ""
     vni: Optional[int] = None
     esi: str = ""
+    far_end: str = ""
+    label: Optional[int] = None
 
     @property
     def local(self) -> bool:
-        """Learned on this node's own port, rather than over the overlay."""
-        return not self.overlay
+        """Learned on this node's own port, rather than from another node."""
+        return not (self.overlay or self.far_end)
 
     @classmethod
     def read(cls, address: Any, destination: Any, type: Any) -> "MacEntry":
         """An entry from the three leaves the bridge table has for it."""
         dest = str(destination or "").strip()
         match = _DESTINATION.search(dest)
-        if not match:
-            return cls(str(address or ""), dest, str(type or ""), interface=dest)
-        return cls(
-            str(address or ""),
-            dest,
-            str(type or ""),
-            overlay=match.group("overlay") or "",
-            vtep=match.group("vtep") or "",
-            vni=as_int(match.group("vni")),
-            esi=match.group("esi") or "",
-        )
+        if match:
+            return cls(
+                str(address or ""),
+                dest,
+                str(type or ""),
+                overlay=match.group("overlay") or "",
+                vtep=match.group("vtep") or "",
+                vni=as_int(match.group("vni")),
+                esi=match.group("esi") or "",
+            )
+        match = _FAR_END.search(dest)
+        if match:
+            return cls(
+                str(address or ""),
+                dest,
+                str(type or ""),
+                far_end=match.group("far_end"),
+                label=as_int(match.group("label")),
+            )
+        return cls(str(address or ""), dest, str(type or ""), interface=dest)
 
 
 @dataclass(frozen=True)
@@ -132,6 +149,23 @@ class Subinterface:
 
 
 @dataclass(frozen=True)
+class BgpVpnInstance:
+    """One bgp-vpn instance of a network-instance: what it imports and exports with.
+
+    A leaf has one. A gateway has two, one per side of it - the DC side that
+    shares its route-target with the leaves, and the WAN side with a
+    route-target and a distinguisher of its own - so the two are kept apart
+    rather than merged into one set the leaves would never match.
+    """
+
+    id: int
+    #: Route-targets, or where a policy sets them instead, the policy's name.
+    import_rts: Tuple[str, ...] = ()
+    export_rts: Tuple[str, ...] = ()
+    rd: str = ""
+
+
+@dataclass(frozen=True)
 class NetworkInstance:
     """One network-instance on one node."""
 
@@ -143,10 +177,17 @@ class NetworkInstance:
     overlays: Tuple[str, ...] = ()
     #: The EVI of each bgp-evpn instance it advertises with; a gateway has two.
     evis: Tuple[str, ...] = ()
-    #: Route-targets, or where a policy sets them instead, the policy's name.
-    import_rts: Tuple[str, ...] = ()
-    export_rts: Tuple[str, ...] = ()
+    instances: Tuple[BgpVpnInstance, ...] = ()
     interfaces: Tuple[Subinterface, ...] = ()
+
+    @property
+    def import_rts(self) -> Tuple[str, ...]:
+        """Every route-target it imports with, over all its instances."""
+        return tuple(sorted({rt for inst in self.instances for rt in inst.import_rts}))
+
+    @property
+    def export_rts(self) -> Tuple[str, ...]:
+        return tuple(sorted({rt for inst in self.instances for rt in inst.export_rts}))
 
 
 # --------------------------------------------------------------------------- #
@@ -413,6 +454,7 @@ __all__ = [
     "BgpPeers",
     "BgpRib",
     "BgpRoute",
+    "BgpVpnInstance",
     "BridgeTable",
     "Candidate",
     "Egress",

@@ -915,8 +915,9 @@ class Layer2Mixin:
         if not self._has_feature("bridged"):
             return {"vxlan": []}
 
-        # vxlan-interface -> the network-instance it is bound to.
-        ni_resp = self.get(paths=["/network-instance[name=*]"], datatype="config")
+        # vxlan-interface -> the network-instance it is bound to, from the
+        # vxlan-interface lists alone (see get_irb for why not the subtree).
+        ni_resp = self.get(paths=["/network-instance[name=*]/vxlan-interface"], datatype="config")
         ni_map: Dict[str, str] = {}
         for ni in as_list(first_payload(ni_resp).get("network-instance")):
             for vxlan_itf in as_list(ni.get("vxlan-interface")):
@@ -972,8 +973,10 @@ class Layer2Mixin:
             "datatype": "all",
         }
 
-        # build NI-to-interface map
-        ni_itfs = self.get(paths=["/network-instance[name=*]"], datatype="config")
+        # build NI-to-interface map, from the interface lists alone: the whole
+        # network-instance subtree carries the BGP RIBs, which is far more
+        # than a subscription serving this Get should have to stream.
+        ni_itfs = self.get(paths=["/network-instance[name=*]/interface"], datatype="config")
         ni_itf_map: Dict[str, List[str]] = {}
         for ni in as_list(first_payload(ni_itfs).get("network-instance")):
             for ni_itf in ni.get("interface", []):

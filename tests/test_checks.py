@@ -23,15 +23,20 @@ from nornir_srl.checks import (
     Check,
     FabricState,
     run_checks,
+    underlay_domains,
 )
 from nornir_srl.records import (
     Association,
     BgpPeers,
+    BgpVpnInstance,
     Candidate,
     EthernetSegment,
     Family,
     Neighbor,
     NetworkInstance,
+    Route,
+    RouteTable,
+    Subinterface,
     VxlanInterface,
 )
 from nornir_srl.reports import REPORTS_BY_NAME
@@ -412,8 +417,7 @@ def _ni(node: str, *, vxlan: str = "vxlan1.100", in_rt: str = "65000:100", out_r
                 type="mac-vrf",
                 oper="up",
                 overlays=(vxlan,),
-                import_rts=(in_rt,),
-                export_rts=(out_rt,),
+                instances=(BgpVpnInstance(1, (in_rt,), (out_rt,)),),
             )
         ]
     }
@@ -461,6 +465,134 @@ def test_evpn_service_mismatch_reads_a_route_target_however_it_is_written():
     assert run("evpn_service_mismatch", state) == []
 
 
+def _gateway(node: str, *, wan_rt: str = "65000:100"):
+    """A DCI gateway: the leaves' instance, plus a WAN-side instance of its own."""
+    return {
+        node: [
+            NetworkInstance(
+                name="mac-vrf-100",
+                type="mac-vrf",
+                oper="up",
+                overlays=("vxlan1.100",),
+                instances=(
+                    BgpVpnInstance(1, ("65000:100",), ("65000:100",)),
+                    BgpVpnInstance(2, (wan_rt,), (wan_rt,), rd="192.0.2.8:100"),
+                ),
+            )
+        ]
+    }
+
+
+def test_evpn_service_mismatch_lets_a_gateway_carry_a_second_instance():
+    """A gateway's WAN-side route-target is not a disagreement with the leaves."""
+    state = fabric(
+        ni={**_ni("leaf1"), **_ni("leaf2"), **_gateway("dcgw1"), **_gateway("dcgw2")},
+        vxlan={**_vxlan("leaf1"), **_vxlan("leaf2"), **_vxlan("dcgw1"), **_vxlan("dcgw2")},
+    )
+    assert run("evpn_service_mismatch", state) == []
+
+
+def test_evpn_service_mismatch_compares_a_second_instance_between_the_gateways():
+    state = fabric(
+        ni={**_ni("leaf1"), **_gateway("dcgw1"), **_gateway("dcgw2", wan_rt="65000:999")},
+        vxlan={**_vxlan("leaf1"), **_vxlan("dcgw1"), **_vxlan("dcgw2")},
+    )
+    findings = run("evpn_service_mismatch", state)
+    # Only the gateways have a second instance, so only they are held to it.
+    assert {f["Node"] for f in findings} == {"dcgw1", "dcgw2"}
+    assert all("bgp-instance 2" in f["Detail"] for f in findings)
+    assert not any("leaf1" in f["Detail"] for f in findings)
+
+
+def test_evpn_service_mismatch_takes_a_name_split_by_route_target_in_one_underlay_as_a_warning():
+    """Two services under one name in one fabric, or a mistyped target: a
+    warning either way, and no error about the VNI between them."""
+    state = fabric(
+        ni={
+            **_ni("leaf1", in_rt="65000:201", out_rt="65000:201"),
+            **_ni("leaf2", in_rt="65000:201", out_rt="65000:201"),
+            **_ni("leaf3", in_rt="65000:202", out_rt="65000:202"),
+        },
+        vxlan={**_vxlan("leaf1", vni=201), **_vxlan("leaf2", vni=201), **_vxlan("leaf3", vni=202)},
+    )
+    findings = run("evpn_service_mismatch", state)
+    assert {f["Severity"] for f in findings} == {WARNING}
+    assert {f["Node"] for f in findings} == {"leaf1", "leaf2", "leaf3"}
+    leaf1 = next(f for f in findings if f["Node"] == "leaf1")
+    assert "65000:201, while leaf3 65000:202 in the same underlay" in leaf1["Detail"]
+    assert "two services under one name" in leaf1["Detail"]
+
+
+def _underlay(node: str, address: str, *reachable: str) -> Dict[str, Any]:
+    """A node's own loopback, and the loopbacks it can reach in ``default``."""
+    return {
+        "ni": NetworkInstance(
+            "default", "default", "up",
+            interfaces=(Subinterface("system0.0", "up", prefixes=(f"{address}/32",)),),
+        ),
+        "rib": RouteTable("default", tuple(Route(f"{other}/32", "bgp") for other in reachable)),
+    }
+
+
+def _two_datacenters(*, dc2_gateway_wan_rt: str = "65000:100") -> FabricState:
+    """Two fabrics whose underlays do not see each other, joined by gateways over a WAN.
+
+    Each datacenter has a bridge domain of the same name with its own VNI and
+    route-target; the gateways carry the leaves' instance and a WAN-side one
+    of their own, and reach each other's loopbacks over the WAN.
+    """
+    dc1 = {"leaf1": "192.0.2.1", "leaf2": "192.0.2.2", "dcgw1": "192.0.2.8"}
+    dc2 = {"leaf5": "192.0.2.5", "leaf6": "192.0.2.6", "dcgw3": "192.0.2.18"}
+    ni: Dict[str, Any] = {}
+    rib: Dict[str, Any] = {}
+    vxlan: Dict[str, Any] = {}
+    for site, members, rt, vni in ((1, dc1, "65000:201", 201), (2, dc2, "65000:202", 202)):
+        for node, address in members.items():
+            reachable = [a for n, a in members.items() if n != node]
+            if node.startswith("dcgw"):
+                # Gateways learn every gateway's loopback over the WAN.
+                reachable += [a for n, a in {**dc1, **dc2}.items() if n.startswith("dcgw") and n != node]
+                service = _gateway(node, wan_rt=dc2_gateway_wan_rt if site == 2 else "65000:100")[node][0]
+                service = replace(service, instances=(BgpVpnInstance(1, (rt,), (rt,)), service.instances[1]))
+            else:
+                service = _ni(node, in_rt=rt, out_rt=rt)[node][0]
+            underlay = _underlay(node, address, *reachable)
+            ni[node] = [service, underlay["ni"]]
+            rib[node] = [underlay["rib"]]
+            vxlan.update(_vxlan(node, vni=vni))
+    return fabric(ni=ni, vxlan=vxlan, ipv4_rib=rib)
+
+
+def test_evpn_service_mismatch_says_nothing_about_a_name_shared_across_underlays():
+    """Leaves whose underlays do not see each other are never one service."""
+    assert run("evpn_service_mismatch", _two_datacenters()) == []
+
+
+def test_evpn_service_mismatch_holds_the_gateways_wan_side_together_across_underlays():
+    """The WAN side is one service among the gateways, reached over the WAN."""
+    findings = run("evpn_service_mismatch", _two_datacenters(dc2_gateway_wan_rt="65000:999"))
+    assert {(f["Node"], f["Severity"]) for f in findings} == {("dcgw1", ERROR), ("dcgw3", ERROR)}
+    assert all("bgp-instance 2" in f["Detail"] for f in findings)
+
+
+def test_underlay_domains_fall_back_to_one_without_route_tables():
+    assert underlay_domains(["b", "a"], {}, {}) == [["a", "b"]]
+    assert underlay_domains([], {}, {}) == []
+
+
+def test_evpn_service_mismatch_still_errs_on_a_vni_within_one_route_target_group():
+    """The silent failure: the same route-target, so routes are imported, but a
+    different VNI, so the data plane never joins up."""
+    state = fabric(
+        ni={**_ni("leaf1"), **_ni("leaf2"), **_ni("leaf5", in_rt="65000:202", out_rt="65000:202")},
+        vxlan={**_vxlan("leaf1", vni=100), **_vxlan("leaf2", vni=999), **_vxlan("leaf5", vni=202)},
+    )
+    findings = run("evpn_service_mismatch", state)
+    errors = [f for f in findings if f["Severity"] == ERROR]
+    assert {f["Node"] for f in errors} == {"leaf1", "leaf2"}
+    assert all("VNI" in f["Detail"] and "leaf5" not in f["Detail"] for f in errors)
+
+
 def test_evpn_service_mismatch_ignores_a_service_only_one_node_has():
     """A service on one leaf is a service, not a disagreement."""
     state = fabric(ni=_ni("leaf1"), vxlan=_vxlan("leaf1"))
@@ -471,7 +603,7 @@ def test_evpn_service_mismatch_ignores_the_default_network_instance():
     state = fabric(
         ni={
             "leaf1": [NetworkInstance("default", "default", "up")],
-            "leaf2": [NetworkInstance("default", "default", "up", import_rts=("x",), export_rts=("y",))],
+            "leaf2": [NetworkInstance("default", "default", "up", instances=(BgpVpnInstance(1, ("x",), ("y",)),))],
         },
         vxlan={},
     )
