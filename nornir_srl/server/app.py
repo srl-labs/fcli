@@ -238,6 +238,11 @@ def create_app(
     async def status(_request: Request) -> Response:
         return JSONResponse(await anyio.to_thread.run_sync(store.status))
 
+    async def network_instances(request: Request) -> Response:
+        inv_filter = parse_kv(request.query_params.get("inv_filter"))
+        found = await anyio.to_thread.run_sync(store.network_instances, inv_filter)
+        return JSONResponse({"network_instances": found})
+
     async def overview(request: Request) -> Response:
         inv_filter = parse_kv(request.query_params.get("inv_filter"))
         return JSONResponse(await anyio.to_thread.run_sync(store.overview, inv_filter))
@@ -464,6 +469,7 @@ def create_app(
         Route("/api/reports", reports),
         Route("/api/inventory", inventory),
         Route("/api/status", status),
+        Route("/api/network-instances", network_instances),
         Route("/api/overview", overview),
         Route("/api/topology", topology),
         Route("/api/report/{name}", report_once),

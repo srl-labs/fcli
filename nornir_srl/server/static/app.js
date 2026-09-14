@@ -26,6 +26,14 @@
     inactive: "state-inactive",
   };
 
+  // Some rows are read by their verdict before their content - a finding by
+  // how bad it is, a BGP session by whether it is up. The whole row carries
+  // that as a tone taken from one column, and that column's cell names it.
+  const ROW_TONES = {
+    checks: { column: "Severity", tone: (severity) => severity }, // error / warning
+    bgp_peers: { column: "state", tone: (session) => (session ? (session === "up" ? "ok" : "down") : "") },
+  };
+
   const el = (id) => document.getElementById(id);
   const dom = {
     reportSearch: el("report-search"),
@@ -143,6 +151,7 @@
     colFilters: new Map(),
     colWidths: new Map(),
     reportParams: new Map(), // the selected report's own arguments, e.g. the RIB LPM address
+    networkInstances: [], // the fabric's instances, for an argument that is one of them
     tree: null, // a lens's answer as cards, alongside its rows
     records: null, // a lens's answer as the objects it found
     graph: null, // a lens's answer as a graph, where it has one (the path walk)
@@ -316,15 +325,21 @@
       name.className = "muted";
       name.textContent = spec.required ? `${spec.label} *` : spec.label;
 
-      const input = document.createElement("input");
+      const input = spec.kind === "ni" ? document.createElement("select") : document.createElement("input");
       input.className = "input";
-      input.type = "search";
-      input.placeholder = spec.placeholder || "";
-      input.autocomplete = "off";
-      input.spellcheck = false;
       input.required = Boolean(spec.required);
-      input.value = state.reportParams.get(spec.name) || "";
       if (spec.help) input.title = spec.help;
+      if (spec.kind === "ni") {
+        input.dataset.paramKind = "ni";
+        input.dataset.paramName = spec.name;
+        fillInstanceOptions(input, spec, state.networkInstances);
+      } else {
+        input.type = "search";
+        input.placeholder = spec.placeholder || "";
+        input.autocomplete = "off";
+        input.spellcheck = false;
+        input.value = state.reportParams.get(spec.name) || "";
+      }
 
       input.addEventListener("change", () => {
         const value = input.value.trim();
@@ -332,7 +347,8 @@
         input.classList.toggle("is-invalid", !valid);
         input.setAttribute("aria-invalid", valid ? "false" : "true");
         if (!valid) return;
-        if (value) state.reportParams.set(spec.name, value);
+        // Choosing what an unchosen instance already means is choosing nothing.
+        if (value && !(spec.kind === "ni" && value === spec.placeholder)) state.reportParams.set(spec.name, value);
         else state.reportParams.delete(spec.name);
         updateFilterUI();
         connect();
@@ -341,6 +357,51 @@
 
       field.append(name, input);
       dom.reportParams.append(field);
+    }
+    if (specs.some((spec) => spec.kind === "ni")) refreshInstanceOptions();
+  }
+
+  // A network-instance is chosen from the ones the fabric has rather than
+  // typed. The list arrives after the field is drawn, so what is in hand -
+  // the value chosen, or the placeholder, which is what none chosen means -
+  // is an option of its own until then, and stays one should the fabric not
+  // list it: a link can name an instance the filtered nodes do not carry.
+  function fillInstanceOptions(select, spec, instances) {
+    const chosen = state.reportParams.get(spec.name) || spec.placeholder || "";
+    select.replaceChildren();
+    if (chosen && !instances.some((inst) => inst.name === chosen)) {
+      select.append(new Option(chosen, chosen));
+    }
+    const groups = new Map();
+    for (const inst of instances) {
+      if (!groups.has(inst.type)) groups.set(inst.type, document.createElement("optgroup"));
+      const group = groups.get(inst.type);
+      group.label = inst.type || "other";
+      const option = new Option(inst.name, inst.name);
+      option.title = `${inst.type || "instance"} on ${inst.nodes} node${inst.nodes === 1 ? "" : "s"}`;
+      group.append(option);
+    }
+    select.append(...groups.values());
+    select.value = chosen;
+  }
+
+  async function refreshInstanceOptions() {
+    const params = new URLSearchParams();
+    const inv = dom.invFilter.value.trim();
+    if (inv) params.set("inv_filter", inv);
+    try {
+      const res = await fetch(`/api/network-instances?${params}`);
+      if (!res.ok) return;
+      state.networkInstances = (await res.json()).network_instances || [];
+    } catch {
+      return;
+    }
+    // Whatever instance fields are on screen by now - the report may have
+    // changed while the fabric was being asked, and then there are none.
+    const specs = (state.report && state.report.params) || [];
+    for (const select of dom.reportParams.querySelectorAll("select[data-param-kind='ni']")) {
+      const spec = specs.find((candidate) => candidate.name === select.dataset.paramName);
+      if (spec) fillInstanceOptions(select, spec, state.networkInstances);
     }
   }
 
@@ -4094,7 +4155,40 @@
     return controls;
   }
 
+  // A card view is rebuilt from scratch on every stream tick. Emptying the
+  // scroll container clamps its offset to zero, and the fresh card bodies
+  // start at the top, so without this each refresh would throw the reader
+  // back to the top of the list and of every card they had scrolled into.
+  // Only a refresh of the same page keeps its place: another report, or the
+  // same lens asked something else, starts at the top as before.
+  // The bodies scroll smoothly by stylesheet; the restore must not animate.
+  function treePageKey() {
+    return state.report ? `${state.report.name}?${queryParams()}` : "";
+  }
+
+  function treeScrollSnapshot() {
+    const cards = new Map();
+    const page = treePageKey();
+    if (dom.servicesTreeView.dataset.page !== page) return { page, top: 0, cards };
+    dom.servicesTreeView.querySelectorAll(".bd-card[data-card-key]").forEach((card) => {
+      const body = card.querySelector(".bd-body");
+      if (body && body.scrollTop) cards.set(card.dataset.cardKey, body.scrollTop);
+    });
+    return { page, top: dom.servicesTreeView.scrollTop, cards };
+  }
+
+  function restoreTreeScroll(snapshot) {
+    dom.servicesTreeView.dataset.page = snapshot.page;
+    snapshot.cards.forEach((top, key) => {
+      const card = dom.servicesTreeView.querySelector(`.bd-card[data-card-key="${CSS.escape(key)}"]`);
+      const body = card && card.querySelector(".bd-body");
+      if (body) body.scrollTo({ top, behavior: "instant" });
+    });
+    dom.servicesTreeView.scrollTo({ top: snapshot.top, behavior: "instant" });
+  }
+
   function renderBridgeDomainsTree(rows) {
+    const scroll = treeScrollSnapshot();
     dom.servicesTreeView.replaceChildren();
     if (!rows || !rows.length) {
       const p = document.createElement("p");
@@ -4129,6 +4223,7 @@
       renderRoutersCards(routerRows);
     }
 
+    restoreTreeScroll(scroll);
     executePendingJump();
   }
 
@@ -4338,6 +4433,7 @@
   // and under each node what that node reports - the same fold the
   // services pages give a fabric.
   function renderLensTree(cards) {
+    const scroll = treeScrollSnapshot();
     dom.servicesTreeView.replaceChildren();
     if (!cards.length) {
       const p = document.createElement("p");
@@ -4351,6 +4447,7 @@
     }
     dom.servicesTreeView.append(renderTreeControls());
     cards.forEach((card, index) => dom.servicesTreeView.append(lensCard(card, index)));
+    restoreTreeScroll(scroll);
   }
 
   /* ---------------------------------------------------------- path graph */
@@ -4367,6 +4464,13 @@
   function pathTrim(text, max) {
     const value = String(text || "");
     return value.length > max ? value.slice(0, max - 1) + "…" : value;
+  }
+
+  // A node name is told apart by its tail - containerlab prefixes every node
+  // of a lab the same way - so a title keeps its end rather than its start.
+  function pathTrimHead(text, max) {
+    const value = String(text || "");
+    return value.length > max ? "…" + value.slice(value.length - max + 1) : value;
   }
 
   // The walk as a picture: one column per hop, a box per lookup, an edge to
@@ -4500,7 +4604,7 @@
           height: PATH_BOX.h,
           class: `path-box ${node.state ? "path-box-" + node.state : ""}`.trim(),
         }),
-        pathSvg("text", { x: 10, y: node.subtitle ? 19 : 28, class: "path-box-title" }, pathTrim(node.title, 22)),
+        pathSvg("text", { x: 10, y: node.subtitle ? 19 : 28, class: "path-box-title" }, pathTrimHead(node.title, 22)),
       );
       if (node.subtitle) {
         group.append(pathSvg("text", { x: 10, y: 35, class: "path-box-sub" }, pathTrim(node.subtitle, 27)));
@@ -4565,6 +4669,8 @@
     const columns = visibleColumns();
     const shown = rows.slice(0, state.windowSize);
     const fragment = document.createDocumentFragment();
+    // Not when comparing two runs: there the colour is the comparison's verdict.
+    const toned = !state.diff && state.report ? ROW_TONES[state.report.name] : null;
 
     for (const row of shown) {
       const key = rowKey(row, identity);
@@ -4576,10 +4682,13 @@
       } else if (!state.firstPaint && previous === undefined) {
         tr.className = "added";
       }
+      const tone = toned ? toned.tone(String(row[toned.column] ?? "").toLowerCase()) : "";
+      if (tone) tr.classList.add("tone-" + tone);
       for (const column of columns) {
         const value = row[column] ?? "";
         const td = document.createElement("td");
         td.textContent = value;
+        if (tone && column === toned.column) td.classList.add("tone-cell");
         const changes = state.diff ? row["_changes"] : null;
         if (changes && changes[column]) td.classList.add("diff-cell");
         let stateClass = STATE_CLASSES[String(value).toLowerCase()];

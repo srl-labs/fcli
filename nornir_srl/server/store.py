@@ -729,6 +729,24 @@ class FabricStore:
             "oldest_update": _oldest_update(self._streams_for(names)),
         }
 
+    def network_instances(
+        self, inv_filter: Optional[Dict[str, str]] = None
+    ) -> List[Dict[str, Any]]:
+        """The network-instances the fabric has, for a surface to offer a choice of.
+
+        One entry per name across the filtered nodes, with its type and how
+        many nodes carry it. The default instance comes first, then the
+        routed ones, then the bridged: the order someone looking a route up
+        wants them in.
+        """
+        state = self.fabric_state(inv_filter, reports=("ni",))
+        found: Dict[str, Dict[str, Any]] = {}
+        for _node, instance in state.items("ni"):
+            entry = found.setdefault(instance.name, {"name": instance.name, "type": instance.type, "nodes": 0})
+            entry["nodes"] += 1
+        rank = {"default": 0, "ip-vrf": 1, "mac-vrf": 2}
+        return sorted(found.values(), key=lambda e: (rank.get(e["type"], 3), e["name"]))
+
     # ------------------------------------------------------------------ #
     # introspection
     # ------------------------------------------------------------------ #

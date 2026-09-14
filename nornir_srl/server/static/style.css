@@ -579,6 +579,37 @@ tr.diff-same td {
   color: var(--muted);
 }
 
+/* A row tinted by its verdict - a finding by how bad it is, a BGP session by
+   whether it is up - with the cell that names the verdict emphasised. */
+tr.tone-error td,
+tr.tone-down td {
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+}
+
+tr.tone-warning td {
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+
+tr.tone-ok td {
+  background: color-mix(in srgb, var(--ok) 8%, transparent);
+}
+
+tr.tone-error td.tone-cell,
+tr.tone-down td.tone-cell {
+  color: var(--err);
+  font-weight: 600;
+}
+
+tr.tone-warning td.tone-cell {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+tr.tone-ok td.tone-cell {
+  color: var(--ok);
+  font-weight: 600;
+}
+
 .errors {
   margin: 10px 18px 0;
   padding: 8px 10px;

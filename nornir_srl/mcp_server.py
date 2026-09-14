@@ -988,6 +988,8 @@ def trace_path(
             far-end gateway - continuing in the underlay towards endpoint),
             'endpoint-reached' (the underlay delivered the endpoint; the packet
             is decapsulated and looked up in resumes_in, the VRF there),
+            'leaked' (the route was leaked from resumes_in, whose next-hops
+            forward it; the walk goes on in that instance on the same node),
             'delivered' (the destination is attached here), 'local-ip' (it is
             this node's own address), 'neighbor' or 'no-neighbor' (whether
             ARP/ND has the delivered address), 'no-route', 'loop' or 'too-long'.

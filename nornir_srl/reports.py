@@ -97,7 +97,10 @@ class ParamSpec:
     label: str
     placeholder: str = ""
     help: str = ""
-    #: ``text``, or ``address`` for one that has to parse as an IP address.
+    #: ``text``; ``address`` for one that has to parse as an IP address; ``ni``
+    #: for the name of a network-instance, which a surface offers from the
+    #: ones the fabric has - its placeholder being the one taken when none is
+    #: chosen.
     kind: str = "text"
     #: True where nothing can be answered without it: a report renders in full
     #: without any of its parameters, but a lens is a question about something.

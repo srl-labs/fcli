@@ -978,7 +978,9 @@ class Layer2Mixin:
         # it does not, which left the VNI column empty on newer releases. The
         # destinations only exist in state, so both datastores are needed.
         path = "/tunnel-interface[name=*]/vxlan-interface"
-        if not self._has_feature("bridged"):
+        # 'vxlan' rather than 'bridged': a 7220 IXR-H does bridging but no
+        # VXLAN, and has no vxlan-interface under network-instance to ask for.
+        if not self._has_feature("vxlan"):
             return {"vxlan": []}
 
         # vxlan-interface -> the network-instance it is bound to, from the

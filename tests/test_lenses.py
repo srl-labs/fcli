@@ -473,6 +473,131 @@ def test_path_confirms_the_neighbour_of_a_delivered_address():
     assert (last.mac, last.egress, last.origin) == ("00:C1:AB:00:02:17", "irb0.2", "dynamic")
 
 
+def _leaked_shared_service() -> FabricState:
+    """Two leaves whose tenant VRF reaches a shared-service VRF by route leaking.
+
+    leaf2 has the service host on a routed port of ``ipvrf-ss`` and leaks
+    that subnet into ``ipvrf-1``; leaf1 learns it over EVPN. The other way,
+    ``ipvrf-ss`` on leaf2 has the tenant's host as a route leaked from
+    ``ipvrf-1``, resolving over ``ipvrf-1``'s VXLAN tunnel to leaf1. Both
+    leaves carry the tenant's anycast irb, so leaf2 has the tenant host's
+    ARP entry over EVPN although the host hangs off leaf1 alone.
+    """
+    state = FabricState()
+    state.hostnames = {"leaf1": "leaf1", "leaf2": "leaf2"}
+    vtep = lambda address: _via(address, Egress("tunnel", f"{address}/32", tunnel="vxlan"))  # noqa: E731
+    state.reports = {
+        "ipv4_rib": {
+            "leaf1": [
+                RouteTable("default", (
+                    _route("192.0.2.1/32", "host", _via("", Egress("interface", "system0.0"))),
+                    _route("192.0.2.2/32", "bgp", _via("", Egress("interface", "ethernet-1/49.0"))),
+                )),
+                RouteTable("ipvrf-1", (
+                    _route("10.1.1.0/24", "local", _via("10.1.1.1", Egress("interface", "irb0.101"))),
+                    _route("10.99.0.0/24", "bgp-evpn", vtep("192.0.2.2")),
+                )),
+            ],
+            "leaf2": [
+                RouteTable("default", (
+                    _route("192.0.2.1/32", "bgp", _via("", Egress("interface", "ethernet-1/49.0"))),
+                    _route("192.0.2.2/32", "host", _via("", Egress("interface", "system0.0"))),
+                )),
+                RouteTable("ipvrf-1", (
+                    _route("10.1.1.0/24", "local", _via("10.1.1.1", Egress("interface", "irb0.101"))),
+                    Route("10.99.0.0/24", "local", leaked_from="ipvrf-ss", next_hops=(
+                        _via("10.99.0.1", Egress("interface", "ethernet-1/3.99", ni="ipvrf-ss")),)),
+                )),
+                RouteTable("ipvrf-ss", (
+                    _route("10.99.0.0/24", "local", _via("10.99.0.1", Egress("interface", "ethernet-1/3.99"))),
+                    Route("10.1.1.11/32", "bgp-evpn-ifl-host", leaked_from="ipvrf-1", next_hops=(vtep("192.0.2.1"),)),
+                )),
+            ],
+        },
+        "ipv6_rib": {},
+        "ni": {},
+        "lldp": {
+            "leaf1": [LldpInterface("ethernet-1/49", (LldpNeighbor("leaf2", "ethernet-1/49"),))],
+            "leaf2": [LldpInterface("ethernet-1/49", (LldpNeighbor("leaf1", "ethernet-1/49"),))],
+        },
+        "arp": {
+            "leaf1": [NeighborCache("irb0.101", ("ipvrf-1", "macvrf-101"), (NeighborEntry("10.1.1.11", "AA:C1:AB:00:00:11", "dynamic"),))],
+            "leaf2": [
+                NeighborCache("irb0.101", ("ipvrf-1", "macvrf-101"), (NeighborEntry("10.1.1.11", "AA:C1:AB:00:00:11", "evpn"),)),
+                NeighborCache("ethernet-1/3.99", ("ipvrf-ss",), (NeighborEntry("10.99.0.18", "AA:C1:AB:00:00:99", "dynamic"),)),
+            ],
+        },
+        "nd": {},
+        "mac": {
+            "leaf1": [BridgeTable("macvrf-101", (MacEntry.read("AA:C1:AB:00:00:11", "lag1.101", "learnt"),))],
+            "leaf2": [BridgeTable("macvrf-101", (MacEntry.read("AA:C1:AB:00:00:11", "vxlan-interface:vxlan0.101 vtep:192.0.2.1 vni:101", "evpn"),))],
+        },
+    }
+    return state
+
+
+def test_path_crosses_into_the_instance_a_leaked_route_came_from():
+    """A leaked route is forwarded by the origin instance's port, so the
+    neighbour is confirmed there, not in the instance the walk was in."""
+    hops = lens_path(_leaked_shared_service(), source="leaf1", destination="10.99.0.18", ni="ipvrf-1")
+    assert [(h.hop, h.node, h.ni, h.outcome) for h in hops] == [
+        (1, "leaf1", "ipvrf-1", "tunnel"),
+        (2, "leaf1", "default", "forwarded"),
+        (3, "leaf2", "default", "endpoint-reached"),
+        (4, "leaf2", "ipvrf-1", "leaked"),
+        (5, "leaf2", "ipvrf-ss", "delivered"),
+        (6, "leaf2", "ipvrf-ss", "neighbor"),
+    ]
+    leaked, delivered, last = hops[3:]
+    # The leaked hop is the route as ipvrf-1 has it; the port is the origin's.
+    assert (leaked.prefix, leaked.route_type, leaked.resumes_in) == ("10.99.0.0/24", "local", "ipvrf-ss")
+    assert not leaked.egress
+    assert delivered.egress == "ethernet-1/3.99"
+    assert (last.mac, last.egress) == ("AA:C1:AB:00:00:99", "ethernet-1/3.99")
+
+
+def test_path_takes_a_leaked_tunnel_with_the_origin_instance_vni():
+    """A leaked route over VXLAN carries the origin instance's VNI, so the
+    far end resumes in that instance - not in the one the walk started in."""
+    hops = lens_path(_leaked_shared_service(), source="leaf2", destination="10.1.1.11", ni="ipvrf-ss")
+    assert [(h.hop, h.node, h.ni, h.outcome) for h in hops] == [
+        (1, "leaf2", "ipvrf-ss", "leaked"),
+        (2, "leaf2", "ipvrf-1", "tunnel"),
+        (3, "leaf2", "default", "forwarded"),
+        (4, "leaf1", "default", "endpoint-reached"),
+        (5, "leaf1", "ipvrf-1", "delivered"),
+        (6, "leaf1", "ipvrf-1", "neighbor"),
+    ]
+    assert hops[1].endpoint == "192.0.2.1"
+    assert hops[3].resumes_in == "ipvrf-1"
+
+
+def test_path_starts_only_where_an_evpn_learned_address_is_really_attached():
+    """An anycast gateway has the host's ARP entry on every leaf carrying the
+    irb; the walk starts on the leaf that has its MAC on a port of its own."""
+    state = _leaked_shared_service()
+    hops = lens_path(state, source="10.1.1.11", destination="10.99.0.18", ni="ipvrf-1")
+    assert {h.node for h in _at_hop(hops, 1)} == {"leaf1"}
+    # A binding the node resolved itself needs no bridge table to count.
+    state.reports["mac"] = {}
+    hops = lens_path(state, source="10.1.1.11", destination="10.99.0.18", ni="ipvrf-1")
+    assert {h.node for h in _at_hop(hops, 1)} == {"leaf1"}
+
+
+def test_path_graph_draws_a_leak_as_an_edge_into_the_origin_instance():
+    graph = graph_path(lens_path(_leaked_shared_service(), source="leaf1", destination="10.99.0.18", ni="ipvrf-1"))
+    assert [(n["title"], n["subtitle"]) for n in graph["nodes"]] == [
+        ("leaf1", "ipvrf-1"), ("leaf1", "default · 192.0.2.2"), ("leaf2", "default · 192.0.2.2"),
+        ("leaf2", "ipvrf-1"), ("leaf2", "ipvrf-ss"), ("10.99.0.18", "AA:C1:AB:00:00:99 on ethernet-1/3.99"),
+    ]
+    assert [e["label"] for e in graph["edges"]] == [
+        "vxlan:192.0.2.2", "ethernet-1/49.0", "into ipvrf-1", "leaked from ipvrf-ss", "ethernet-1/3.99",
+    ]
+    # Every edge goes one column to the right: nothing points back at a start.
+    columns = {n["id"]: n["hop"] for n in graph["nodes"]}
+    assert all(columns[e["to"]] == columns[e["from"]] + 1 for e in graph["edges"])
+
+
 def test_path_reports_a_loop_with_the_steps_it_took():
     """Two nodes each routing the destination to the other."""
     state = FabricState()
@@ -660,8 +785,8 @@ def test_every_hop_outcome_has_a_detail():
     from nornir_srl.lenses import _HOP_DETAIL  # noqa: PLC0415 - the map is the test
 
     documented = {
-        "forwarded", "dead-end", "tunnel", "endpoint-reached", "delivered", "local-ip",
-        "neighbor", "no-neighbor", "no-route", "loop", "too-long",
+        "forwarded", "dead-end", "tunnel", "endpoint-reached", "leaked", "delivered",
+        "local-ip", "neighbor", "no-neighbor", "no-route", "loop", "too-long",
     }
     assert set(_HOP_DETAIL) == documented
 

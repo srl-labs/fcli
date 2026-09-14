@@ -73,9 +73,9 @@ ES_ESI = "00:00:00:00:01:01:01:01:01:01"
 def _responses(name="leaf1"):
     return {
         LLDP_PATH: LLDP_RESPONSE,
-        # Reports gate the bridged and EVPN paths on this, as a node that does
-        # neither does not implement them.
-        "/system/features": [{"system/features": ["bridged", "evpn"]}],
+        # Reports gate the bridged, EVPN and VXLAN paths on this, as a node
+        # that does none of them does not implement them.
+        "/system/features": [{"system/features": ["bridged", "evpn", "vxlan"]}],
         "/tunnel-interface[name=*]/vxlan-interface": [{"tunnel-interface": []}],
         HOSTNAME_PATH: hostname_response(name),
         ES_PATH: es_response("mh-1", ES_ESI, "lag1"),
@@ -1109,6 +1109,43 @@ def test_inventory_endpoint(client):
     assert {h["labels"]["role"] for h in hosts} == {"leaf", "spine"}
     # the gNMI session is open, but nothing streams until a report is opened
     assert all(h["connected"] and not h["streaming"] and not h["getting"] for h in hosts)
+
+
+def _instances_response(*instances):
+    """What a node answers for its network-instances: name and type of each."""
+    return [{"network-instance": [{"name": name, "type": kind, "oper-state": "up"} for name, kind in instances]}]
+
+
+def test_network_instances_endpoint_lists_the_fabric_s_instances(client):
+    """One entry per name across the nodes, typed and counted, the default
+    instance first and the routed ones before the bridged - what a field
+    choosing an instance to look a route up in offers."""
+    test_client, devices = client
+    devices["leaf1"].responses["/network-instance[name=*]"] = _instances_response(
+        ("macvrf-101", "mac-vrf"), ("ipvrf-1", "ip-vrf"), ("default", "default"), ("mgmt", "ip-vrf")
+    )
+    devices["spine1"].responses["/network-instance[name=*]"] = _instances_response(
+        ("default", "default"), ("mgmt", "ip-vrf")
+    )
+    found = test_client.get("/api/network-instances").json()["network_instances"]
+    assert found == [
+        {"name": "default", "type": "default", "nodes": 2},
+        {"name": "ipvrf-1", "type": "ip-vrf", "nodes": 1},
+        {"name": "mgmt", "type": "ip-vrf", "nodes": 2},
+        {"name": "macvrf-101", "type": "mac-vrf", "nodes": 1},
+    ]
+    # The inventory filter narrows whose instances are counted.
+    narrowed = test_client.get("/api/network-instances", params={"inv_filter": "role=spine"}).json()
+    assert [(e["name"], e["nodes"]) for e in narrowed["network_instances"]] == [("default", 1), ("mgmt", 1)]
+
+
+def test_the_path_lens_chooses_its_instance_from_the_fabric(client):
+    """The browser draws the path lens's instance as a choice, not a text field."""
+    test_client, _devices = client
+    payload = test_client.get("/api/reports").json()
+    path = next(r for r in payload["reports"] if r["name"] == "path")
+    ni = next(p for p in path["params"] if p["name"] == "ni")
+    assert (ni["kind"], ni["placeholder"]) == ("ni", "default")
 
 
 def test_inventory_counts_the_gets_a_node_was_asked_for(store):

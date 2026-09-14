@@ -148,6 +148,8 @@ class Hop:
     #: far-end PE - and goes on in the underlay towards :attr:`endpoint`.
     #: ``endpoint-reached``: the underlay delivered the tunnel endpoint; the
     #: packet is decapsulated and looked up again in :attr:`resumes_in`.
+    #: ``leaked``: the route matched was leaked from :attr:`resumes_in`, whose
+    #: next-hops forward it; the walk goes on there.
     #: ``delivered``: the destination is attached here. ``local-ip``: it is
     #: this node's own address. ``neighbor``/``no-neighbor``: whether ARP or
     #: ND has the delivered address. ``no-route``, ``loop``, ``too-long``:
@@ -169,6 +171,7 @@ class Hop:
     #: ``endpoint-reached``: the network-instance the walk picks up again in.
     #: Chosen by name where the far end has one, else by the route-target the
     #: origin's instance exports, since a gateway need not call it the same.
+    #: ``leaked``: the instance the route was leaked from, on this node.
     resumes_in: str = ""
     #: ``neighbor``: the MAC the binding resolved to, and how it was learned.
     mac: str = ""
@@ -753,11 +756,23 @@ def _starting_nodes(state: FabricState, source: str, ni: str) -> List[str]:
     if address is None:
         raise ValueError(f"'{source}' is neither a node in the inventory nor an address")
 
-    # An address starts the walk wherever it is directly attached: an ARP or ND
-    # binding for it, or a connected route covering it.
+    # An address starts the walk wherever it is attached: on the node that
+    # resolved it itself, through ARP or ND on a routed port or as the irb
+    # gateway that answered. An anycast gateway spreads that binding over
+    # EVPN to every leaf carrying the irb, so a binding learned that way only
+    # counts where the host's MAC is on a port of the node's own - the sides
+    # of its segment - rather than on every leaf in the fabric. Failing any
+    # binding, a connected route covering it.
+    own_macs = {
+        (node, _mac(entry.address))
+        for node, _table, entry in state.sub_items("mac", "entries")
+        if entry.local
+    }
     starts = []
     for node, _cache, entry, _report in _arp_bindings(state):
-        if _address(entry.address) == address and node not in starts:
+        if _address(entry.address) != address or node in starts:
+            continue
+        if text(entry.origin) != "evpn" or (node, _mac(entry.mac)) in own_macs:
             starts.append(node)
     if starts:
         return starts
@@ -833,6 +848,11 @@ def lens_path(
     in the VRF there, so a DCI path traces end to end: VXLAN to the DC
     gateway, MPLS across to the far gateway, VXLAN again to the leaf.
 
+    A lookup that matches a route leaked from another instance crosses into
+    that instance the same way, since the route is forwarded by that
+    instance's next-hops: out of one of its ports, or into a tunnel that
+    lands in its counterpart at the far end rather than in this one's.
+
     The final hop of a delivered destination includes the ARP or ND entry for
     it, confirming the host is reachable, or noting when no binding exists.
     """
@@ -868,7 +888,8 @@ def lens_path(
             continue
         # Another branch converging on a lookup already made is not a loop
         # but not news either.
-        lookup = (node, instance, str(address), (resume[1], str(resume[2])) if resume else None)
+        resumed = (resume[1], str(resume[2])) if resume else None
+        lookup = (node, instance, str(address), resumed)
         if lookup in made:
             continue
         made.add(lookup)
@@ -887,6 +908,18 @@ def lens_path(
             route_type=kind,
             next_hops=tuple(nh.address or nh.resolving_route for nh in route.next_hops),
         )
+
+        # A leaked route is another instance's route with that instance's
+        # next-hops: its port, or its tunnel with its VNI. The walk crosses
+        # into it before following them, so that what comes next is read
+        # where it actually is - the neighbour on a port of that instance,
+        # the VRF its tunnel lands in at the far end.
+        if route.leaked_from and route.leaked_from != instance:
+            hops.append(Hop(**here, **matched, outcome="leaked", resumes_in=route.leaked_from))
+            seen, hop, instance = seen + (step,), hop + 1, route.leaked_from
+            step = f"{node}/{instance}" if address == target else f"{node}/{instance}@{address}"
+            here = dict(hop=hop, node=node, ni=instance, address=str(address))
+            made.add((node, instance, str(address), resumed))
 
         # A route that resolved onto a tunnel names it rather than an
         # interface: VXLAN to a VTEP from a leaf, LDP or SR-MPLS to a far-end
@@ -994,6 +1027,7 @@ _HOP_DETAIL: Dict[str, Callable[[Hop], str]] = {
     ),
     "tunnel": lambda h: f"over {h.tunnel} to {h.endpoint}, continuing in default",
     "endpoint-reached": lambda h: f"tunnel endpoint reached, continuing in {h.resumes_in}",
+    "leaked": lambda h: f"leaked from {h.resumes_in}, continuing there",
     "delivered": lambda h: f"delivered here, {h.route_type} on {h.egress or 'this node'}",
     "local-ip": lambda h: f"locally configured on {h.egress or 'this node'}",
     "neighbor": lambda h: f"{h.mac} on {h.egress}, {h.origin}",
@@ -1068,8 +1102,9 @@ def graph_path(hops: List[Hop]) -> Dict[str, Any]:
     leads to the same two spines, both spines to the same gateway. What a
     lookup did says where the packet goes next - out of a port to the LLDP
     peer, into a tunnel and so into the underlay on the same node, out of a
-    tunnel and so into the VRF, off an attached interface and so to the host -
-    and that is the edge. A lookup that stopped the walk has no edge out.
+    tunnel and so into the VRF, along a leaked route and so into the instance
+    it came from, off an attached interface and so to the host - and that is
+    the edge. A lookup that stopped the walk has no edge out.
     """
     if not hops:
         return {"nodes": [], "edges": [], "destination": ""}
@@ -1128,6 +1163,8 @@ def graph_path(hops: List[Hop]) -> Dict[str, Any]:
             to, label = successor(h, h.node, "default", h.endpoint), h.egress
         elif h.outcome == "endpoint-reached":
             to, label = successor(h, h.node, h.resumes_in, destination), f"into {h.resumes_in}"
+        elif h.outcome == "leaked":
+            to, label = successor(h, h.node, h.resumes_in, h.address), f"leaked from {h.resumes_in}"
         elif h.outcome == "delivered":
             to, label = successor(h, h.node, h.ni, destination), h.egress
         elif h.outcome == "dead-end":
@@ -1424,8 +1461,9 @@ LENSES: Tuple[LensSpec, ...] = (
             "destination, following every ECMP branch and every tunnel: VXLAN to "
             "the VTEP, MPLS to the far-end gateway, and back into the VRF there."
         ),
-        # ``ni`` says which VRF a tunnel lands in at its far end.
-        requires=("ni", "ipv4_rib", "ipv6_rib", "lldp", "arp", "nd"),
+        # ``ni`` says which VRF a tunnel lands in at its far end; ``mac`` which
+        # leaves a source address is attached to, rather than merely known on.
+        requires=("ni", "ipv4_rib", "ipv6_rib", "lldp", "arp", "nd", "mac"),
         columns=PATH_COLUMNS,
         run=lens_path,
         tree=tree_path,
@@ -1451,6 +1489,7 @@ LENSES: Tuple[LensSpec, ...] = (
                 label="Network instance",
                 placeholder="default",
                 help="The instance to look the destination up in",
+                kind="ni",
             ),
         ),
         mcp_name="trace_path",
