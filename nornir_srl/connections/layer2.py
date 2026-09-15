@@ -2,11 +2,30 @@ from __future__ import annotations
 
 import ipaddress
 from typing import Any, Dict, List, Optional, Tuple
-import jmespath
 
 from .down_reason import STANDBY_STATE, ParentReasons, parent_interface
 from .down_reason import clean_leaf as _clean_state
-from .helpers import as_list, bgp_evpn_evis, first_payload
+from ..records import (
+    Association,
+    BridgeTable,
+    Candidate,
+    EsDestination,
+    EsDestinations,
+    EthernetSegment,
+    HostRouteRule,
+    IrbAddress,
+    IrbArp,
+    IrbInterface,
+    IrbNd,
+    LldpInterface,
+    LldpNeighbor,
+    MacEntry,
+    NextHop,
+    VxlanDestination,
+    VxlanInterface,
+    as_int,
+)
+from .helpers import as_list, bgp_evpn_evis, first_payload, instances_by_interface
 from .routing import _gnmi_path_missing, _suppress_pygnmi_client_logging
 
 
@@ -151,24 +170,27 @@ _ES_PATH = "/system/network-instance/protocols/evpn/ethernet-segments"
 _ES_ENVELOPE = _ES_PATH.lstrip("/")
 
 
-def _df_peers(vrf: Dict[str, Any]) -> str:
-    """The designated-forwarder candidates of one network-instance on a segment.
-
-    The elected one is marked, because on a single-active segment it is the
-    answer to why the other leaf is holding its port in standby.
-    """
+def _df_candidates(vrf: Dict[str, Any]) -> Tuple[Candidate, ...]:
+    """The designated-forwarder candidates of one network-instance on a segment."""
     # Only the first bgp-instance elects a DF for the segment.
     instances = as_list(vrf.get("bgp-instance"))
     candidates = (instances[0] if instances else {}).get(
         "computed-designated-forwarder-candidates", {}
     )
-    return " ".join(
-        (
-            f"{peer.get('address')}(DF)"
-            if peer.get("designated-forwarder")
-            else str(peer.get("address"))
-        )
+    return tuple(
+        Candidate(str(peer.get("address")), bool(peer.get("designated-forwarder")))
         for peer in as_list(candidates.get("designated-forwarder-candidate"))
+    )
+
+
+def _df_peers(vrf: Dict[str, Any]) -> str:
+    """The DF candidates of one network-instance on a segment, as one string.
+
+    The elected one is marked, because on a single-active segment it is the
+    answer to why the other leaf is holding its port in standby.
+    """
+    return " ".join(
+        f"{c.address}(DF)" if c.designated else c.address for c in _df_candidates(vrf)
     )
 
 
@@ -222,21 +244,6 @@ def _es_next_hops(es: Dict[str, Any]) -> List[Tuple[str, List[str]]]:
         if address:
             pairs.append((address, _evi_values(nh)))
     return pairs
-
-
-def _es_evi_display(pairs: List[Tuple[str, List[str]]]) -> str:
-    """The EVIs of a virtual ES, paired with a next-hop only where that matters.
-
-    One next-hop, or several that are tied to the same EVIs, is just the EVI
-    list. A segment that tracks a different next-hop per EVI has to say which
-    of them is which, or the column cannot be matched to a router at all.
-    """
-    with_evis = [(nh, evis) for nh, evis in pairs if evis]
-    if not with_evis:
-        return ""
-    if len({tuple(evis) for _nh, evis in with_evis}) == 1:
-        return " ".join(with_evis[0][1])
-    return " ".join(f"{nh}:{','.join(evis)}" for nh, evis in with_evis)
 
 
 def _compress_esi(esi: Any) -> str:
@@ -707,6 +714,49 @@ def _vpn_tile_groups(ni: Dict[str, Any], isolated_label: str) -> List[Dict[str, 
     return groups
 
 
+def _irb_addresses(family: Dict[str, Any]) -> Tuple[IrbAddress, ...]:
+    """The addresses under an irb's ``ipv4`` or ``ipv6`` container."""
+    return tuple(
+        IrbAddress(
+            prefix=str(addr.get("ip-prefix") or ""),
+            # ``primary`` is a presence container: it comes back as ``[None]``.
+            primary=addr.get("primary") is not None,
+            anycast_gw=bool(addr.get("anycast-gw")),
+        )
+        for addr in as_list(family.get("address"))
+        if isinstance(addr, dict)
+    )
+
+
+def _host_route_rules(neighbor_cfg: Dict[str, Any]) -> Tuple[HostRouteRule, ...]:
+    """The ``host-route/populate`` entries of an irb's ARP or ND settings."""
+    return tuple(
+        HostRouteRule(
+            route_type=str(rule.get("route-type") or ""),
+            datapath_programming=bool(rule.get("datapath-programming")),
+        )
+        for rule in as_list((neighbor_cfg.get("host-route") or {}).get("populate"))
+        if isinstance(rule, dict)
+    )
+
+
+def _evpn_advertise_entries(neighbor_cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [
+        entry
+        for entry in as_list((neighbor_cfg.get("evpn") or {}).get("advertise"))
+        if isinstance(entry, dict)
+    ]
+
+
+def _evpn_advertised(neighbor_cfg: Dict[str, Any]) -> Tuple[str, ...]:
+    """The entry origins an irb advertises into EVPN."""
+    return tuple(str(entry.get("route-type") or "") for entry in _evpn_advertise_entries(neighbor_cfg))
+
+
+def _interface_less_routing(neighbor_cfg: Dict[str, Any]) -> bool:
+    return any("interface-less-routing" in entry for entry in _evpn_advertise_entries(neighbor_cfg))
+
+
 class Layer2Mixin:
     """Mixin providing Layer2 related getters."""
 
@@ -792,158 +842,150 @@ class Layer2Mixin:
         return ", ".join(hosts)
 
     def get_lldp_sum(self, interface: Optional[str] = "*") -> Dict[str, Any]:
-        path_spec = {
-            "path": f"/system/lldp/interface[name={interface}]/neighbor",
-            "jmespath": '"system/lldp".interface[].{interface:name, Neighbors:neighbor[].{"Nbr-port":"port-id","Nbr-System":"system-name", "Nbr-port-desc":"port-description"}}',
-            "datatype": "state",
-        }
-        resp = self.get(
-            paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
-        )
-        res = jmespath.search(path_spec["jmespath"], first_payload(resp))
-        return {"lldp_nbrs": res}
+        path = f"/system/lldp/interface[name={interface}]/neighbor"
+        resp = self.get(paths=[path], datatype="state")
+        lldp = first_payload(resp).get("system/lldp") or {}
+        interfaces = [
+            LldpInterface(
+                name=str(itf.get("name") or ""),
+                neighbors=tuple(
+                    LldpNeighbor(
+                        system_name=str(nbr.get("system-name") or ""),
+                        port_id=str(nbr.get("port-id") or ""),
+                        port_description=str(nbr.get("port-description") or ""),
+                    )
+                    for nbr in as_list(itf.get("neighbor"))
+                    if isinstance(nbr, dict)
+                ),
+            )
+            for itf in as_list(lldp.get("interface"))
+            if isinstance(itf, dict)
+        ]
+        return {"lldp_nbrs": interfaces}
 
     def get_mac_table(self, network_instance: Optional[str] = "*") -> Dict[str, Any]:
-        path_spec = {
-            "path": f"/network-instance[name={network_instance}]/bridge-table/mac-table/mac",
-            "jmespath": '"network-instance"[].{"NI":name, Fib:"bridge-table"."mac-table".mac[].{Address:address, Dest:destination, Type:type}}',
-            "datatype": "state",
-        }
+        path = f"/network-instance[name={network_instance}]/bridge-table/mac-table/mac"
         if not self._has_feature("bridged"):
             return {"mac_table": []}
         with _suppress_pygnmi_client_logging():
             try:
-                resp = self.get(
-                    paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
-                )
+                resp = self.get(paths=[path], datatype="state")
             except BaseException as e:
                 if _gnmi_path_missing(e):
                     return {"mac_table": []}
                 raise
-        res = jmespath.search(path_spec["jmespath"], first_payload(resp))
-        return {"mac_table": res}
+        tables = [
+            BridgeTable(
+                ni=str(ni.get("name", "")),
+                entries=tuple(
+                    MacEntry.read(mac.get("address"), mac.get("destination"), mac.get("type"))
+                    for mac in as_list(
+                        ni.get("bridge-table", {}).get("mac-table", {}).get("mac")
+                    )
+                    if isinstance(mac, dict)
+                ),
+            )
+            for ni in as_list(first_payload(resp).get("network-instance"))
+            if isinstance(ni, dict)
+        ]
+        return {"mac_table": tables}
 
     def get_es(self) -> Dict[str, Any]:
-        path_spec = {
-            "path": _ES_PATH,
-            "jmespath": '"system/network-instance/protocols/evpn/ethernet-segments"."bgp-instance"[]."ethernet-segment"[].{name:name, esi:esi, type:type, "mh-mode":"multi-homing-mode", oper:"oper-state", "itf/nh":"_itf_or_nh", evi:"_evi", "ni-peers":association."network-instance"[]."_ni_peers"|join(\', \',@) }',
-            "datatype": "all",
-        }
-
-        def set_es_fields(resp: List[Dict[str, Any]]) -> None:
-            segments = first_payload(resp).get(_ES_ENVELOPE, {})
-            for bgp_inst in as_list(segments.get("bgp-instance")):
-                for es in as_list(bgp_inst.get("ethernet-segment")):
-                    # compute interface or next-hop display field
-                    next_hops = _es_next_hops(es)
-                    if "interface" in es:
-                        es["_itf_or_nh"] = " ".join(
-                            i["ethernet-interface"] for i in es["interface"]
-                        )
-                    elif next_hops:
-                        es["_itf_or_nh"] = " ".join(nh for nh, _evis in next_hops)
-                    else:
-                        es["_itf_or_nh"] = ""
-                    # The EVI is what ties a virtual segment to an ip-vrf, and
-                    # the Routers report matches the two on it.
-                    es["_evi"] = _es_evi_display(next_hops)
-                    if "association" not in es:
-                        es["association"] = {}
-                    if "network-instance" not in es["association"]:
-                        es["association"]["network-instance"] = []
-                    for vrf in es["association"]["network-instance"]:
-                        vrf["_peers"] = _df_peers(vrf)
-                        vrf["_ni_peers"] = f"{vrf['name']}:[{vrf['_peers']}]"
-
         if not self._has_feature("evpn"):
             return {"es": []}
         with _suppress_pygnmi_client_logging():
             try:
-                resp = self.get(
-                    paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
-                )
+                resp = self.get(paths=[_ES_PATH], datatype="all")
             except BaseException as e:
                 if _gnmi_path_missing(e):
                     return {"es": []}
                 raise
-        set_es_fields(resp)
-        res = jmespath.search(path_spec["jmespath"], first_payload(resp))
-        return {"es": res}
+        segments = first_payload(resp).get(_ES_ENVELOPE, {})
+        records = []
+        for bgp_inst in as_list(segments.get("bgp-instance")):
+            for es in as_list(bgp_inst.get("ethernet-segment")):
+                if not isinstance(es, dict):
+                    continue
+                records.append(
+                    EthernetSegment(
+                        name=str(es.get("name", "")),
+                        esi=str(es.get("esi", "")),
+                        type=str(es.get("type", "")),
+                        mh_mode=str(es.get("multi-homing-mode", "")),
+                        oper=str(es.get("oper-state", "")),
+                        interfaces=tuple(
+                            str(i.get("ethernet-interface", ""))
+                            for i in as_list(es.get("interface"))
+                            if isinstance(i, dict)
+                        ),
+                        # A virtual segment has no port: it tracks a next-hop,
+                        # and the EVI under that next-hop is the ip-vrf it serves.
+                        next_hops=tuple(
+                            NextHop(address, tuple(evis)) for address, evis in _es_next_hops(es)
+                        ),
+                        associations=tuple(
+                            Association(str(vrf.get("name", "")), _df_candidates(vrf))
+                            for vrf in as_list(
+                                (es.get("association") or {}).get("network-instance")
+                            )
+                            if isinstance(vrf, dict)
+                        ),
+                    )
+                )
+        return {"es": records}
 
     def get_es_dest(self) -> Dict[str, Any]:
-        path_spec = {
-            "path": "/tunnel-interface[name=*]/vxlan-interface/bridge-table/unicast-destinations/es-destination",
-            "jmespath": '"tunnel-interface"[].{tunnel:name, "es-dest":"vxlan-interface"[]."bridge-table"."unicast-destinations"."es-destination"[].{esi:esi, vteps:"_vteps"}}',
-            "datatype": "state",
-        }
-
-        def set_vtep_fields(resp: List[Dict[str, Any]]) -> None:
-            for tun in as_list(first_payload(resp).get("tunnel-interface")):
-                for vxlan in tun.get("vxlan-interface", []):
-                    bt = vxlan.get("bridge-table", {})
-                    ucast = bt.get("unicast-destinations", {})
-                    for es_dest in ucast.get("es-destination", []):
-                        vteps = es_dest.get("vtep", [])
-                        es_dest["_vteps"] = " ".join(
-                            v.get("address", "") for v in vteps
-                        )
-
+        path = "/tunnel-interface[name=*]/vxlan-interface/bridge-table/unicast-destinations/es-destination"
         if not self._has_feature("bridged"):
             return {"es_dest": []}
         with _suppress_pygnmi_client_logging():
             try:
-                resp = self.get(
-                    paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
-                )
+                resp = self.get(paths=[path], datatype="state")
             except BaseException as e:
                 if _gnmi_path_missing(e):
                     return {"es_dest": []}
                 raise
-        set_vtep_fields(resp)
-        res = jmespath.search(path_spec["jmespath"], first_payload(resp))
-        return {"es_dest": res}
+        records = []
+        for tun in as_list(first_payload(resp).get("tunnel-interface")):
+            if not isinstance(tun, dict):
+                continue
+            tunnel = str(tun.get("name") or "")
+            destinations = []
+            for vxlan in as_list(tun.get("vxlan-interface")):
+                if not isinstance(vxlan, dict):
+                    continue
+                unicast = (vxlan.get("bridge-table") or {}).get("unicast-destinations") or {}
+                for es_dest in as_list(unicast.get("es-destination")):
+                    if not isinstance(es_dest, dict):
+                        continue
+                    destinations.append(
+                        EsDestination(
+                            esi=str(es_dest.get("esi") or ""),
+                            overlay=f"{tunnel}.{vxlan.get('index', '')}",
+                            vteps=tuple(
+                                str(vtep.get("address") or "")
+                                for vtep in as_list(es_dest.get("vtep"))
+                                if isinstance(vtep, dict)
+                            ),
+                        )
+                    )
+            records.append(EsDestinations(tunnel=tunnel, destinations=tuple(destinations)))
+        return {"es_dest": records}
 
     def get_vxlan(self) -> Dict[str, Any]:
-        path_spec = {
-            "path": "/tunnel-interface[name=*]/vxlan-interface",
-            "jmespath": '"tunnel-interface"[]."_vxlan_itfs"[].{"vxlan-itf":name, NI:ni, "ing-vni":"ing-vni", destinations:destinations}',
-            # ``all`` rather than ``state``: up to 25.3 the state datastore also
-            # carried the configured ``ingress/vni`` and ``type``, and from 25.10
-            # it does not, which left the VNI column empty on newer releases.
-            # The destinations only exist in state, so both datastores are needed.
-            "datatype": "all",
-        }
-
-        def set_vxlan_fields(
-            resp: List[Dict[str, Any]],
-            ni_map: Dict[str, str],
-        ) -> None:
-            for tun in as_list(first_payload(resp).get("tunnel-interface")):
-                tun["_vxlan_itfs"] = []
-                for vxlan in tun.get("vxlan-interface", []):
-                    vxlan_name = f"{tun['name']}.{vxlan['index']}"
-                    dests = (
-                        vxlan.get("bridge-table", {})
-                        .get("unicast-destinations", {})
-                        .get("destination", [])
-                    )
-                    vteps = ", ".join(
-                        f"({d.get('vtep', '')}, {d.get('vni', '')})" for d in dests
-                    )
-                    tun["_vxlan_itfs"].append(
-                        {
-                            "name": vxlan_name,
-                            "ni": ni_map.get(vxlan_name, ""),
-                            "ing-vni": vxlan.get("ingress", {}).get("vni", "-"),
-                            "destinations": vteps if vteps else "-",
-                        }
-                    )
-
-        if not self._has_feature("bridged"):
+        # ``all`` rather than ``state``: up to 25.3 the state datastore also
+        # carried the configured ``ingress/vni`` and ``type``, and from 25.10
+        # it does not, which left the VNI column empty on newer releases. The
+        # destinations only exist in state, so both datastores are needed.
+        path = "/tunnel-interface[name=*]/vxlan-interface"
+        # 'vxlan' rather than 'bridged': a 7220 IXR-H does bridging but no
+        # VXLAN, and has no vxlan-interface under network-instance to ask for.
+        if not self._has_feature("vxlan"):
             return {"vxlan": []}
 
-        # build vxlan-interface to network-instance map
-        ni_resp = self.get(paths=["/network-instance[name=*]"], datatype="config")
+        # vxlan-interface -> the network-instance it is bound to, from the
+        # vxlan-interface lists alone (see get_irb for why not the subtree).
+        ni_resp = self.get(paths=["/network-instance[name=*]/vxlan-interface"], datatype="config")
         ni_map: Dict[str, str] = {}
         for ni in as_list(first_payload(ni_resp).get("network-instance")):
             for vxlan_itf in as_list(ni.get("vxlan-interface")):
@@ -951,128 +993,82 @@ class Layer2Mixin:
 
         with _suppress_pygnmi_client_logging():
             try:
-                resp = self.get(
-                    paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
-                )
+                resp = self.get(paths=[path], datatype="all")
             except BaseException as e:
                 if _gnmi_path_missing(e):
                     return {"vxlan": []}
                 raise
-        set_vxlan_fields(resp, ni_map)
-        res = jmespath.search(path_spec["jmespath"], first_payload(resp))
-        return {"vxlan": res}
+        records = []
+        for tun in as_list(first_payload(resp).get("tunnel-interface")):
+            for vxlan in as_list(tun.get("vxlan-interface")):
+                if not isinstance(vxlan, dict):
+                    continue
+                name = f"{tun['name']}.{vxlan['index']}"
+                destinations = (
+                    vxlan.get("bridge-table", {})
+                    .get("unicast-destinations", {})
+                    .get("destination", [])
+                )
+                records.append(
+                    VxlanInterface(
+                        name=name,
+                        ni=ni_map.get(name, ""),
+                        vni=as_int(vxlan.get("ingress", {}).get("vni")),
+                        destinations=tuple(
+                            VxlanDestination(str(d.get("vtep", "")), as_int(d.get("vni")))
+                            for d in as_list(destinations)
+                            if isinstance(d, dict)
+                        ),
+                    )
+                )
+        return {"vxlan": records}
 
     def get_irb(self) -> Dict[str, Any]:
-        path_spec = {
-            "path": "/interface[name=irb*]/subinterface",
-            "jmespath": (
-                '"interface"[].subinterface[].{name:"_subitf",'
-                ' "net-inst":"_ni",'
-                ' "ipv4-addr":"_ipv4_addrs",'
-                ' "ipv6-addr":"_ipv6_addrs",'
-                ' "AGW?":"_anycast_gw",'
-                ' arp:"_arp_summary",'
-                ' nd:"_nd_summary",'
-                ' "arp-evpn":"_arp_evpn",'
-                ' "nd-evpn":"_nd_evpn",'
-                ' "IFL?":"_ilr"}'
-            ),
-            "datatype": "all",
-        }
+        # The instances an irb is in, from the interface lists alone: the whole
+        # network-instance subtree carries the BGP RIBs, which is far more
+        # than a subscription serving this Get should have to stream.
+        bound = instances_by_interface(self.get)
+        resp = self.get(paths=["/interface[name=irb*]/subinterface"], datatype="all")
 
-        # build NI-to-interface map
-        ni_itfs = self.get(paths=["/network-instance[name=*]"], datatype="config")
-        ni_itf_map: Dict[str, List[str]] = {}
-        for ni in as_list(first_payload(ni_itfs).get("network-instance")):
-            for ni_itf in ni.get("interface", []):
-                if ni_itf["name"] not in ni_itf_map:
-                    ni_itf_map[ni_itf["name"]] = []
-                ni_itf_map[ni_itf["name"]].append(ni["name"])
-
-        resp = self.get(
-            paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
-        )
-
-        def _format_addrs(addrs: List[Dict[str, Any]]) -> str:
-            parts = []
-            for a in addrs:
-                s = a.get("ip-prefix", "")
-                flags = []
-                if a.get("primary") is not None:
-                    flags.append("P")
-                if a.get("anycast-gw"):
-                    flags.append("AGW")
-                if flags:
-                    s += f" ({','.join(flags)})"
-                parts.append(s)
-            return ", ".join(parts) if parts else ""
-
-        def _arp_summary(ipv4: Dict[str, Any]) -> str:
-            arp = ipv4.get("arp", {})
-            parts = []
-            if arp.get("proxy-arp"):
-                parts.append("proxy")
-            if arp.get("learn-unsolicited"):
-                parts.append("learn-unsol")
-            for hr in arp.get("host-route", {}).get("populate", []):
-                dp = "dp" if hr.get("datapath-programming") else "no-dp"
-                parts.append(f"host-rt:{hr.get('route-type', '?')}/{dp}")
-            return ", ".join(parts) if parts else "-"
-
-        def _nd_summary(ipv6: Dict[str, Any]) -> str:
-            nd = ipv6.get("neighbor-discovery", {})
-            parts = []
-            if nd.get("proxy-nd"):
-                parts.append("proxy")
-            learn = nd.get("learn-unsolicited", "none")
-            if learn and learn != "none":
-                parts.append(f"learn-unsol:{learn}")
-            for hr in nd.get("host-route", {}).get("populate", []):
-                dp = "dp" if hr.get("datapath-programming") else "no-dp"
-                parts.append(f"host-rt:{hr.get('route-type', '?')}/{dp}")
-            return ", ".join(parts) if parts else "-"
-
-        def _evpn_adv(proto_cfg: Dict[str, Any]) -> str:
-            evpn = proto_cfg.get("evpn", {})
-            advs = evpn.get("advertise", [])
-            if not advs:
-                return "-"
-            return ", ".join(a.get("route-type", "?") for a in advs)
-
+        records = []
         for itf in as_list(first_payload(resp).get("interface")):
-            for subitf in itf.get("subinterface", []):
-                subitf_name = f"{itf['name']}.{subitf['index']}"
-                subitf["_subitf"] = subitf_name
-                subitf["_ni"] = ", ".join(ni_itf_map.get(subitf_name, []))
-
-                ipv4 = subitf.get("ipv4", {})
-                ipv6 = subitf.get("ipv6", {})
-
-                subitf["_ipv4_addrs"] = _format_addrs(ipv4.get("address", []))
-                subitf["_ipv6_addrs"] = _format_addrs(ipv6.get("address", []))
-
-                agw = subitf.get("anycast-gw", {})
-                if agw:
-                    subitf["_anycast_gw"] = "Y"
-                else:
-                    subitf["_anycast_gw"] = "N"
-
-                subitf["_arp_summary"] = _arp_summary(ipv4)
-                subitf["_nd_summary"] = _nd_summary(ipv6)
-                subitf["_arp_evpn"] = _evpn_adv(ipv4.get("arp", {}))
-                subitf["_nd_evpn"] = _evpn_adv(ipv6.get("neighbor-discovery", {}))
-
-                arp_advs = ipv4.get("arp", {}).get("evpn", {}).get("advertise", [])
-                nd_advs = (
-                    ipv6.get("neighbor-discovery", {})
-                    .get("evpn", {})
-                    .get("advertise", [])
+            if not isinstance(itf, dict):
+                continue
+            for subitf in as_list(itf.get("subinterface")):
+                if not isinstance(subitf, dict):
+                    continue
+                name = f"{itf.get('name', '')}.{subitf.get('index', '')}"
+                ipv4 = subitf.get("ipv4") or {}
+                ipv6 = subitf.get("ipv6") or {}
+                arp = ipv4.get("arp") or {}
+                nd = ipv6.get("neighbor-discovery") or {}
+                anycast = subitf.get("anycast-gw") or {}
+                records.append(
+                    IrbInterface(
+                        name=name,
+                        nis=bound.get(name, ()),
+                        ipv4=_irb_addresses(ipv4),
+                        ipv6=_irb_addresses(ipv6),
+                        anycast_gw=bool(anycast),
+                        anycast_gw_mac=str(anycast.get("anycast-gw-mac") or ""),
+                        virtual_router_id=as_int(anycast.get("virtual-router-id")),
+                        arp=IrbArp(
+                            proxy=bool(arp.get("proxy-arp")),
+                            learn_unsolicited=bool(arp.get("learn-unsolicited")),
+                            host_routes=_host_route_rules(arp),
+                            evpn_advertise=_evpn_advertised(arp),
+                            interface_less_routing=_interface_less_routing(arp),
+                        ),
+                        nd=IrbNd(
+                            proxy=bool(nd.get("proxy-nd")),
+                            learn_unsolicited=str(nd.get("learn-unsolicited") or ""),
+                            host_routes=_host_route_rules(nd),
+                            evpn_advertise=_evpn_advertised(nd),
+                            interface_less_routing=_interface_less_routing(nd),
+                        ),
+                    )
                 )
-                has_ilr = any("interface-less-routing" in a for a in arp_advs + nd_advs)
-                subitf["_ilr"] = "Y" if has_ilr else "N"
-
-        res = jmespath.search(path_spec["jmespath"], first_payload(resp))
-        return {"irb": res}
+        return {"irb": records}
 
     def get_bridge_domains(self, nw_instance: str = "*") -> Dict[str, Any]:
         """Return EVPN Bridge Domains (mac-vrf) grouped by Route-Target."""

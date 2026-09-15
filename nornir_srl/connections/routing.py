@@ -1,17 +1,56 @@
 # Routing related methods extracted from srlinux.py
 from __future__ import annotations
 
-import copy
 import logging
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
-import jmespath
-
+from ..records import (
+    BgpPeers,
+    BgpRib,
+    BgpRoute,
+    Egress,
+    Family,
+    Neighbor,
+    Route,
+    RouteNextHop,
+    RouteTable,
+    StaticNextHop,
+    StaticRoute,
+    StaticRouteTable,
+    Tunnel,
+    TunnelNextHop,
+    TunnelTable,
+    as_int,
+)
 from .helpers import as_list, first_payload, lpm, model_version, version_bucket
 
 logger = logging.getLogger(__name__)
+
+#: The address families the peers report knows, by the name the newer BGP
+#: model gives them under ``afi-safi``.
+_BGP_FAMILIES = (
+    "evpn",
+    "ipv4-unicast",
+    "ipv6-unicast",
+    "l3vpn-ipv4-unicast",
+    "l3vpn-ipv6-unicast",
+)
+
+
+def _family(name: str, afi: Dict[str, Any]) -> Family:
+    """One address family of a session, as the neighbour state describes it."""
+    return Family(
+        name=name,
+        enabled=afi.get("admin-state") == "enable",
+        oper=str(afi.get("oper-state") or ""),
+        received=as_int(afi.get("received-routes")) or 0,
+        active=as_int(afi.get("active-routes")) or 0,
+        sent=as_int(afi.get("sent-routes")) or 0,
+    )
+
 
 # CLI / API aliases (e.g. ``-r l3vpn-v4``) → YANG ``afi-safi-name`` used in paths.
 BGP_RIB_ROUTE_FAM_ALIASES: Dict[str, str] = {
@@ -22,6 +61,125 @@ BGP_RIB_ROUTE_FAM_ALIASES: Dict[str, str] = {
     "l3vpn-ipv6": "l3vpn-ipv6-unicast",
     "l3vpn-ipv6-unicast": "l3vpn-ipv6-unicast",
 }
+
+#: What the BGP RIB report calls a family, and what the model calls it.
+_BGP_RIB_FAMILY = {
+    "evpn": "evpn",
+    "ipv4": "ipv4-unicast",
+    "ipv6": "ipv6-unicast",
+    "l3vpn-ipv4-unicast": "l3vpn-ipv4-unicast",
+    "l3vpn-ipv6-unicast": "l3vpn-ipv6-unicast",
+}
+
+#: The container holding each EVPN route type, in the singular the newer model
+#: uses; the older one pluralises it.
+_EVPN_ROUTE_CONTAINERS = {
+    "1": "ethernet-ad-route",
+    "2": "mac-ip-route",
+    "3": "imet-route",
+    "4": "ethernet-segment-route",
+    "5": "ip-prefix-route",
+}
+
+
+def _rib_entries(ni: Dict[str, Any], family: str, steps: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    """The route entries of *family* in one network-instance's bgp-rib.
+
+    Whichever way the release lays them out: the family directly under
+    ``bgp-rib`` or under an ``afi-safi`` list entry, and the last container
+    named in the singular or the plural.
+    """
+    bgp_rib = ni.get("bgp-rib") or {}
+    tables = [afi[family] for afi in as_list(bgp_rib.get("afi-safi")) if isinstance(afi, dict) and family in afi]
+    if family in bgp_rib:
+        tables.append(bgp_rib[family])
+    entries: List[Dict[str, Any]] = []
+    for table in tables:
+        node: Any = table
+        for step in steps[:-1]:
+            node = node.get(step) if isinstance(node, dict) else None
+        if not isinstance(node, dict):
+            continue
+        last = steps[-1]
+        entries.extend(
+            entry for entry in as_list(node.get(last, node.get(last + "s"))) if isinstance(entry, dict)
+        )
+    return entries
+
+
+def _ext_community(communities: List[str], prefix: str) -> Tuple[str, ...]:
+    """The values of the extended communities of one kind, ``target:`` say."""
+    return tuple(c.split(prefix, 1)[1] for c in communities if prefix in c)
+
+
+def _domain_ids(obj: Any) -> List[str]:
+    """Every ``domain-id`` in a D-PATH attribute, in order."""
+    found: List[str] = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if key == "domain-id":
+                found.extend(str(v) for v in as_list(value))
+            else:
+                found.extend(_domain_ids(value))
+    elif isinstance(obj, list):
+        for item in obj:
+            found.extend(_domain_ids(item))
+    return found
+
+
+def _label(route: Dict[str, Any], key: str) -> Optional[int]:
+    label = route.get(key)
+    return as_int(label.get("value")) if isinstance(label, dict) else None
+
+
+def _bgp_route(route: Dict[str, Any]) -> BgpRoute:
+    """A route merged with its attr-set, as a record."""
+    communities = route.get("communities") or {}
+    ext = [str(c) for c in as_list(communities.get("ext-community"))]
+    prefix = route.get("prefix") or route.get("ipv4-prefix") or route.get("ipv6-prefix")
+    # From 24.3 a MAC/IP route carries its VNI as the first of two labels, an
+    # RT-5 as a single label; before that, as a vni leaf.
+    label1, label2 = _label(route, "label1"), _label(route, "label2")
+    vni = label1 if "label1" in route else _label(route, "label") if "label" in route else as_int(route.get("vni"))
+    return BgpRoute(
+        neighbor=str(route.get("neighbor") or ""),
+        used=bool(route.get("used-route")),
+        valid=bool(route.get("valid-route")),
+        best=bool(route.get("best-route")),
+        rd=str(route.get("route-distinguisher") or ""),
+        prefix=str(prefix or route.get("ip-prefix") or ""),
+        esi=str(route.get("esi") or ""),
+        tag=as_int(route.get("ethernet-tag-id")),
+        mac=str(route.get("mac-address") or ""),
+        ip=str(route.get("ip-address") or ""),
+        gateway=str(route.get("gateway-ip") or ""),
+        vni=vni,
+        label1=label1,
+        label2=label2,
+        next_hop=str(route.get("next-hop") or ""),
+        origin=str(route.get("origin") or ""),
+        local_pref=as_int(route.get("local-pref")),
+        med=as_int(route.get("med")),
+        as_path=tuple(
+            member
+            for segment in as_list((route.get("as-path") or {}).get("segment"))
+            if isinstance(segment, dict)
+            for member in (as_int(m) for m in as_list(segment.get("member")))
+            if member is not None
+        ),
+        route_targets=_ext_community(ext, "target:"),
+        esi_labels=_ext_community(ext, "esi-label:"),
+        soo=_ext_community(ext, "origin:"),
+        tunnel_encap=_ext_community(ext, "bgp-tunnel-encap:"),
+        communities=tuple(str(c) for c in as_list(communities.get("community"))),
+        large_communities=tuple(str(c) for c in as_list(communities.get("large-community"))),
+        ext_communities=tuple(ext),
+        domain_path=tuple(_domain_ids(route.get("domain-path") or {})),
+        tie_break=str(route.get("tie-break-reason") or ""),
+        internal_tags=tuple(str(t) for t in as_list(route.get("internal-tags"))),
+        neighbor_as=as_int(route.get("neighbor-as")),
+    )
+
 
 #: How far :meth:`RoutingMixin.get_rib` follows a chain of indirect next-hops
 #: looking for the egress interface. Recursive resolution is a handful of hops
@@ -139,6 +297,13 @@ class RoutingMixin:
         network_instance: str = "*",
         detail: bool = False,
     ) -> Dict[str, Any]:
+        """The BGP RIB of one family, as records carrying every path attribute.
+
+        *detail* is accepted for the callers that used to ask for the extra
+        attributes: a record carries all of them, and the table declared for
+        the report decides which to show.
+        """
+        del detail
         mod_version = model_version(
             self.capabilities, "bgp-rib", "urn:nokia.com:srlinux:bgp:rib-bgp"
         )
@@ -149,354 +314,58 @@ class RoutingMixin:
             1: ("2021-", "2022-", "2023-", "2024-03", "2024-07"),
             2: ("20"),
         }
-        BGP_EVPN_ROUTE_TYPE_MAP = {
-            1: ("2021-", "2022-", "2023-", "2024-03", "2024-07"),
-            2: ("20"),
-        }
         BGP_IP_VERSION_MAP = {
             1: ("2021-", "2022-"),
             2: ("2023-03",),
             3: ("20"),
         }
-        ROUTE_FAMILY = {
-            "evpn": "evpn",
-            "ipv4": "ipv4-unicast",
-            "ipv6": "ipv6-unicast",
-            "l3vpn-ipv4-unicast": "l3vpn-ipv4-unicast",
-            "l3vpn-ipv6-unicast": "l3vpn-ipv6-unicast",
-        }
-        ROUTE_TYPE_VERSIONS = {
-            1: {
-                "1": "ethernet-ad-routes",
-                "2": "mac-ip-routes",
-                "3": "imet-routes",
-                "4": "ethernet-segment-routes",
-                "5": "ip-prefix-routes",
-            },
-            2: {
-                "1": "ethernet-ad-route",
-                "2": "mac-ip-route",
-                "3": "imet-route",
-                "4": "ethernet-segment-route",
-                "5": "ip-prefix-route",
-            },
-        }
-
-        def augment_routes(d, attribs):  # augment routes with attributes
-            if isinstance(d, list):
-                return [augment_routes(x, attribs) for x in d]
-            elif isinstance(d, dict):
-                if "attr-id" in d:
-                    d.update(attribs.get(d["attr-id"], {}))
-                    d["_r_state"] = (
-                        ("u" if d["used-route"] else "")
-                        + ("*" if d["valid-route"] else "")
-                        + (">" if d["best-route"] else "")
-                    )
-                    if "label1" in d:  # from SRL 24.3 onwards for mac/ip routes
-                        d["vni"] = d["label1"].get("value", "-")
-                        d["_label1"] = d["label1"].get("value", "-")
-                    elif "label" in d:  # for SRL 24.3 onwards
-                        d["vni"] = d["label"].get("value", "-")
-                        d["_label1"] = "-"
-                    else:
-                        d["vni"] = d.get("vni", "-")
-                        d["_label1"] = "-"
-                    if "label2" in d:
-                        d["_label2"] = d["label2"].get("value", "-")
-                    else:
-                        d["_label2"] = "-"
-                    d["_rt"] = ", ".join(
-                        [
-                            x_comm.split("target:")[1]
-                            for x_comm in d.get("communities", {}).get(
-                                "ext-community", []
-                            )
-                            if "target:" in x_comm
-                        ]
-                    )
-                    d["_as_path"] = str(
-                        attribs.get(d["attr-id"], {})
-                        .get("as-path", {})
-                        .get("segment", [{}])[0]
-                        .get("member", [])
-                    )
-                    d["_esi_lbl"] = ",".join(
-                        [
-                            str(x_comm.split("esi-label:")[1])
-                            .replace("Single-Active", "S-A")
-                            .replace("All-Active", "A-A")
-                            for x_comm in d.get("communities", {}).get(
-                                "ext-community", []
-                            )
-                            if "esi-label:" in x_comm
-                        ]
-                    )
-                    ext_comms = d.get("communities", {}).get("ext-community", [])
-                    # Site-of-Origin (SoO) carried as origin: ext-community
-                    d["_soo"] = ", ".join(
-                        [c.split("origin:")[1] for c in ext_comms if "origin:" in c]
-                    )
-                    # BGP tunnel-encap ext-community (e.g. VXLAN / MPLS)
-                    d["_tunnel_encap"] = ", ".join(
-                        [
-                            c.split("bgp-tunnel-encap:")[1]
-                            for c in ext_comms
-                            if "bgp-tunnel-encap:" in c
-                        ]
-                    )
-                    # Standard, large and extended communities (RT/SoO/encap also
-                    # have dedicated columns when detail=True).
-                    std_comms = d.get("communities", {}).get("community", []) or []
-                    large_comms = (
-                        d.get("communities", {}).get("large-community", []) or []
-                    )
-                    d["_communities"] = ", ".join(
-                        [
-                            str(c)
-                            for c in list(std_comms) + list(large_comms) + list(ext_comms)
-                        ]
-                    )
-                    # D-PATH (BGP domain-path) - collect all domain-ids in order
-                    dpath_ids: List[str] = []
-
-                    def _collect_domain_ids(obj: Any) -> None:
-                        if isinstance(obj, dict):
-                            for k, v in obj.items():
-                                if k == "domain-id":
-                                    if isinstance(v, list):
-                                        dpath_ids.extend(str(x) for x in v)
-                                    else:
-                                        dpath_ids.append(str(v))
-                                else:
-                                    _collect_domain_ids(v)
-                        elif isinstance(obj, list):
-                            for item in obj:
-                                _collect_domain_ids(item)
-
-                    _collect_domain_ids(d.get("domain-path", {}))
-                    d["_dpath"] = " ".join(dpath_ids)
-                    return d
-                else:
-                    return {k: augment_routes(v, attribs) for k, v in d.items()}
-            else:
-                return d
-
         evpn_path_version = version_bucket(BGP_EVPN_VERSION_MAP, mod_version)
-        evpn_route_type_version = version_bucket(BGP_EVPN_ROUTE_TYPE_MAP, mod_version)
         ip_path_version = version_bucket(BGP_IP_VERSION_MAP, mod_version)
 
-        if route_fam not in ROUTE_FAMILY:
+        if route_fam not in _BGP_RIB_FAMILY:
             raise ValueError(f"Invalid route family {route_fam}")
-        if (
-            route_type
-            and route_type not in ROUTE_TYPE_VERSIONS[evpn_route_type_version]
-        ):
+        family = _BGP_RIB_FAMILY[route_fam]
+        if route_type and route_type not in _EVPN_ROUTE_CONTAINERS:
             raise ValueError(f"Invalid route type {route_type}")
 
-        PATH_BGP_PATH_ATTRIBS = (
-            "/network-instance[name="
-            + network_instance
-            + "]/bgp-rib/attr-sets/attr-set"
-        )
-        RIB_EVPN_PATH_VERSIONS: Dict[int, Dict[str, Any]] = {
-            1: {
-                "RIB_EVPN_PATH": (
-                    "/network-instance[name=" + network_instance + "]/bgp-rib/"  # type: ignore
-                    f"{ROUTE_FAMILY[route_fam]}/rib-in-out/rib-in-post/"
-                    f"{ROUTE_TYPE_VERSIONS[evpn_route_type_version][route_type]}"  # type: ignore
-                ),
-                "RIB_EVPN_JMESPATH_COMMON": '"network-instance"[].{NI:name, Rib:"bgp-rib"."'
-                + ROUTE_FAMILY[route_fam]
-                + '"."rib-in-out"."rib-in-post"."'
-                + ROUTE_TYPE_VERSIONS[evpn_route_type_version][route_type]  # type: ignore
-                + '"[]',
-                "RIB_EVPN_JMESPATH_ATTRS": {
-                    "1": '.{RD:"route-distinguisher", peer:neighbor, ESI:esi, Tag:"ethernet-tag-id",vni:vni, "NextHop":"next-hop", RT:"_rt", "esi-lbl":"_esi_lbl", "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
-                    "2": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "MAC":"mac-address", "IP":"ip-address",vni:vni,L1:"_label1",L2:"_label2","next-hop":"next-hop", "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
-                    "3": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, Tag:"ethernet-tag-id", "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
-                    "4": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
-                    "5": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, lpref:"local-pref", "IP-Pfx":"ip-prefix",vni:vni, med:med, "next-hop":"next-hop", GW:"gateway-ip",origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
-                },
-            },
-            2: {
-                "RIB_EVPN_PATH": (
-                    "/network-instance[name=" + network_instance + f"]/bgp-rib/afi-safi[afi-safi-name={ROUTE_FAMILY[route_fam]}]/"  # type: ignore
-                    f"{ROUTE_FAMILY[route_fam]}/rib-in-out/rib-in-post/"
-                    f"{ROUTE_TYPE_VERSIONS[evpn_route_type_version][route_type]}"  # type: ignore
-                ),
-                "RIB_EVPN_JMESPATH_COMMON": '"network-instance"[].{NI:name, Rib:"bgp-rib"."afi-safi"[]."'
-                + ROUTE_FAMILY[route_fam]
-                + '"."rib-in-out"."rib-in-post"."'
-                + ROUTE_TYPE_VERSIONS[evpn_route_type_version][route_type]  # type: ignore
-                + '"[]',
-                "RIB_EVPN_JMESPATH_ATTRS": {
-                    "1": '.{RD:"route-distinguisher", peer:neighbor, ESI:esi, Tag:"ethernet-tag-id",vni:vni, "NextHop":"next-hop", RT:"_rt", "esi-lbl":"_esi_lbl", "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
-                    "2": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "MAC":"mac-address", "IP":"ip-address",vni:vni,L1:"_label1",L2:"_label2","next-hop":"next-hop", "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
-                    "3": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, Tag:"ethernet-tag-id", "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
-                    "4": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, "next-hop":"next-hop", origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
-                    "5": '.{RD:"route-distinguisher", RT:"_rt", peer:neighbor, ESI:esi, lpref:"local-pref", "IP-Pfx":"ip-prefix",vni:vni, med:med, "next-hop":"next-hop", GW:"gateway-ip",origin:origin, "0_st":"_r_state", "as-path":"as-path".segment[0].member, communities:"_communities"}}',
-                },
-            },
-        }
-        if route_fam in ("l3vpn-ipv4-unicast", "l3vpn-ipv6-unicast"):
-            # Hyphenated YANG leaf names must be JMESPath quoted identifiers, not bare tokens.
-            # Some releases expose the VPN NLRI as ``prefix`` instead of ``ipv4-prefix`` /
-            # ``ipv6-prefix``; OR picks whichever is present.
-            _pfx_expr = (
-                '"ipv4-prefix" || prefix'
-                if route_fam == "l3vpn-ipv4-unicast"
-                else '"ipv6-prefix" || prefix'
+        # The rib-in-post of an EVPN route type, or the local-rib of an IP
+        # family. Up to 24.7 the family sits directly under bgp-rib and the
+        # containers are named in the plural; from 24.10 it sits under an
+        # afi-safi list entry, and the containers are singular.
+        under_afi_safi = f"/bgp-rib/afi-safi[afi-safi-name={family}]/{family}"
+        if family == "evpn":
+            container = _EVPN_ROUTE_CONTAINERS[str(route_type)]
+            path = (
+                f"/network-instance[name={network_instance}]"
+                + (under_afi_safi if evpn_path_version == 2 else f"/bgp-rib/{family}")
+                + f"/rib-in-out/rib-in-post/{container}{'' if evpn_path_version == 2 else 's'}"
             )
-            ip_rib_jmespath_tail = {
-                1: (
-                    f'.{{neighbor:neighbor, "0_st":"_r_state", "RD":"route-distinguisher", '
-                    f'"Pfx":{_pfx_expr}, "lpref":"local-pref", med:med, "next-hop":"next-hop",'
-                    f'"as-path":"as-path".segment[0].member, communities:"_communities"}}}}'
-                ),
-                2: (
-                    f'.{{neighbor:neighbor, "0_st":"_r_state", "RD":"route-distinguisher", '
-                    f'"Pfx":{_pfx_expr}, "lpref":"local-pref", med:med, "next-hop":"next-hop",'
-                    f'"as-path":"as-path".segment[0].member, communities:"_communities"}}}}'
-                ),
-                3: (
-                    f'.{{neighbor:neighbor, "0_st":"_r_state", "RD":"route-distinguisher", '
-                    f'"Pfx":{_pfx_expr}, "lpref":"local-pref", med:med, "next-hop":"next-hop",'
-                    f'"as-path":"as-path".segment[0].member, communities:"_communities"}}}}'
-                ),
-            }
+            steps = ("rib-in-out", "rib-in-post", container)
         else:
-            ip_rib_jmespath_tail = {
-                1: (
-                    '.{neighbor:neighbor, "0_st":"_r_state", "Prefix":prefix, "lpref":"local-pref", med:med, '
-                    '"next-hop":"next-hop","as-path":"as-path".segment[0].member, communities:"_communities"}}'
-                ),
-                2: (
-                    '.{neighbor:neighbor, "0_st":"_r_state", "Prefix":prefix, "lpref":"local-pref", med:med, '
-                    '"next-hop":"next-hop","as-path":"as-path".segment[0].member, communities:"_communities"}}'
-                ),
-                3: (
-                    '.{neighbor:neighbor, "0_st":"_r_state", "Prefix":prefix, "lpref":"local-pref", med:med, '
-                    '"next-hop":"next-hop","as-path":"as-path".segment[0].member, communities:"_communities"}}'
-                ),
-            }
+            path = (
+                f"/network-instance[name={network_instance}]"
+                + (under_afi_safi if ip_path_version > 1 else f"/bgp-rib/{family}")
+                + f"/local-rib/route{'s' if ip_path_version < 3 else ''}"
+            )
+            steps = ("local-rib", "route")
 
-        RIB_IP_PATH_VERSIONS = {
-            1: {
-                "RIB_IP_PATH": (
-                    f"/network-instance[name={network_instance}]/bgp-rib/"
-                    f"{ROUTE_FAMILY[route_fam]}/local-rib/routes"
-                ),
-                "RIB_IP_JMESPATH": '"network-instance"[].{NI:name, Rib:"bgp-rib"."'
-                + ROUTE_FAMILY[route_fam]
-                + '"."local-rib"."routes"[]'
-                + ip_rib_jmespath_tail[1],
-            },
-            2: {
-                "RIB_IP_PATH": (
-                    f"/network-instance[name={network_instance}]/bgp-rib/afi-safi[afi-safi-name={ROUTE_FAMILY[route_fam]}]/"
-                    f"{ROUTE_FAMILY[route_fam]}/local-rib/routes"
-                ),
-                "RIB_IP_JMESPATH": '"network-instance"[].{NI:name, Rib:"bgp-rib"."afi-safi"[]."'
-                + ROUTE_FAMILY[route_fam]
-                + '"."local-rib"."routes"[]'
-                + ip_rib_jmespath_tail[2],
-            },
-            3: {
-                "RIB_IP_PATH": (
-                    f"/network-instance[name={network_instance}]/bgp-rib/afi-safi[afi-safi-name={ROUTE_FAMILY[route_fam]}]/"
-                    f"{ROUTE_FAMILY[route_fam]}/local-rib/route"
-                ),
-                "RIB_IP_JMESPATH": '"network-instance"[].{NI:name, Rib:"bgp-rib"."afi-safi"[]."'
-                + ROUTE_FAMILY[route_fam]
-                + '"."local-rib"."route"[]'
-                + ip_rib_jmespath_tail[3],
-            },
-        }
-
-        # Extra path-attribute fields appended when detail=True (CLI/MCP json and
-        # the server's export menu). Communities are always in the lean projection
-        # so live server tables carry them; the CLI table omits that column.
-        EXTRA_ATTRS_EVPN = (
-            'soo:"_soo", '
-            '"tunnel-encap":"_tunnel_encap", dpath:"_dpath", '
-            'valid:"valid-route", best:"best-route", used:"used-route", '
-            '"tie-break":"tie-break-reason", "internal-tags":"internal-tags", '
-            '"neighbor-as":"neighbor-as"'
+        attribs: Dict[str, Dict[str, Any]] = {}
+        resp = self.get(
+            paths=[f"/network-instance[name={network_instance}]/bgp-rib/attr-sets/attr-set"],
+            datatype="state",
         )
-        EXTRA_ATTRS_IP = (
-            'soo:"_soo", "tunnel-encap":"_tunnel_encap", dpath:"_dpath", '
-            'valid:"valid-route", best:"best-route", used:"used-route", '
-            '"tie-break":"tie-break-reason", "internal-tags":"internal-tags", '
-            '"neighbor-as":"neighbor-as"'
-        )
-
-        def _with_detail(attrs: str, extra: str) -> str:
-            # The per-route projection ends with '}}' (closing the route dict and
-            # the enclosing NI dict). Inject extra fields into the route dict.
-            if detail and attrs.endswith("}}"):
-                return attrs[:-2] + ", " + extra + "}}"
-            return attrs
-
-        evpn_attrs = _with_detail(
-            RIB_EVPN_PATH_VERSIONS[evpn_path_version]["RIB_EVPN_JMESPATH_ATTRS"][
-                route_type
-            ],
-            EXTRA_ATTRS_EVPN,
-        )
-        ip_jmespath = _with_detail(
-            RIB_IP_PATH_VERSIONS[ip_path_version]["RIB_IP_JMESPATH"], EXTRA_ATTRS_IP
-        )
-
-        PATH_SPECS = {
-            "evpn": {
-                "path": RIB_EVPN_PATH_VERSIONS[evpn_path_version]["RIB_EVPN_PATH"],
-                "jmespath": RIB_EVPN_PATH_VERSIONS[evpn_path_version][
-                    "RIB_EVPN_JMESPATH_COMMON"
-                ]
-                + evpn_attrs,
-                "datatype": "state",
-            },
-            "ipv4": {
-                "path": RIB_IP_PATH_VERSIONS[ip_path_version]["RIB_IP_PATH"],
-                "jmespath": ip_jmespath,
-                "datatype": "state",
-            },
-            "ipv6": {
-                "path": RIB_IP_PATH_VERSIONS[ip_path_version]["RIB_IP_PATH"],
-                "jmespath": ip_jmespath,
-                "datatype": "state",
-            },
-            "l3vpn-ipv4-unicast": {
-                "path": RIB_IP_PATH_VERSIONS[ip_path_version]["RIB_IP_PATH"],
-                "jmespath": ip_jmespath,
-                "datatype": "state",
-            },
-            "l3vpn-ipv6-unicast": {
-                "path": RIB_IP_PATH_VERSIONS[ip_path_version]["RIB_IP_PATH"],
-                "jmespath": ip_jmespath,
-                "datatype": "state",
-            },
-        }
-
-        attribs: Dict[str, Dict[str, Any]] = dict()
-
-        resp = self.get(paths=[PATH_BGP_PATH_ATTRIBS], datatype="state")
         for ni in as_list(first_payload(resp).get("network-instance")):
             ni_name = ni.get("name")
             if ni_name is None:
                 continue
-            attribs.setdefault(ni_name, dict())
-            for path in ni.get("bgp-rib", {}).get("attr-sets", {}).get("attr-set", []):
-                path_copy = copy.deepcopy(path)
-                attribs[ni_name].update({path_copy.pop("index"): path_copy})
+            attribs.setdefault(ni_name, {})
+            for attr_set in ni.get("bgp-rib", {}).get("attr-sets", {}).get("attr-set", []):
+                attribs[ni_name][attr_set.get("index")] = attr_set
 
-        path_spec: Dict[str, str] = PATH_SPECS[route_fam]
-        rib_path = str(path_spec.get("path"))
-        if route_fam in ("l3vpn-ipv4-unicast", "l3vpn-ipv6-unicast"):
+        if family in ("l3vpn-ipv4-unicast", "l3vpn-ipv6-unicast"):
             with _suppress_pygnmi_client_logging():
                 try:
-                    resp = self.get(paths=[rib_path], datatype=path_spec["datatype"])
+                    resp = self.get(paths=[path], datatype="state")
                 except BaseException as e:
                     # Leaves / platforms without IP-VPN have no l3vpn-* RIB path; skip instead of failing.
                     if _gnmi_path_missing(e):
@@ -509,17 +378,28 @@ class RoutingMixin:
                         return {"bgp_rib": []}
                     raise
         else:
-            resp = self.get(paths=[rib_path], datatype=path_spec["datatype"])
-        payload = first_payload(resp)
-        for ni in as_list(payload.get("network-instance")):
+            resp = self.get(paths=[path], datatype="state")
+
+        ribs = []
+        for ni in as_list(first_payload(resp).get("network-instance")):
+            if not isinstance(ni, dict):
+                continue
+            ni_name = str(ni.get("name", ""))
             # A network-instance can appear in the RIB without a matching
             # attr-set, e.g. when the two Gets straddle a routing change.
-            ni = augment_routes(ni, attribs.get(ni.get("name"), {}))
-
-        res = jmespath.search(path_spec["jmespath"], payload)
-        if res is None:
-            res = []
-        return {"bgp_rib": res}
+            attr_sets = attribs.get(ni_name, {})
+            ribs.append(
+                BgpRib(
+                    ni=ni_name,
+                    family=family,
+                    route_type=str(route_type) if family == "evpn" else "",
+                    routes=tuple(
+                        _bgp_route({**route, **attr_sets.get(route.get("attr-id"), {})})
+                        for route in _rib_entries(ni, family, steps)
+                    ),
+                )
+            )
+        return {"bgp_rib": ribs}
 
     def get_sum_bgp(self, network_instance: Optional[str] = "*") -> Dict[str, Any]:
         mod_version = model_version(
@@ -531,177 +411,55 @@ class RoutingMixin:
         BGP_VERSION_MAP = {1: ("2021-", "2022-"), 2: ("2023-3", "20")}
         our_version = version_bucket(BGP_VERSION_MAP, mod_version)
 
-        def augment_resp(resp):
-            for ni in as_list(first_payload(resp).get("network-instance")):
-                if ni.get("protocols") and ni["protocols"].get("bgp"):
-                    for peer in as_list(ni["protocols"]["bgp"].get("neighbor")):
-                        peer_data = dict()
-                        if our_version == 1:
-                            peer_data["evpn"] = peer.get("evpn")
-                            peer_data["ipv4-unicast"] = peer.get("ipv4-unicast")
-                            local_as = as_list(peer.get("local-as")) or [{}]
-                            peer_data["local-as"] = local_as[0].get("as-number", "-")
-                        elif our_version == 2:
-                            peer_data["local-as"] = peer.get("local-as", {}).get(
-                                "as-number", "-"
-                            )
-                            for afi in peer.get("afi-safi", []):
-                                if afi["afi-safi-name"] == "evpn":
-                                    peer_data["evpn"] = afi
-                                elif afi["afi-safi-name"] == "ipv4-unicast":
-                                    peer_data["ipv4-unicast"] = afi
-                                elif afi["afi-safi-name"] == "ipv6-unicast":
-                                    peer_data["ipv6-unicast"] = afi
-                                elif afi["afi-safi-name"] == "l3vpn-ipv4-unicast":
-                                    peer_data["l3vpn-ipv4-unicast"] = afi
-                                elif afi["afi-safi-name"] == "l3vpn-ipv6-unicast":
-                                    peer_data["l3vpn-ipv6-unicast"] = afi
-                        peer["_local-asn"] = peer_data["local-as"]
-                        peer["_flags"] = ""
-                        peer["_flags"] += (
-                            "D" if peer.get("dynamic-neighbor", False) else "-"
-                        )
-                        peer["_flags"] += (
-                            "B"
-                            if peer.get("failure-detection", {}).get(
-                                "enable-bfd", False
-                            )
-                            else "-"
-                        )
-                        peer["_flags"] += (
-                            "F"
-                            if peer.get("failure-detection", {}).get(
-                                "fast-failover", False
-                            )
-                            else "-"
-                        )
-                        if peer_data.get("evpn"):
-                            peer["_evpn"] = (
-                                str(peer_data["evpn"]["received-routes"])
-                                + "/"
-                                + str(peer_data["evpn"]["active-routes"])
-                                + "/"
-                                + str(peer_data["evpn"]["sent-routes"])
-                                if peer_data["evpn"]["admin-state"] == "enable"
-                                else "disabled"
-                            )
-                        else:
-                            peer["_evpn"] = "-"
-                        if peer_data.get("ipv4-unicast"):
-                            if peer_data["ipv4-unicast"]["admin-state"] == "enable":
-                                peer["_ipv4"] = (
-                                    str(peer_data["ipv4-unicast"]["received-routes"])
-                                    + "/"
-                                    + str(peer_data["ipv4-unicast"]["active-routes"])
-                                    + "/"
-                                    + str(peer_data["ipv4-unicast"]["sent-routes"])
-                                )
-                                if (
-                                    peer_data["ipv4-unicast"].get("oper-state")
-                                    == "down"
-                                ):
-                                    peer["_ipv4"] = "down"
-                            else:
-                                peer["_ipv4"] = "disabled"
-                        else:
-                            peer["_ipv4"] = "-"
-                        if peer_data.get("ipv6-unicast"):
-                            if peer_data["ipv6-unicast"]["admin-state"] == "enable":
-                                peer["_ipv6"] = (
-                                    str(peer_data["ipv6-unicast"]["received-routes"])
-                                    + "/"
-                                    + str(peer_data["ipv6-unicast"]["active-routes"])
-                                    + "/"
-                                    + str(peer_data["ipv6-unicast"]["sent-routes"])
-                                )
-                                if (
-                                    peer_data["ipv6-unicast"].get("oper-state")
-                                    == "down"
-                                ):
-                                    peer["_ipv6"] = "down"
-                            else:
-                                peer["_ipv6"] = "disabled"
-                        else:
-                            peer["_ipv6"] = "-"
-                        if peer_data.get("l3vpn-ipv4-unicast"):
-                            if (
-                                peer_data["l3vpn-ipv4-unicast"]["admin-state"]
-                                == "enable"
-                            ):
-                                peer["_l3vpn4"] = (
-                                    str(
-                                        peer_data["l3vpn-ipv4-unicast"][
-                                            "received-routes"
-                                        ]
-                                    )
-                                    + "/"
-                                    + str(
-                                        peer_data["l3vpn-ipv4-unicast"]["active-routes"]
-                                    )
-                                    + "/"
-                                    + str(
-                                        peer_data["l3vpn-ipv4-unicast"]["sent-routes"]
-                                    )
-                                )
-                                if (
-                                    peer_data["l3vpn-ipv4-unicast"].get("oper-state")
-                                    == "down"
-                                ):
-                                    peer["_l3vpn4"] = "down"
-                            else:
-                                peer["_l3vpn4"] = "disabled"
-                        else:
-                            peer["_l3vpn4"] = "-"
-                        if peer_data.get("l3vpn-ipv6-unicast"):
-                            if (
-                                peer_data["l3vpn-ipv6-unicast"]["admin-state"]
-                                == "enable"
-                            ):
-                                peer["_l3vpn6"] = (
-                                    str(
-                                        peer_data["l3vpn-ipv6-unicast"][
-                                            "received-routes"
-                                        ]
-                                    )
-                                    + "/"
-                                    + str(
-                                        peer_data["l3vpn-ipv6-unicast"]["active-routes"]
-                                    )
-                                    + "/"
-                                    + str(
-                                        peer_data["l3vpn-ipv6-unicast"]["sent-routes"]
-                                    )
-                                )
-                                if (
-                                    peer_data["l3vpn-ipv6-unicast"].get("oper-state")
-                                    == "down"
-                                ):
-                                    peer["_l3vpn6"] = "down"
-                            else:
-                                peer["_l3vpn6"] = "disabled"
-                        else:
-                            peer["_l3vpn6"] = "-"
-                        transport = peer.get("transport") or {}
-                        peer["_local-address"] = transport.get("local-address", "")
-                        peer["_local-port"] = transport.get("local-port", "")
+        def neighbor(peer: Dict[str, Any]) -> Neighbor:
+            families: List[Family] = []
+            if our_version == 1:
+                # The older model keeps each family in a container of its own
+                # and the local AS in a list.
+                local_as = (as_list(peer.get("local-as")) or [{}])[0].get("as-number")
+                for name in ("evpn", "ipv4-unicast"):
+                    if isinstance(peer.get(name), dict):
+                        families.append(_family(name, peer[name]))
+            else:
+                local_as = (peer.get("local-as") or {}).get("as-number")
+                for afi in as_list(peer.get("afi-safi")):
+                    if isinstance(afi, dict) and afi.get("afi-safi-name") in _BGP_FAMILIES:
+                        families.append(_family(str(afi["afi-safi-name"]), afi))
+            detection = peer.get("failure-detection") or {}
+            transport = peer.get("transport") or {}
+            return Neighbor(
+                peer=str(peer.get("peer-address", "")),
+                state=str(peer.get("session-state") or ""),
+                peer_as=as_int(peer.get("peer-as")),
+                local_as=as_int(local_as),
+                local_address=str(transport.get("local-address") or ""),
+                local_port=as_int(transport.get("local-port")),
+                group=str(peer.get("peer-group") or ""),
+                dynamic=bool(peer.get("dynamic-neighbor", False)),
+                bfd=bool(detection.get("enable-bfd", False)),
+                fast_failover=bool(detection.get("fast-failover", False)),
+                import_policies=tuple(str(p) for p in as_list(peer.get("import-policy"))),
+                export_policies=tuple(str(p) for p in as_list(peer.get("export-policy"))),
+                families=tuple(families),
+            )
 
-        path_spec = {
-            "path": f"/network-instance[name={network_instance}]/protocols/bgp/neighbor",
-            "jmespath": '"network-instance"[].{NI:name, Neighbors: protocols.bgp.neighbor[].{"1_peer":"peer-address",\
-                    "2_local-address":"_local-address", "3_local-port":"_local-port",\
-                    "peer-as":"peer-as", state:"session-state","local-as":"_local-asn",flags:"_flags",\
-                    "group":"peer-group", "export-policy":"export-policy", "import-policy":"import-policy",\
-                    "U4\\nR/A/T":"_ipv4", "U6\\nR/A/T":"_ipv6", "EVPN\\nR/A/T":"_evpn",\
-                    "VPNv4\\nR/A/T":"_l3vpn4", "VPNv6\\nR/A/T":"_l3vpn6"}}',
-            "datatype": "all",
-            "key": "index",
-        }
         resp = self.get(
-            paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
+            paths=[f"/network-instance[name={network_instance}]/protocols/bgp/neighbor"],
+            datatype="all",
         )
-        augment_resp(resp)
-        res = jmespath.search(path_spec["jmespath"], first_payload(resp))
-        return {"bgp_peers": res}
+        records = [
+            BgpPeers(
+                ni=str(ni.get("name", "")),
+                neighbors=tuple(
+                    neighbor(peer)
+                    for peer in as_list(((ni.get("protocols") or {}).get("bgp") or {}).get("neighbor"))
+                    if isinstance(peer, dict)
+                ),
+            )
+            for ni in as_list(first_payload(resp).get("network-instance"))
+            if isinstance(ni, dict)
+        ]
+        return {"bgp_peers": records}
 
     def get_rib(
         self,
@@ -709,16 +467,7 @@ class RoutingMixin:
         network_instance: Optional[str] = "*",
         lpm_address: Optional[str] = None,
     ) -> Dict[str, Any]:
-        path_spec = {
-            "path": f"/network-instance[name={network_instance}]/route-table/{afi}",
-            "jmespath": '"network-instance"[?_hasrib].{NI:name, Rib:"route-table"."'
-            + afi
-            + '".route[].{"Prefix":"'
-            + ("ipv4-prefix" if afi == "ipv4-unicast" else "ipv6-prefix")
-            + '",\
-                    "next-hop":"_next-hop",type:"route-type", Act:active, "orig-vrf":"_orig_vrf",metric:metric, pref:preference, itf:"_nh_itf"}}',
-            "datatype": "state",
-        }
+        prefix_key = "ipv4-prefix" if afi == "ipv4-unicast" else "ipv6-prefix"
 
         nhgroups = self.get(
             paths=[
@@ -759,9 +508,11 @@ class RoutingMixin:
                 # on instead. Either way the VTEP is what the route egresses to.
                 tunnel = resolving_tunnel or nh.get("tunnel") or {}
                 if tunnel:
-                    tunnel_type = tunnel.get("tunnel-type") or tunnel.get("type") or ""
-                    tunnel_prefix = tunnel.get("ip-prefix") or ""
-                    entry["tunnel"] = f"{tunnel_type}:{tunnel_prefix}"
+                    entry["tunnel"] = Egress(
+                        "tunnel",
+                        str(tunnel.get("ip-prefix") or ""),
+                        tunnel=str(tunnel.get("tunnel-type") or tunnel.get("type") or ""),
+                    )
                 if resolving_route:
                     entry["resolving-route"] = resolving_route.get("ip-prefix")
                     # The resolving route names its own next-hop-group, which is
@@ -783,8 +534,8 @@ class RoutingMixin:
 
         def egress(
             ni_name: str, nh: Dict[str, Any], seen: Tuple[str, ...] = ()
-        ) -> List[Tuple[str, str]]:
-            """Where a next-hop leaves the node, as ``(kind, value)`` pairs.
+        ) -> List[Egress]:
+            """Where a next-hop leaves the node.
 
             A next-hop resolved down to a port or a tunnel says so itself. An
             indirect one only names the route it resolves through, so the port
@@ -795,9 +546,9 @@ class RoutingMixin:
             shown when the chain cannot be walked to an interface.
             """
             if nh.get("subinterface"):
-                return [("itf", nh["subinterface"])]
+                return [Egress("interface", str(nh["subinterface"]))]
             if nh.get("tunnel"):
-                return [("tunnel", nh["tunnel"])]
+                return [nh["tunnel"]]
             via = nh.get("resolving-nhg")
             if via and via not in seen and len(seen) < _MAX_NH_RESOLVE_DEPTH:
                 hops = [
@@ -808,78 +559,75 @@ class RoutingMixin:
                 if hops:
                     return hops
             if nh.get("resolving-route"):
-                return [("route", nh["resolving-route"])]
+                return [Egress("route", str(nh["resolving-route"]))]
             return []
 
         resp = self.get(
-            paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
+            paths=[f"/network-instance[name={network_instance}]/route-table/{afi}"],
+            datatype="state",
         )
-        payload = first_payload(resp)
-        if lpm_address:
-            # Narrowing to the matched prefix rewrites the route lists in
-            # place, and what came back can be a payload a cache still holds
-            # on behalf of the renders that want the table in full - as it does
-            # on the server, where one report is rendered both ways at once.
-            payload = copy.deepcopy(payload)
-        prefix_key = "ipv4-prefix" if afi == "ipv4-unicast" else "ipv6-prefix"
-        for ni in as_list(payload.get("network-instance")):
+        tables: List[RouteTable] = []
+        for ni in as_list(first_payload(resp).get("network-instance")):
+            ni_name = str(ni.get("name", ""))
             afi_table = ni.get("route-table", {}).get(afi) or {}
             if not afi_table:
-                ni["_hasrib"] = False
                 continue
-            ni["_hasrib"] = True
+            raw_routes = [r for r in as_list(afi_table.get("route")) if isinstance(r, dict)]
             if lpm_address:
-                routes = as_list(afi_table.get("route"))
+                # Narrowing keeps the one prefix the address falls into, or
+                # nothing: the instance then has no route to it. Nothing is
+                # rewritten in place, so a payload a cache still holds on
+                # behalf of the renders that want the table in full is intact.
                 lpm_prefix = lpm(
-                    lpm_address, [r[prefix_key] for r in routes if prefix_key in r]
+                    lpm_address, [r[prefix_key] for r in raw_routes if prefix_key in r]
                 )
                 if not lpm_prefix:
-                    afi_table["route"] = []
-                    ni["_hasrib"] = False
                     continue
-                afi_table["route"] = [
-                    r for r in routes if r.get(prefix_key) == lpm_prefix
-                ]
-            for route in as_list(afi_table.get("route")):
-                route["active"] = "yes" if route.get("active") else "no"
-                if "next-hop-group" not in route:
-                    continue
-                leaked = False
-                orig_ni = route.get("origin-network-instance", ni.get("name"))
-                if orig_ni != ni.get("name"):
-                    leaked = True
-                    route["_orig_vrf"] = orig_ni
-                nhg_ni = route.get("next-hop-group-network-instance", orig_ni)
-                resolved = nhgroup_mapping.get(nhg_ni, {}).get(
-                    route["next-hop-group"], []
-                )
-                route["_next-hop"] = [
-                    (
-                        nh["resolving-route"] + " (indirect)"
-                        if nh.get("type") == "indirect" and nh.get("resolving-route")
-                        else nh.get("ip-address")
-                    )
-                    for nh in resolved
-                ]
-                # In next-hop order, so the ports read alongside the addresses
-                # beside them - though one indirect next-hop can resolve onto
-                # several, and then there are more ports than addresses.
-                route["_nh_itf"] = [
-                    f"{hop}@vrf:{orig_ni}" if leaked and kind == "itf" else hop
-                    for nh in resolved
-                    for kind, hop in egress(nhg_ni, nh)
-                ]
+                raw_routes = [r for r in raw_routes if r.get(prefix_key) == lpm_prefix]
 
-        res = jmespath.search(path_spec["jmespath"], payload)
-        return {"ip_rib": res}
+            routes = []
+            for route in raw_routes:
+                orig_ni = str(route.get("origin-network-instance") or ni_name)
+                leaked = orig_ni != ni_name
+                next_hops: List[RouteNextHop] = []
+                if "next-hop-group" in route:
+                    nhg_ni = str(route.get("next-hop-group-network-instance") or orig_ni)
+                    for nh in nhgroup_mapping.get(nhg_ni, {}).get(route["next-hop-group"], []):
+                        next_hops.append(
+                            RouteNextHop(
+                                address=str(nh.get("ip-address") or ""),
+                                type=str(nh.get("type") or ""),
+                                resolving_route=str(nh.get("resolving-route") or ""),
+                                egress=tuple(
+                                    # A leaked route leaves through a port of
+                                    # the instance it came from.
+                                    replace(hop, ni=orig_ni)
+                                    if leaked and hop.kind == "interface"
+                                    else hop
+                                    for hop in egress(nhg_ni, nh)
+                                ),
+                            )
+                        )
+                routes.append(
+                    Route(
+                        prefix=str(route.get(prefix_key) or ""),
+                        type=str(route.get("route-type") or ""),
+                        active=bool(route.get("active")),
+                        metric=as_int(route.get("metric")),
+                        preference=as_int(route.get("preference")),
+                        leaked_from=orig_ni if leaked else "",
+                        next_hops=tuple(next_hops),
+                    )
+                )
+            tables.append(RouteTable(ni=ni_name, routes=tuple(routes)))
+        return {"ip_rib": tables}
 
     def get_tunnel_table(self, network_instance: str = "*") -> Dict[str, Any]:
         """Get the IP tunnel-table (LDP, SR-ISIS, RSVP, VXLAN, ...).
 
         Resolves each tunnel's next-hop-group to the egress subinterface,
         next-hop IP and pushed MPLS label-stack, mirroring the next-hop
-        resolution used by :meth:`get_rib`. Returns flat rows with the fields
-        required to verify transport/forwarding paths in tests.
+        resolution used by :meth:`get_rib`.
         """
         # Build next-hop and next-hop-group lookups (per network-instance).
         nhs = self.get(
@@ -895,72 +643,76 @@ class RoutingMixin:
             datatype="state",
         )
 
-        nh_mapping: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        nh_mapping: Dict[str, Dict[str, TunnelNextHop]] = {}
         for ni in as_list(first_payload(nhs).get("network-instance")):
-            tmp_map: Dict[str, Dict[str, Any]] = {}
-            for nh in ni.get("route-table", {}).get("next-hop", []):
-                label_stack = nh.get("mpls-encapsulation", {}).get(
+            if not isinstance(ni, dict):
+                continue
+            resolved: Dict[str, TunnelNextHop] = {}
+            for nh in as_list((ni.get("route-table") or {}).get("next-hop")):
+                if not isinstance(nh, dict):
+                    continue
+                label_stack = (nh.get("mpls-encapsulation") or {}).get(
                     "pushed-mpls-label-stack"
-                ) or nh.get("mpls", {}).get("pushed-mpls-label-stack")
-                tmp_map[nh["index"]] = {
-                    "ip-address": nh.get("ip-address"),
-                    "subinterface": nh.get("subinterface"),
-                    "type": nh.get("type"),
-                    "labels": label_stack,
-                }
-            nh_mapping[ni["name"]] = tmp_map
+                ) or (nh.get("mpls") or {}).get("pushed-mpls-label-stack")
+                resolved[str(nh.get("index"))] = TunnelNextHop(
+                    address=str(nh.get("ip-address") or ""),
+                    subinterface=str(nh.get("subinterface") or ""),
+                    type=str(nh.get("type") or ""),
+                    labels=tuple(str(label) for label in as_list(label_stack)),
+                )
+            nh_mapping[str(ni.get("name", ""))] = resolved
 
-        nhgroup_mapping: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        nhgroup_mapping: Dict[str, Dict[str, Tuple[TunnelNextHop, ...]]] = {}
         for ni in as_list(first_payload(nhgroups).get("network-instance")):
-            ni_name = ni["name"]
-            nh_map: Dict[str, List[Dict[str, Any]]] = {}
-            for nhgroup in ni.get("route-table", {}).get("next-hop-group", []):
-                nh_map[nhgroup["index"]] = [
-                    nh_mapping.get(ni_name, {}).get(nh.get("next-hop"), {})
-                    for nh in nhgroup.get("next-hop", [])
-                ]
-            nhgroup_mapping[ni_name] = nh_map
+            if not isinstance(ni, dict):
+                continue
+            ni_name = str(ni.get("name", ""))
+            groups: Dict[str, Tuple[TunnelNextHop, ...]] = {}
+            for nhgroup in as_list((ni.get("route-table") or {}).get("next-hop-group")):
+                if not isinstance(nhgroup, dict):
+                    continue
+                groups[str(nhgroup.get("index"))] = tuple(
+                    nh_mapping.get(ni_name, {}).get(str(member.get("next-hop")), TunnelNextHop())
+                    for member in as_list(nhgroup.get("next-hop"))
+                    if isinstance(member, dict)
+                )
+            nhgroup_mapping[ni_name] = groups
 
         resp = self.get(
             paths=[f"/network-instance[name={network_instance}]/tunnel-table"],
             datatype="state",
         )
 
-        rows: List[Dict[str, Any]] = []
+        tables: List[TunnelTable] = []
         for ni in as_list(first_payload(resp).get("network-instance")):
-            ni_name = ni["name"]
-            tunnel_table = ni.get("tunnel-table", {})
+            if not isinstance(ni, dict):
+                continue
+            ni_name = str(ni.get("name", ""))
+            tunnel_table = ni.get("tunnel-table") or {}
+            tunnels: List[Tunnel] = []
             for afi in ("ipv4", "ipv6"):
-                prefix_key = "ipv4-prefix" if afi == "ipv4" else "ipv6-prefix"
-                for tunnel in tunnel_table.get(afi, {}).get("tunnel", []):
-                    nhg_index = tunnel.get("next-hop-group")
-                    resolved = nhgroup_mapping.get(ni_name, {}).get(nhg_index, [])
-                    next_hops = [
-                        nh.get("ip-address") for nh in resolved if nh.get("ip-address")
-                    ]
-                    egress_itfs = [
-                        nh.get("subinterface")
-                        for nh in resolved
-                        if nh.get("subinterface")
-                    ]
-                    labels = [
-                        str(lbl) for nh in resolved for lbl in (nh.get("labels") or [])
-                    ]
-                    rows.append(
-                        {
-                            "NI": ni_name,
-                            "Prefix": tunnel.get(prefix_key),
-                            "type": tunnel.get("type"),
-                            "owner": tunnel.get("owner"),
-                            "pref": tunnel.get("preference"),
-                            "metric": tunnel.get("metric"),
-                            "next-hop": next_hops,
-                            "egress-itf": egress_itfs,
-                            "label": labels,
-                        }
+                prefix_key = f"{afi}-prefix"
+                for tunnel in as_list((tunnel_table.get(afi) or {}).get("tunnel")):
+                    if not isinstance(tunnel, dict):
+                        continue
+                    tunnels.append(
+                        Tunnel(
+                            prefix=str(tunnel.get(prefix_key) or ""),
+                            type=str(tunnel.get("type") or ""),
+                            owner=str(tunnel.get("owner") or ""),
+                            preference=as_int(tunnel.get("preference")),
+                            metric=as_int(tunnel.get("metric")),
+                            next_hops=nhgroup_mapping.get(ni_name, {}).get(
+                                str(tunnel.get("next-hop-group")), ()
+                            ),
+                        )
                     )
+            # An instance without tunnels has no table to show, rather than
+            # an empty one: most instances have none.
+            if tunnels:
+                tables.append(TunnelTable(ni=ni_name, tunnels=tuple(tunnels)))
 
-        return {"tunnel_table": rows}
+        return {"tunnel_table": tables}
 
     def get_routing_policies(self) -> Dict[str, Any]:
         """
@@ -986,57 +738,55 @@ class RoutingMixin:
         ]
         resp = self.get(paths=paths, datatype="all")
 
-        # Map next-hop groups
-        # nh_mapping[ni_name][group_name] = [ip1, ip2(R), ...]
-        nh_mapping: Dict[str, Dict[str, List[str]]] = {}
-        # static_routes_data[ni_name] = [route1, route2, ...]
-        static_routes_data: Dict[str, List[Dict[str, Any]]] = {}
-
+        # The two paths answer as separate notifications, each with its own
+        # network-instance list, so both are read per instance before the
+        # routes are resolved against their groups.
+        groups: Dict[str, Dict[str, Tuple[StaticNextHop, ...]]] = {}
+        routes: Dict[str, List[Dict[str, Any]]] = {}
         for item in resp:
-            if "network-instance" in item:
-                for ni in item["network-instance"]:
-                    ni_name = ni["name"]
-                    if "next-hop-groups" in ni:
-                        if ni_name not in nh_mapping:
-                            nh_mapping[ni_name] = {}
-                        for group in ni["next-hop-groups"].get("group", []):
-                            group_name = group["name"]
-                            nh_list = []
-                            for nh in group.get("nexthop", []):
-                                ip = nh.get("ip-address")
-                                if ip:
-                                    if nh.get("resolve", False):
-                                        ip = f"{ip}(R)"
-                                    nh_list.append(ip)
-                            nh_mapping[ni_name][group_name] = nh_list
-
-                    if "static-routes" in ni:
-                        if ni_name not in static_routes_data:
-                            static_routes_data[ni_name] = []
-                        static_routes_data[ni_name].extend(
-                            ni["static-routes"].get("route", [])
+            if not isinstance(item, dict):
+                continue
+            for ni in as_list(item.get("network-instance")):
+                if not isinstance(ni, dict):
+                    continue
+                ni_name = str(ni.get("name", ""))
+                for group in as_list((ni.get("next-hop-groups") or {}).get("group")):
+                    if not isinstance(group, dict):
+                        continue
+                    groups.setdefault(ni_name, {})[str(group.get("name"))] = tuple(
+                        StaticNextHop(
+                            address=str(nh.get("ip-address")),
+                            resolve=bool(nh.get("resolve", False)),
                         )
+                        for nh in as_list(group.get("nexthop"))
+                        if isinstance(nh, dict) and nh.get("ip-address")
+                    )
+                if "static-routes" in ni:
+                    routes.setdefault(ni_name, []).extend(
+                        route
+                        for route in as_list((ni.get("static-routes") or {}).get("route"))
+                        if isinstance(route, dict)
+                    )
 
-        processed_routes = []
-        for ni_name, routes in static_routes_data.items():
-            for route in routes:
-                nh_group_name = route.get("next-hop-group")
-                nhops = (
-                    nh_mapping.get(ni_name, {}).get(nh_group_name, [])
-                    if nh_group_name
-                    else []
-                )
-
-                processed_routes.append(
-                    {
-                        "NI": ni_name,
-                        "route": route.get("prefix"),
-                        "admin-state": route.get("admin-state"),
-                        "installed": route.get("installed"),
-                        "metric": route.get("metric"),
-                        "pref": route.get("preference"),
-                        "nhops": nhops,
-                    }
-                )
-
-        return {"static_routes": processed_routes}
+        tables = [
+            StaticRouteTable(
+                ni=ni_name,
+                routes=tuple(
+                    StaticRoute(
+                        prefix=str(route.get("prefix") or ""),
+                        admin=str(route.get("admin-state") or ""),
+                        installed=(
+                            bool(route["installed"]) if route.get("installed") is not None else None
+                        ),
+                        metric=as_int(route.get("metric")),
+                        preference=as_int(route.get("preference")),
+                        next_hop_group=str(route.get("next-hop-group") or ""),
+                        next_hops=groups.get(ni_name, {}).get(str(route.get("next-hop-group")), ()),
+                    )
+                    for route in ni_routes
+                ),
+            )
+            for ni_name, ni_routes in routes.items()
+            if ni_routes
+        ]
+        return {"static_routes": tables}

@@ -24,6 +24,7 @@ from ..connections.layer2 import Layer2Mixin
 from ..connections.neighbor_discovery import NeighborDiscoveryMixin
 from ..connections.routing import RoutingMixin
 from ..connections.system import SystemMixin
+from ..records import InterfaceStats
 from .stream import HostStream, _suppress_pygnmi_client_logging
 
 logger = logging.getLogger(__name__)
@@ -117,9 +118,10 @@ class CachedDevice(MixinDevice):
         Unlike the CLI implementation this does not take two samples of its own:
         the subscription already delivers a fresh sample every interval, and
         :class:`~nornir_srl.server.stream.RateTracker` keeps the derived rates
-        up to date.
+        and the per-sample counts up to date. The port state streams alongside
+        the counters, so the records carry it too.
         """
-        rows: List[Dict[str, Any]] = []
+        records: List[InterfaceStats] = []
         for name in self.stream.interfaces():
             if interface not in ("*", name):
                 continue
@@ -128,6 +130,7 @@ class CachedDevice(MixinDevice):
             if not stats:
                 continue
             rates = self.stream.rates.rates(name)
+            deltas = self.stream.rates.deltas(name)
 
             def _counter(key: str) -> int:
                 try:
@@ -135,26 +138,26 @@ class CachedDevice(MixinDevice):
                 except (TypeError, ValueError):
                     return 0
 
-            rows.append(
-                {
-                    "interface": name,
-                    "oper-state": itf.get("oper-state", "-"),
+            records.append(
+                InterfaceStats(
+                    name=name,
+                    oper=str(itf.get("oper-state", "-")),
                     # Why a port is down is what tells an idle interface that is
                     # meant to be idle - a standby ethernet-segment member -
                     # from one that is not.
-                    "down-reason": clean_leaf(itf.get("oper-down-reason")),
-                    "in-Kbps": round(rates.get("in-octets", 0.0) * 8 / 1000, 1),
-                    "out-Kbps": round(rates.get("out-octets", 0.0) * 8 / 1000, 1),
-                    "in-pps": round(rates.get("in-packets", 0.0), 1),
-                    "out-pps": round(rates.get("out-packets", 0.0), 1),
-                    "in-err": _counter("in-error-packets"),
-                    "out-err": _counter("out-error-packets"),
-                    "in-disc": _counter("in-discarded-packets"),
-                    "out-disc": _counter("out-discarded-packets"),
-                    "in-pkts": _counter("in-packets"),
-                    "out-pkts": _counter("out-packets"),
-                    "in-octets": _counter("in-octets"),
-                    "out-octets": _counter("out-octets"),
-                }
+                    down_reason=clean_leaf(itf.get("oper-down-reason")),
+                    in_kbps=round(rates.get("in-octets", 0.0) * 8 / 1000, 1),
+                    out_kbps=round(rates.get("out-octets", 0.0) * 8 / 1000, 1),
+                    in_pps=round(rates.get("in-packets", 0.0), 1),
+                    out_pps=round(rates.get("out-packets", 0.0), 1),
+                    in_errors=deltas.get("in-error-packets", 0),
+                    out_errors=deltas.get("out-error-packets", 0),
+                    in_discards=deltas.get("in-discarded-packets", 0),
+                    out_discards=deltas.get("out-discarded-packets", 0),
+                    in_packets=_counter("in-packets"),
+                    out_packets=_counter("out-packets"),
+                    in_octets=_counter("in-octets"),
+                    out_octets=_counter("out-octets"),
+                )
             )
-        return {"ifstats": rows}
+        return {"ifstats": records}

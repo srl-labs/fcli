@@ -11,12 +11,14 @@ from nornir.core.inventory import Host
 from nornir.core.task import AggregatedResult, MultiResult, Result
 
 from nornir_srl import cli, mcp_server
+from nornir_srl.lenses import lenses_for
 from nornir_srl.reports import (
     ALL_SURFACES,
     CLI,
     MCP,
     SERVER,
     REPORTS,
+    REPORTS_BY_NAME,
     coerce_params,
     get_report,
     reports_for,
@@ -147,16 +149,58 @@ def _cli_commands():
     return {c.callback.__name__: c for c in cli.app.registered_commands}
 
 
-#: Commands that are not reports: they run the fabric, or run over a report,
-#: rather than being one.
+#: Commands that are neither a report nor a lens: they run the fabric, or run
+#: over a report, rather than reading one.
 NON_REPORT_COMMANDS = {"server", "diff"}
 
 
 def test_cli_exposes_exactly_the_cli_reports():
     commands = _cli_commands()
-    expected = {r.name for r in reports_for(CLI)}
+    expected = {r.name for r in reports_for(CLI)} | {
+        lens.name for lens in lenses_for(CLI)
+    }
     assert expected <= set(commands)
     assert set(commands) - expected == NON_REPORT_COMMANDS
+
+
+def test_cli_exposes_every_lens():
+    commands = _cli_commands()
+    for lens in lenses_for(CLI):
+        assert lens.name in commands, f"no CLI command for lens '{lens.name}'"
+
+
+def test_mcp_exposes_every_lens():
+    for lens in lenses_for(MCP):
+        tool = getattr(mcp_server, lens.tool_name, None)
+        assert tool is not None, f"no MCP tool for lens '{lens.name}'"
+
+
+def test_every_lens_reads_reports_that_exist():
+    for lens in lenses_for(CLI):
+        for report in lens.requires:
+            assert report in REPORTS_BY_NAME, (
+                f"lens '{lens.name}' reads unknown report '{report}'"
+            )
+
+
+@pytest.mark.parametrize("runner", [cli.run_lens, mcp_server._run_lens])
+def test_a_lens_parameter_cannot_shadow_the_surface_plumbing(runner):
+    """A lens's arguments are passed through as ``**params``.
+
+    ``service`` takes a ``name``; a surface whose own parameter was called
+    ``name`` got two of them and crashed on the one command that used it.
+    """
+    own = {
+        p.name
+        for p in inspect.signature(runner).parameters.values()
+        if p.kind is not p.VAR_KEYWORD
+    }
+    for lens in lenses_for(CLI) + lenses_for(MCP):
+        clash = own & {param.name for param in lens.params}
+        assert not clash, (
+            f"lens '{lens.name}' takes {sorted(clash)}, which "
+            f"{runner.__qualname__} uses for itself"
+        )
 
 
 def test_mcp_exposes_exactly_the_mcp_reports():
@@ -343,3 +387,10 @@ def test_cli_table_omits_bgp_peers_local_endpoint_columns():
         ["peer", "local-address", "local-port", "state", "peer-as"],
     )
     assert columns == ["peer", "state", "peer-as"]
+
+
+def test_cli_table_omits_the_port_state_the_cli_ifstats_never_reads():
+    columns = cli._cli_table_columns(
+        "ifstats", ["interface", "oper-state", "down-reason", "in-Kbps", "in-pps"]
+    )
+    assert columns == ["interface", "in-Kbps", "in-pps"]

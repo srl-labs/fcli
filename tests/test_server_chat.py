@@ -677,6 +677,34 @@ def test_chat_service_runs_a_live_report(store):
     assert {row["Node"] for row in payload["rows"]} == set(HOSTS)
 
 
+def test_chat_service_offers_the_lenses_as_tools(store):
+    fabric_store, _devices = store
+    chat = ChatService(fabric_store, client_factory=lambda: None)
+    tools = {t["name"]: t for t in chat._tools}
+    assert {"locate_address", "trace_path", "service_detail"} <= set(tools)
+    assert tools["trace_path"]["parameters"]["required"] == ["source", "destination"]
+    assert "inv_filter" in tools["locate_address"]["parameters"]["properties"]
+
+
+def test_chat_service_runs_a_lens_and_hands_back_its_records(store):
+    fabric_store, _devices = store
+    chat = ChatService(fabric_store, client_factory=lambda: None)
+    payload = json.loads(
+        chat.execute_tool("trace_path", {"source": "leaf1", "destination": "10.1.1.5"})
+    )
+    assert payload["lens"] == "path"
+    assert [r["outcome"] for r in payload["records"]] == ["delivered", "no-neighbor"]
+    assert payload["records"][0]["node"] == "leaf1"
+
+
+def test_chat_service_reports_what_a_lens_cannot_answer(store):
+    fabric_store, _devices = store
+    chat = ChatService(fabric_store, client_factory=lambda: None)
+    assert "needs address" in json.loads(chat.execute_tool("locate_address", {}))["error"]
+    missing = json.loads(chat.execute_tool("service_detail", {"name": "nothing"}))
+    assert "no network-instance matching" in missing["error"]
+
+
 def test_chat_service_honours_field_filter(store):
     fabric_store, _devices = store
     chat = ChatService(fabric_store, client_factory=lambda: None)

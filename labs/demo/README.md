@@ -17,3 +17,7 @@ The topology file was renamed from `3-stage-without-eda.clab.yaml` to `demo.clab
 ## License
 
 The lab configs carry a BSD-3-Clause license (© 2025 Nokia). See the SPDX headers in the source files.
+
+## Adding or testing releases
+
+To see which SR Linux releases are tested, view datamodel changes across releases, or learn how to add and re-record fixtures for a new release, see [`tests/fixtures/releases/MATRIX.md`](../../tests/fixtures/releases/MATRIX.md).

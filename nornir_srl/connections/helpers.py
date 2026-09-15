@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Tuple, Optional
+from typing import Any, Callable, Dict, List, Tuple, Optional
 import json
 import difflib
 import re
@@ -26,6 +26,32 @@ def as_list(value: Any) -> List[Any]:
     if isinstance(value, list):
         return value
     return [value]
+
+
+def instances_by_interface(
+    get: Callable[..., List[Dict[str, Any]]],
+) -> Dict[str, Tuple[str, ...]]:
+    """Map ``<interface>.<index>`` to the network-instances that bind it.
+
+    Only the interface lists are asked for. On the server a Get is served
+    from what is subscribed, and a subscription to the whole
+    network-instance subtree streams every node's BGP RIBs and statistics
+    along with it - enough to fall behind on, and then everything on that
+    node's stream goes stale.
+    """
+    resp = get(paths=["/network-instance[name=*]/interface"], datatype="config")
+    bound: Dict[str, List[str]] = {}
+    for ni in as_list(first_payload(resp).get("network-instance")):
+        if not isinstance(ni, dict):
+            continue
+        ni_name = str(ni.get("name", "") or "")
+        if not ni_name:
+            continue
+        for itf in as_list(ni.get("interface")):
+            name = itf.get("name") if isinstance(itf, dict) else itf
+            if name:
+                bound.setdefault(str(name), []).append(ni_name)
+    return {name: tuple(nis) for name, nis in bound.items()}
 
 
 def bgp_evpn_evis(ni: Any) -> Dict[str, str]:

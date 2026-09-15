@@ -22,6 +22,7 @@ from starlette.staticfiles import StaticFiles
 
 from .. import __version__
 from ..diff import diff_nodes, diff_tables
+from ..lenses import LENSES_BY_NAME, coerce_lens_params, lenses_for
 from ..reports import SERVER, ReportSpec, coerce_params, get_report, reports_for
 from .agent import NO_PROVIDER, ChatService
 from .snapshots import SnapshotStore, comparable
@@ -87,16 +88,17 @@ def table_digest(table: Dict[str, Any]) -> str:
 
 async def table_events(
     store: FabricStore,
-    report: ReportSpec,
-    inv_filter: Optional[Dict[str, str]],
+    name: str,
+    render: Callable[[], Dict[str, Any]],
     interval: float,
     is_disconnected: Callable[[], Awaitable[bool]],
-    params: Optional[Dict[str, Any]] = None,
 ) -> AsyncIterator[bytes]:
-    """Yield server-sent events for *report* until the client goes away.
+    """Yield server-sent events of what *render* makes of the state, until the
+    client goes away.
 
     A table is only pushed when it actually changed, so an idle fabric costs
-    nothing but the periodic keep-alive comment.
+    nothing but the periodic keep-alive comment. *render* is a report's table
+    or a lens's answer; *name* is only for the log.
     """
     loop = asyncio.get_running_loop()
     last_digest = ""
@@ -104,15 +106,20 @@ async def table_events(
     try:
         while not await is_disconnected() and not store.stopping:
             try:
-                table = await anyio.to_thread.run_sync(
-                    store.table, report, inv_filter, params
-                )
+                table = await anyio.to_thread.run_sync(render)
             except (asyncio.CancelledError, GeneratorExit):
                 break
+            except ValueError as exc:
+                # A lens asked something it cannot answer: an ordinary answer
+                # for the browser to show, not a failure to log.
+                payload = json.dumps({"error": str(exc)})
+                yield f"event: error\ndata: {payload}\n\n".encode()
+                await asyncio.sleep(interval)
+                continue
             except Exception as exc:  # noqa: BLE001 - surfaced in the browser
                 if store.stopping:
                     return
-                logger.exception("rendering report '%s' failed", report.name)
+                logger.exception("rendering '%s' failed", name)
                 payload = json.dumps({"error": str(exc)})
                 yield f"event: error\ndata: {payload}\n\n".encode()
                 await asyncio.sleep(interval)
@@ -213,7 +220,10 @@ def create_app(
             {
                 "version": __version__,
                 "topo_name": store.topo_name,
-                "reports": [r.as_dict() for r in reports_for(SERVER)],
+                # The lenses are offered alongside the reports, marked as what
+                # they are: a question with arguments, run rather than streamed.
+                "reports": [r.as_dict() for r in reports_for(SERVER)]
+                + [lens.as_dict() for lens in lenses_for(SERVER)],
                 "chat": {
                     "enabled": chat.enabled(),
                     "providers": chat.providers(),
@@ -227,6 +237,11 @@ def create_app(
 
     async def status(_request: Request) -> Response:
         return JSONResponse(await anyio.to_thread.run_sync(store.status))
+
+    async def network_instances(request: Request) -> Response:
+        inv_filter = parse_kv(request.query_params.get("inv_filter"))
+        found = await anyio.to_thread.run_sync(store.network_instances, inv_filter)
+        return JSONResponse({"network_instances": found})
 
     async def overview(request: Request) -> Response:
         inv_filter = parse_kv(request.query_params.get("inv_filter"))
@@ -243,27 +258,42 @@ def create_app(
             raise KeyError(f"report '{name}' cannot be streamed")
         return report
 
+    def renderer(request: Request) -> Callable[[], Dict[str, Any]]:
+        """What answers the named report or lens, with the request's arguments.
+
+        A lens and a report are asked for the same way and answer in the same
+        shape; only what the server does to answer differs. Raises
+        :class:`KeyError` for a name the server does not offer and
+        :class:`ValueError` for an argument it cannot use.
+        """
+        name = request.path_params["name"]
+        inv_filter = parse_kv(request.query_params.get("inv_filter"))
+        if name in LENSES_BY_NAME and LENSES_BY_NAME[name].on(SERVER):
+            lens = LENSES_BY_NAME[name]
+            params = coerce_lens_params(lens, request.query_params)
+            return lambda: store.lens_table(lens, inv_filter, params)
+        report = streamable_report(name)
+        params = coerce_params(report, request.query_params)
+        return lambda: store.table(report, inv_filter, params)
+
     async def report_once(request: Request) -> Response:
         try:
-            report = streamable_report(request.path_params["name"])
+            render = renderer(request)
         except KeyError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
-        inv_filter = parse_kv(request.query_params.get("inv_filter"))
-        try:
-            params = coerce_params(report, request.query_params)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
-        table = await anyio.to_thread.run_sync(store.table, report, inv_filter, params)
+        try:
+            table = await anyio.to_thread.run_sync(render)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
         return JSONResponse(table)
 
     async def report_stream(request: Request) -> Response:
         try:
-            report = streamable_report(request.path_params["name"])
+            render = renderer(request)
         except KeyError as exc:
             return JSONResponse({"error": str(exc)}, status_code=404)
-        inv_filter = parse_kv(request.query_params.get("inv_filter"))
-        try:
-            params = coerce_params(report, request.query_params)
         except ValueError as exc:
             return JSONResponse({"error": str(exc)}, status_code=400)
         try:
@@ -274,11 +304,10 @@ def create_app(
         return StreamingResponse(
             table_events(
                 store,
-                report,
-                inv_filter,
+                request.path_params["name"],
+                render,
                 interval,
                 request.is_disconnected,
-                params,
             ),
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
@@ -440,6 +469,7 @@ def create_app(
         Route("/api/reports", reports),
         Route("/api/inventory", inventory),
         Route("/api/status", status),
+        Route("/api/network-instances", network_instances),
         Route("/api/overview", overview),
         Route("/api/topology", topology),
         Route("/api/report/{name}", report_once),

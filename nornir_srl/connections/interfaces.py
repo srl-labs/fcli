@@ -1,11 +1,63 @@
 # Network instance related methods extracted from srlinux.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import jmespath
 
+from ..records import (
+    BgpVpnInstance,
+    Interface,
+    Lag,
+    LagMember,
+    NetworkInstance,
+    Subinterface,
+    SubinterfaceState,
+    as_int,
+)
 from .down_reason import ParentReasons
 from .helpers import as_list, bgp_evpn_evis, first_payload
+
+
+def _route_targets(inst: Dict[str, Any], direction: str) -> Tuple[str, ...]:
+    """The ``import`` or ``export`` route-targets of one bgp-vpn instance.
+
+    Where a policy sets them instead of a target list, the policy's name is
+    what there is to show.
+    """
+    policy = inst.get(f"{direction}-policy")
+    if policy:
+        return tuple(str(p) for p in as_list(policy))
+    targets = []
+    for rt in as_list((inst.get("route-target") or {}).get(f"{direction}-rt")):
+        target = rt.get("target") if isinstance(rt, dict) else rt
+        if target:
+            targets.append(str(target).replace("target:", ""))
+    return tuple(sorted(set(targets)))
+
+
+def _bgp_vpn_instances(bgp_vpn: Dict[str, Any]) -> Tuple[BgpVpnInstance, ...]:
+    """The bgp-vpn instances of a network-instance, each with its own targets."""
+    return tuple(
+        BgpVpnInstance(
+            id=as_int(inst.get("id")) or index,
+            import_rts=_route_targets(inst, "import"),
+            export_rts=_route_targets(inst, "export"),
+            rd=str((inst.get("route-distinguisher") or {}).get("rd") or ""),
+        )
+        for index, inst in enumerate(as_list(bgp_vpn.get("bgp-instance")), start=1)
+        if isinstance(inst, dict)
+    )
+
+
+def _prefixes(family: Any) -> Tuple[str, ...]:
+    """The addresses configured under an ``ipv4`` or ``ipv6`` container."""
+    if not isinstance(family, dict):
+        return ()
+    return tuple(
+        str(addr.get("ip-prefix"))
+        for addr in as_list(family.get("address"))
+        if isinstance(addr, dict) and addr.get("ip-prefix")
+    )
 
 
 class NetworkInstanceMixin:
@@ -22,110 +74,109 @@ class NetworkInstanceMixin:
 
     def get_nwi_itf(self, nw_instance: str = "*") -> Dict[str, Any]:
         SUBITF_PATH = "/interface[name=*]/subinterface"
-        path_spec = {
-            "path": f"/network-instance[name={nw_instance}]",
-            "jmespath": '"network-instance"[].{NI:name,oper:"oper-state",type:type,"router-id":protocols.bgp."router-id",\
-                    "vxlan-itf":"vxlan-interface"[].name || `[]` | join(\', \',@), \
-                    evi:"_evi", "In-RT":"In-RT", "Out-RT":"Out-RT",\
-                    itfs: interface[].{Subitf:name,"assoc-ni":"_other_ni","if-oper":"oper-state", "ip-prefix":*.address[]."ip-prefix",\
-                        vlan:vlan.encap."single-tagged"."vlan-id", "mtu":"_mtu"}}',
-            "datatype": "all",
-        }
-        subitf: Dict[str, Any] = {}
+        subitf: Dict[str, Dict[str, Any]] = {}
         resp = self.get(paths=[SUBITF_PATH], datatype="all")
         for itf in as_list(first_payload(resp).get("interface")):
             for si in as_list(itf.get("subinterface")):
-                subif_name = f"{itf.get('name', '')}.{si.get('index', '')}"
-                # A copy, because these details are merged into the interfaces of
-                # every network-instance that binds them and the response itself
-                # may be a cached one the streaming server hands out repeatedly.
-                details = {k: v for k, v in si.items() if k != "index"}
-                details["_mtu"] = (
-                    si.get("l2-mtu") if "l2-mtu" in si else si.get("ip-mtu", "")
-                )
-                subitf[subif_name] = details
+                subitf[f"{itf.get('name', '')}.{si.get('index', '')}"] = si
 
-        resp = self.get(
-            paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
-        )
-        ni_list = as_list(first_payload(resp).get("network-instance"))
+        resp = self.get(paths=[f"/network-instance[name={nw_instance}]"], datatype="all")
+        ni_list = [
+            ni for ni in as_list(first_payload(resp).get("network-instance")) if isinstance(ni, dict)
+        ]
+        # interface -> the network-instances it is bound to, which is how an
+        # irb names the ip-vrf a mac-vrf routes into.
+        bound: Dict[str, List[str]] = {}
         for ni in ni_list:
-            bgp_vpn = ni.get("protocols", {}).get("bgp-vpn", {})
-            in_rts = []
-            out_rts = []
-            bgp_instances = bgp_vpn.get("bgp-instance", [])
-            if isinstance(bgp_instances, dict):
-                bgp_instances = [bgp_instances]
+            for itf in as_list(ni.get("interface")):
+                if isinstance(itf, dict) and itf.get("name"):
+                    bound.setdefault(str(itf["name"]), []).append(str(ni.get("name", "")))
 
-            for inst in bgp_instances:
-                rt_cfg = inst.get("route-target", {})
-
-                if inst.get("import-policy"):
-                    imp_pol = inst.get("import-policy")
-                    if isinstance(imp_pol, str):
-                        imp_pol = [imp_pol]
-                    in_rts.extend(imp_pol)
-                else:
-                    import_rt = rt_cfg.get("import-rt", [])
-                    if isinstance(import_rt, (str, dict)):
-                        import_rt = [import_rt]
-                    for rt in import_rt:
-                        target = rt.get("target") if isinstance(rt, dict) else rt
-                        if target:
-                            in_rts.append(target.replace("target:", ""))
-
-                if inst.get("export-policy"):
-                    exp_pol = inst.get("export-policy")
-                    if isinstance(exp_pol, str):
-                        exp_pol = [exp_pol]
-                    out_rts.extend(exp_pol)
-                else:
-                    export_rt = rt_cfg.get("export-rt", [])
-                    if isinstance(export_rt, (str, dict)):
-                        export_rt = [export_rt]
-                    for rt in export_rt:
-                        target = rt.get("target") if isinstance(rt, dict) else rt
-                        if target:
-                            out_rts.append(target.replace("target:", ""))
-            ni["In-RT"] = ", ".join(sorted(list(set(in_rts))))
-            ni["Out-RT"] = ", ".join(sorted(list(set(out_rts))))
-            # The EVI the service advertises with, which is also what a virtual
-            # ethernet-segment names to say which network-instance it serves.
-            ni["_evi"] = ", ".join(bgp_evpn_evis(ni).values())
-
-            for ni_itf in ni.get("interface", []):
-                ni_itf.update(subitf.get(ni_itf["name"], {}))
-                if ni_itf["name"].startswith("irb"):
-                    ni_itf["_other_ni"] = " ".join(
-                        f"{vrf['name']}"
-                        for vrf in ni_list
-                        if ni_itf["name"]
-                        in [i["name"] for i in vrf.get("interface", [])]
-                        and vrf["name"] != ni["name"]
+        records = []
+        for ni in ni_list:
+            name = str(ni.get("name", ""))
+            protocols = ni.get("protocols") or {}
+            bgp_vpn = protocols.get("bgp-vpn") or {}
+            interfaces = []
+            for itf in as_list(ni.get("interface")):
+                if not isinstance(itf, dict):
+                    continue
+                itf_name = str(itf.get("name", ""))
+                details = subitf.get(itf_name, {})
+                interfaces.append(
+                    Subinterface(
+                        name=itf_name,
+                        oper=str(details.get("oper-state") or itf.get("oper-state") or ""),
+                        prefixes=tuple(
+                            str(p) for p in jmespath.search('*.address[]."ip-prefix"', details) or []
+                        ),
+                        mtu=as_int(details.get("l2-mtu") if "l2-mtu" in details else details.get("ip-mtu")),
+                        vlan=as_int(
+                            jmespath.search('vlan.encap."single-tagged"."vlan-id"', details)
+                        ),
+                        associated=tuple(
+                            other for other in bound.get(itf_name, []) if other != name
+                        )
+                        if itf_name.startswith("irb")
+                        else (),
                     )
-
-        # The projection runs against the normalized list, so a lone
-        # network-instance that gNMI returned unwrapped still yields a row.
-        res = jmespath.search(path_spec["jmespath"], {"network-instance": ni_list})
-        return {"nwi_itfs": res}
+                )
+            records.append(
+                NetworkInstance(
+                    name=name,
+                    type=str(ni.get("type") or ""),
+                    oper=str(ni.get("oper-state") or ""),
+                    router_id=str((protocols.get("bgp") or {}).get("router-id") or ""),
+                    overlays=tuple(
+                        str(v.get("name", ""))
+                        for v in as_list(ni.get("vxlan-interface"))
+                        if isinstance(v, dict)
+                    ),
+                    # The EVI the service advertises with, which is also what a
+                    # virtual ethernet-segment names to say which
+                    # network-instance it serves.
+                    evis=tuple(bgp_evpn_evis(ni).values()),
+                    instances=_bgp_vpn_instances(bgp_vpn),
+                    interfaces=tuple(interfaces),
+                )
+            )
+        return {"nwi_itfs": records}
 
     def get_lag(self, lag_id: str = "*") -> Dict[str, Any]:
-        path_spec = {
-            "path": f"/interface[name=lag{lag_id}]",
-            "jmespath": '"interface"[].{lag:name, oper:"oper-state",mtu:mtu,"min":lag."min-links",desc:description, type:lag."lag-type", speed:lag."lag-speed","stby-sig":ethernet."standby-signaling",\
-                  "lacp-key":lag.lacp."admin-key","lacp-itvl":lag.lacp.interval,"lacp-mode":lag.lacp."lacp-mode","lacp-sysid":lag.lacp."system-id-mac","lacp-prio":lag.lacp."system-priority",\
-                    members:lag.member[].{"member-itf":name, "member-oper":"oper-state","act":lacp."activity"}}',
-            "datatype": "all",
-        }
-        resp = self.get(
-            paths=[path_spec.get("path", "")], datatype=path_spec["datatype"]
-        )
-        lags = as_list(first_payload(resp).get("interface"))
-        for itf in lags:
-            for member in as_list(itf.get("lag", {}).get("member")):
-                member["name"] = str(member.get("name", "")).replace("ethernet", "et")
-        res = jmespath.search(path_spec["jmespath"], {"interface": lags})
-        return {"lag": res}
+        resp = self.get(paths=[f"/interface[name=lag{lag_id}]"], datatype="all")
+        records = []
+        for itf in as_list(first_payload(resp).get("interface")):
+            if not isinstance(itf, dict):
+                continue
+            lag = itf.get("lag") or {}
+            lacp = lag.get("lacp") or {}
+            records.append(
+                Lag(
+                    name=str(itf.get("name") or ""),
+                    oper=str(itf.get("oper-state") or ""),
+                    mtu=as_int(itf.get("mtu")),
+                    min_links=as_int(lag.get("min-links")),
+                    description=str(itf.get("description") or ""),
+                    type=str(lag.get("lag-type") or ""),
+                    speed=as_int(lag.get("lag-speed")),
+                    standby_signaling=str((itf.get("ethernet") or {}).get("standby-signaling") or ""),
+                    lacp_key=as_int(lacp.get("admin-key")),
+                    lacp_interval=str(lacp.get("interval") or ""),
+                    lacp_mode=str(lacp.get("lacp-mode") or ""),
+                    lacp_system_id=str(lacp.get("system-id-mac") or ""),
+                    lacp_priority=as_int(lacp.get("system-priority")),
+                    members=tuple(
+                        LagMember(
+                            name=str(member.get("name") or ""),
+                            oper=str(member.get("oper-state") or ""),
+                            activity=str((member.get("lacp") or {}).get("activity") or ""),
+                        )
+                        for member in as_list(lag.get("member"))
+                        if isinstance(member, dict)
+                    ),
+                )
+            )
+        return {"lag": records}
 
     def get_sum_subitf(self, interface: str = "*") -> Dict[str, Any]:
         path_spec = {
@@ -155,17 +206,19 @@ class NetworkInstanceMixin:
         # with the port, so the reason worth showing lives one level up.
         parents = ParentReasons(self.get)
 
-        results = []
+        records = []
         for itf in itf_list:
-            itf_name = itf.get("name", "")
-            subitfs = []
-            for si in itf.get("subinterface", []):
+            itf_name = str(itf.get("name", ""))
+            subinterfaces = []
+            for si in as_list(itf.get("subinterface")):
+                if not isinstance(si, dict):
+                    continue
                 # Construct proper subinterface name
                 index = si.get("index", "")
-                si_name = si.get("name", "")
+                si_name = str(si.get("name", "") or "")
                 if not si_name:
                     si_name = f"{itf_name}.{index}"
-                elif str(si_name).isdigit():
+                elif si_name.isdigit():
                     si_name = f"{itf_name}.{si_name}"
 
                 # A port held in standby by its ethernet-segment is down on
@@ -174,35 +227,19 @@ class NetworkInstanceMixin:
                 own_reason = si.get("oper-down-reason")
                 oper = parents.state(si.get("oper-state"), si_name, own_reason)
 
-                # Extract interesting fields
-                sub_data = {
-                    "Subitf": si_name,
-                    "type": si.get("type"),
-                    "admin": si.get("admin-state"),
-                    "oper": oper,
-                    "down-reason": (
-                        "" if oper == "up" else parents.resolve(si_name, own_reason)
-                    ),
-                    "ip-mtu": si.get("ip-mtu"),
-                    "vlan": jmespath.search('vlan.encap."single-tagged"."vlan-id"', si),
-                }
+                subinterfaces.append(
+                    SubinterfaceState(
+                        name=si_name,
+                        type=str(si.get("type") or ""),
+                        admin=str(si.get("admin-state") or ""),
+                        oper=oper,
+                        down_reason="" if oper == "up" else parents.resolve(si_name, own_reason),
+                        ip_mtu=as_int(si.get("ip-mtu")),
+                        vlan=as_int(jmespath.search('vlan.encap."single-tagged"."vlan-id"', si)),
+                        ipv4=_prefixes(si.get("ipv4")),
+                        ipv6=_prefixes(si.get("ipv6")),
+                    )
+                )
+            records.append(Interface(name=itf_name, subinterfaces=tuple(subinterfaces)))
 
-                # IPv4 details
-                ipv4 = si.get("ipv4")
-                if ipv4:
-                    sub_data["ipv4"] = [
-                        addr.get("ip-prefix") for addr in ipv4.get("address", [])
-                    ]
-
-                # IPv6 details
-                ipv6 = si.get("ipv6")
-                if ipv6:
-                    sub_data["ipv6"] = [
-                        addr.get("ip-prefix") for addr in ipv6.get("address", [])
-                    ]
-
-                subitfs.append(sub_data)
-
-            results.append({"Itf": itf_name, "subitfs": subitfs})
-
-        return {"subinterface": results}
+        return {"subinterface": records}

@@ -19,6 +19,7 @@ import anyio
 
 from ..connections.routing import BGP_RIB_ROUTE_FAM_ALIASES
 from ..connections.srlinux import CONNECTION_NAME
+from ..lenses import LensSpec, coerce_lens_params, lenses_for
 from ..reports import SERVER, ReportSpec, get_report, reports_for
 from ..rows import pass_filter
 from .cli_guard import CliRejected, check_cli, check_gnmi_path
@@ -128,7 +129,7 @@ _FILTER_PROPS: Dict[str, Any] = {
         "type": "string",
         "description": (
             "Row filter as comma-separated field=regex pairs "
-            "(e.g. 'session-state=established'). Values are case-insensitive regexes."
+            "(e.g. 'state=up'). Values are case-insensitive regexes."
         ),
     },
 }
@@ -187,6 +188,10 @@ def _table_tools() -> Dict[str, ReportSpec]:
             continue
         tools[spec.tool_name] = spec
     return tools
+
+
+def _lens_tools() -> Dict[str, LensSpec]:
+    return {lens.tool_name: lens for lens in lenses_for(SERVER)}
 
 
 def _bgp_rib_report(route_fam: str, route_type: Optional[str]) -> ReportSpec:
@@ -370,6 +375,26 @@ def tool_specs() -> List[Dict[str, Any]]:
                 },
             }
         )
+    # A lens is a question with arguments: the arguments it declares are the
+    # tool's, and the ones it cannot answer without are required.
+    for name, lens in _lens_tools().items():
+        tools.append(
+            {
+                "name": name,
+                "description": lens.description,
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        **{
+                            p.name: {"type": "string", "description": f"{p.help} (e.g. {p.placeholder})"}
+                            for p in lens.params
+                        },
+                        "inv_filter": _FILTER_PROPS["inv_filter"],
+                    },
+                    "required": [p.name for p in lens.params if p.required],
+                },
+            }
+        )
     return tools
 
 
@@ -379,6 +404,9 @@ def system_prompt(context: Optional[Dict[str, Any]], topo_name: Optional[str]) -
         "You are a read-only SR Linux fabric troubleshooting assistant inside fcli.",
         "Prefer live report tools (bgp_peers, lldp_neighbors, ipv4_rib, mac_table, …) "
         "before logging into a node. Those tables are the same data the UI is streaming.",
+        "For 'where is this address', 'how does A reach B' and 'show me this "
+        "service everywhere' use locate_address, trace_path and service_detail: "
+        "each joins several reports across every node in one call.",
         # The reports are all operational state, so a "how is this configured"
         # question has to go to the config datastore or it never gets answered.
         "Report tools show operational state, never configuration. For how "
@@ -460,6 +488,7 @@ class ChatService:
         #: Overrides the reasoning effort the environment configures.
         self.effort = effort
         self._table_tools = _table_tools()
+        self._lens_tools = _lens_tools()
         self._tools = tool_specs()
         #: (when, node, message) once a node refuses JSON-RPC outright.
         self._jsonrpc_down: Optional[Tuple[float, str, str]] = None
@@ -575,11 +604,31 @@ class ChatService:
                 str(arguments.get("path") or ""),
                 str(arguments.get("datatype") or "state"),
             )
+        lens = self._lens_tools.get(name)
+        if lens is not None:
+            return self._run_lens(lens, arguments)
         spec = self._table_tools.get(name)
         if spec is None:
             return json.dumps({"error": f"unknown tool '{name}'"})
         return self._run_table(
             spec, arguments.get("inv_filter"), arguments.get("field_filter")
+        )
+
+    def _run_lens(self, lens: LensSpec, arguments: Dict[str, Any]) -> str:
+        """Ask a lens, and hand the agent its records rather than its table."""
+        try:
+            params = coerce_lens_params(lens, arguments)
+            answer = self.store.lens_table(lens, parse_kv(arguments.get("inv_filter")), params)
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
+        return dumps_truncated(
+            {
+                "lens": lens.name,
+                "title": lens.title,
+                "records": answer["records"],
+                "errors": answer["errors"],
+                "nodes": answer["nodes"],
+            }
         )
 
     def _jsonrpc_unreachable(self) -> Optional[str]:

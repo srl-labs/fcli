@@ -579,6 +579,37 @@ tr.diff-same td {
   color: var(--muted);
 }
 
+/* A row tinted by its verdict - a finding by how bad it is, a BGP session by
+   whether it is up - with the cell that names the verdict emphasised. */
+tr.tone-error td,
+tr.tone-down td {
+  background: color-mix(in srgb, var(--err) 10%, transparent);
+}
+
+tr.tone-warning td {
+  background: color-mix(in srgb, var(--warn) 10%, transparent);
+}
+
+tr.tone-ok td {
+  background: color-mix(in srgb, var(--ok) 8%, transparent);
+}
+
+tr.tone-error td.tone-cell,
+tr.tone-down td.tone-cell {
+  color: var(--err);
+  font-weight: 600;
+}
+
+tr.tone-warning td.tone-cell {
+  color: var(--warn);
+  font-weight: 600;
+}
+
+tr.tone-ok td.tone-cell {
+  color: var(--ok);
+  font-weight: 600;
+}
+
 .errors {
   margin: 10px 18px 0;
   padding: 8px 10px;
@@ -1344,6 +1375,12 @@ th.filtered::after {
   font-weight: 600;
   min-width: 0;
   flex-shrink: 0;
+}
+
+/* A lens detail that is one value rather than pills: a sentence, an address. */
+.bd-detail-value {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .bd-detail-section {
@@ -2317,4 +2354,112 @@ button.pill-jump:focus-visible {
 .chat-form .btn.stop {
   border-color: var(--err);
   color: var(--err);
+}
+
+
+/* ----------------------------------------------------------- path graph */
+
+/* The Path lens drawn as a walk: one column per hop, a box per lookup, an
+   edge to each lookup it leads to. Wide walks scroll sideways. */
+.path-graph-wrap {
+  padding: 12px 16px 16px;
+  overflow: auto;
+}
+
+.path-graph-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 18px;
+  align-items: center;
+  margin-bottom: 10px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.path-graph-summary strong {
+  color: var(--text);
+}
+
+.path-graph {
+  display: block;
+  font-family: inherit;
+}
+
+.path-hop-label {
+  fill: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.path-box {
+  fill: var(--panel);
+  stroke: var(--border);
+  stroke-width: 1.2;
+  rx: 8;
+}
+
+.path-box-up {
+  stroke: var(--ok);
+  stroke-width: 1.8;
+}
+
+.path-box-warn {
+  stroke: var(--warn);
+  stroke-width: 1.8;
+}
+
+.path-box-down {
+  stroke: var(--err);
+  stroke-width: 1.8;
+  stroke-dasharray: 5 3;
+}
+
+.path-box-title {
+  fill: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.path-box-sub {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.path-edge {
+  fill: none;
+  stroke: var(--border);
+  stroke-width: 1.6;
+}
+
+.path-edge-up {
+  stroke: var(--ok);
+}
+
+.path-edge-down {
+  stroke: var(--err);
+  stroke-dasharray: 5 3;
+}
+
+.path-edge-label {
+  fill: var(--muted);
+  font-size: 10px;
+}
+
+.path-edge-label-bg {
+  fill: var(--bg);
+  opacity: 0.9;
+}
+
+.path-arrow {
+  fill: var(--border);
+}
+
+.path-arrow-up {
+  fill: var(--ok);
+}
+
+.path-arrow-down {
+  fill: var(--err);
 }
