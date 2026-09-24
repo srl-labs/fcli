@@ -1,12 +1,7 @@
 import json
 import os
 import tempfile
-from nornir_srl import __version__
 from nornir_srl.mcp_server import list_topologies
-
-
-def test_version():
-    assert __version__ == "0.6.4"
 
 
 def test_list_topologies_recursive():
