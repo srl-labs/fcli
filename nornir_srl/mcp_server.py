@@ -1074,6 +1074,44 @@ def _run_lens(lens: str, inv_filter: Optional[str] = None, **params: Any) -> str
 
 
 @mcp.tool()
+def fabric_summary(inv_filter: Optional[str] = None) -> str:
+    """Executive fabric briefing: what it is built of, what it carries, and active incidents.
+
+    The first tool to call to understand the fabric topology, roles and health before
+    investigating specific tables or incidents.
+
+    Returns a JSON object with:
+        summary: The fabric in 3-4 briefing sentences.
+        nodes: Total number of network devices.
+        roles: Count of devices by role (spine, leaf, dcgw, core).
+        services: Total number of active services.
+        incidents: Open incident counts (errors, warnings, findings) and worst incident.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs. Omit to target all nodes.
+    """
+    from .checks import REQUIRED_REPORTS
+    from .server.topology import summarize_fabric
+
+    i_filter, _ = _parse_filters(inv_filter, None)
+    nornir = get_nornir()
+    target = nornir.filter(**i_filter) if i_filter else nornir
+    reports = tuple(dict.fromkeys(REQUIRED_REPORTS + ("sys_info", "es")))
+    state = collect_lens_state(target, reports)
+    result = summarize_fabric(state)
+    return json.dumps(
+        {
+            "summary": result["summary"],
+            "nodes": result["nodes"],
+            "roles": result["roles"],
+            "services": result["services"],
+            "incidents": result["incidents"],
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
 def fabric_incidents(inv_filter: Optional[str] = None) -> str:
     """Every check's findings grouped by root cause: the first tool to call for 'what is wrong'.
 

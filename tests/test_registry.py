@@ -151,7 +151,7 @@ def _cli_commands():
 
 #: Commands that are neither a report nor a lens: they run the fabric, or run
 #: over a report, rather than reading one.
-NON_REPORT_COMMANDS = {"server", "diff"}
+NON_REPORT_COMMANDS = {"server", "diff", "summary"}
 
 
 def test_cli_exposes_exactly_the_cli_reports():

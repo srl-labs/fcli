@@ -37,7 +37,12 @@ from __future__ import annotations
 
 import ipaddress
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from ..checks import Finding
+    from ..fabric import FabricState
+    from ..incidents import Incident
 
 from ..aliases import alias_index, resolve, tail
 from ..connections.down_reason import STANDBY_STATE, is_intent, root_reason
@@ -1356,6 +1361,191 @@ def summarize(graph: Dict[str, Any]) -> List[str]:
     elif "incidents" in graph:
         lines.append("No findings: every check passes")
     return lines
+
+
+def facts_from_fabric_state(state: FabricState) -> List[NodeFacts]:
+    """Build NodeFacts for every node from a collected FabricState."""
+    facts = []
+    all_nodes = dict.fromkeys(
+        list(state.hostnames)
+        + [n for rep in state.reports.values() for n in rep]
+        + [n for (_, n) in state.errors]
+    )
+
+    for name in all_nodes:
+        hostname = state.hostnames.get(name, name)
+        sys_list = state.reports.get("sys_info", {}).get(name, [])
+        sys_info = sys_list[0] if sys_list else None
+        system_name = (
+            getattr(sys_info, "host_name", None)
+            or (sys_info.get("host_name") if isinstance(sys_info, dict) else "")
+            or ""
+        )
+        platform = (
+            getattr(sys_info, "type", None)
+            or getattr(sys_info, "chassis_type", None)
+            or (sys_info.get("type") or sys_info.get("chassis_type") or sys_info.get("chassis-type") if isinstance(sys_info, dict) else "")
+            or ""
+        )
+
+        mac_vrfs, ip_vrfs, stitched = 0, 0, 0
+        services: List[str] = []
+        attachments: List[Attachment] = []
+        nis = state.reports.get("ni", {}).get(name, [])
+        has_state = bool(nis)
+        for ni in nis:
+            ntype = getattr(ni, "type", None) or (ni.get("type") if isinstance(ni, dict) else "")
+            nname = getattr(ni, "name", None) or (ni.get("name") if isinstance(ni, dict) else "")
+            if ntype == "mac-vrf":
+                mac_vrfs += 1
+                kind = "bridged"
+            elif ntype in ("ip-vrf", "vrf") and nname != "mgmt":
+                ip_vrfs += 1
+                kind = "routed"
+            else:
+                continue
+            services.append(str(nname))
+            itfs = (
+                getattr(ni, "interfaces", None)
+                or (ni.get("interfaces") if isinstance(ni, dict) else ())
+                or ()
+            )
+            for itf in itfs:
+                itf_name = getattr(itf, "name", None) or (itf.get("name") if isinstance(itf, dict) else str(itf))
+                if not any(itf_name.startswith(vp) for vp in _VIRTUAL_PORTS):
+                    port = itf_name.rsplit(".", 1)[0]
+                    oper = getattr(itf, "oper", None) or (itf.get("oper") if isinstance(itf, dict) else "")
+                    attachments.append(
+                        Attachment(
+                            subinterface=itf_name,
+                            port=port,
+                            service=str(nname),
+                            kind=kind,
+                            oper_state=oper,
+                        )
+                    )
+            instances = (
+                getattr(ni, "instances", None)
+                or (ni.get("instances") if isinstance(ni, dict) else ())
+                or ()
+            )
+            if len(instances) >= 2:
+                stitched += 1
+
+        adjacencies: List[Adjacency] = []
+        for itf in state.reports.get("lldp", {}).get(name, []):
+            port = getattr(itf, "name", None) or getattr(itf, "interface", None) or (itf.get("name") or itf.get("interface") if isinstance(itf, dict) else "")
+            if not any(port.startswith(oob) for oob in _OUT_OF_BAND):
+                neighbors = getattr(itf, "neighbors", None) or (itf.get("neighbors") if isinstance(itf, dict) else None)
+                if neighbors is not None:
+                    for nbr in neighbors:
+                        peer = getattr(nbr, "system_name", None) or getattr(nbr, "neighbor", None) or (nbr.get("system_name") or nbr.get("neighbor") if isinstance(nbr, dict) else "")
+                        peer_port = getattr(nbr, "port_id", None) or getattr(nbr, "neighbor_interface", None) or (nbr.get("port_id") or nbr.get("neighbor_interface") if isinstance(nbr, dict) else "")
+                        if peer:
+                            adjacencies.append(
+                                Adjacency(
+                                    local_port=port,
+                                    peer=str(peer),
+                                    peer_port=str(peer_port),
+                                    oper_state="up",
+                                )
+                            )
+                else:
+                    peer = getattr(itf, "neighbor", None) or (itf.get("neighbor") if isinstance(itf, dict) else "")
+                    peer_port = getattr(itf, "neighbor_interface", None) or (itf.get("neighbor_interface") if isinstance(itf, dict) else "")
+                    if peer:
+                        adjacencies.append(
+                            Adjacency(
+                                local_port=port,
+                                peer=str(peer),
+                                peer_port=str(peer_port),
+                                oper_state="up",
+                            )
+                        )
+
+        segments: Dict[str, Segment] = {}
+        for es in state.reports.get("es", {}).get(name, []):
+            es_itf = getattr(es, "interface", None) or (es.get("interface") if isinstance(es, dict) else "")
+            es_name = getattr(es, "name", None) or (es.get("name") if isinstance(es, dict) else "")
+            es_esi = getattr(es, "esi", None) or (es.get("esi") if isinstance(es, dict) else "")
+            if es_itf:
+                segments[str(es_itf)] = Segment(name=str(es_name), esi=str(es_esi))
+
+        connected = not any(n == name for (_, n) in state.errors)
+        error = next((err for (rep, n), err in state.errors.items() if n == name), None)
+
+        facts.append(
+            NodeFacts(
+                name=name,
+                hostname=hostname,
+                system_name=system_name,
+                platform=platform,
+                mac_vrfs=mac_vrfs,
+                ip_vrfs=ip_vrfs,
+                stitched=stitched,
+                has_state=has_state or bool(adjacencies),
+                connected=connected,
+                error=error,
+                adjacencies=adjacencies,
+                attachments=attachments,
+                segments=segments,
+                services=services,
+            )
+        )
+    return facts
+
+
+def summarize_fabric(
+    state: FabricState,
+    *,
+    findings: Optional[List[Finding]] = None,
+    incidents: Optional[List[Incident]] = None,
+) -> Dict[str, Any]:
+    """Compute topology and executive briefing summary from a collected FabricState."""
+    facts = facts_from_fabric_state(state)
+    graph = build_topology(facts)
+    if findings is None:
+        from ..checks import run_checks  # noqa: PLC0415
+        findings = run_checks(state)
+    if incidents is None:
+        from ..acks import mark as mark_acknowledged  # noqa: PLC0415
+        from ..incidents import correlate  # noqa: PLC0415
+        incidents = mark_acknowledged(correlate(findings, state), state.acknowledged)
+
+    from ..incidents import locate  # noqa: PLC0415
+    annotate_health(
+        graph,
+        locate(findings, state),
+        incidents,
+        acked=state.acknowledged,
+    )
+    lines = summarize(graph)
+    graph["summary"] = lines
+
+    devices = [n for n in graph.get("nodes", []) if n.get("role") in _ROLE_NOUNS]
+    roles = graph.get("roles", {})
+    services = {name for n in devices for name in n.get("services", [])}
+    open_incidents = [i for i in incidents if not getattr(i, "acknowledged", False)]
+    errors = sum(1 for i in open_incidents if getattr(i, "severity", "") == "error")
+    warnings = sum(1 for i in open_incidents if getattr(i, "severity", "") == "warning")
+    worst = open_incidents[0].title if open_incidents else ""
+
+    return {
+        "summary": lines,
+        "nodes": len(devices),
+        "roles": roles,
+        "services": len(services),
+        "incidents": {
+            "open": len(open_incidents),
+            "errors": errors,
+            "warnings": warnings,
+            "findings": len(findings),
+            "worst": worst,
+            "acknowledged": len(incidents) - len(open_incidents),
+        },
+        "graph": graph,
+    }
+
 
 # --------------------------------------------------------------------------- #
 # virtual ethernet-segments: L3 aliasing in a routed service

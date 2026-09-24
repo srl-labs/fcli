@@ -1494,6 +1494,12 @@ INCIDENT_COLUMNS: Tuple[Column, ...] = (
     Column("Severity", "severity"),
     Column("Incident", "title"),
     Column("Root cause", lambda i: i.root.check),
+    Column(
+        "Scope",
+        lambda i: "fabric-wide"
+        if i.kind == "pattern"
+        else (f"{len(i.nodes)} nodes" if len(i.nodes) > 1 else "1 node"),
+    ),
     Column("Findings", lambda i: len(i.findings)),
     Column("Ack", lambda i: "acknowledged" if i.acknowledged else ""),
     Column("Explanation", "explanation"),

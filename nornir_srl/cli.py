@@ -1,13 +1,15 @@
 import csv
+import glob
 import io
 import json
-import tempfile
-from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Optional, Callable
-from enum import Enum
 import logging
 import os
+import sys
+import tempfile
 import time
+from enum import Enum
+from pathlib import Path
+from typing import Any, Callable, Dict, FrozenSet, List, Optional
 
 import typer
 import yaml  # type: ignore
@@ -210,6 +212,7 @@ def print_table(
     per_node: List[NodeRows],
     *,
     box_type: Optional[str] = None,
+    node_prefix: Optional[str] = None,
 ) -> None:
     """Render the extracted rows as a rich table, one section per node."""
     console = Console(theme=TABLE_THEME)
@@ -219,14 +222,24 @@ def print_table(
     for col in columns:
         table.add_column(col, no_wrap=False)
 
+    if not node_prefix and per_node:
+        names = [n.node for n in per_node if n.node]
+        if len(names) > 1 and all(n.startswith("clab-") for n in names):
+            common = os.path.commonprefix(names)
+            if "-" in common:
+                node_prefix = common.rsplit("-", 1)[0] + "-"
+
     for node in per_node:
         first = True
+        node_display = node.node
+        if node_prefix and node_display.startswith(node_prefix):
+            node_display = node_display[len(node_prefix):]
         for row in node.rows:
             # Fields a row inherited from its parent item are shown once, so a
             # parent with many sub-rows reads as one entry spanning them.
             cells = row.cells(group=True)
             values = [_cell(cells.get(col, "")) for col in columns]
-            table.add_row(node.node if first else "", *values)
+            table.add_row(node_display if first else "", *values)
             first = False
         table.add_section()
 
@@ -245,6 +258,7 @@ def print_report(
     i_filter: Optional[Dict] = None,
     output: OutputFormat = OutputFormat.TABLE,
     table: Optional[ReportTable] = None,
+    node_prefix: Optional[str] = None,
 ) -> None:
     columns, per_node = extract(
         result.name,
@@ -271,7 +285,7 @@ def print_report(
             title += "\n[red]Failed hosts:" + str(failed_hosts)
         if not columns:
             logger.debug("No data returned for %s: %s", result.name, result)
-        print_table(title, columns, per_node, box_type=box_type)
+        print_table(title, columns, per_node, box_type=box_type, node_prefix=node_prefix)
     else:
         rows = [
             {"Node": node.node, **row.values} for node in per_node for row in node.rows
@@ -279,7 +293,19 @@ def print_report(
         print_structured(columns, rows, output)
 
 
-# ------------------------- root callback -------------------------
+def _is_help_requested() -> bool:
+    """True if --help or -h was passed on the command line or via runner invoke."""
+    if any(arg in sys.argv for arg in ("--help", "-h")):
+        return True
+    import inspect
+
+    frame = inspect.currentframe()
+    while frame:
+        args = frame.f_locals.get("args")
+        if isinstance(args, (list, tuple)) and any(a in ("--help", "-h") for a in args):
+            return True
+        frame = frame.f_back
+    return False
 
 
 @app.callback()
@@ -358,14 +384,35 @@ def main(
 ) -> None:
     setup_logging(log_level.value, str(log_file) if log_file else None)
     ctx.ensure_object(dict)
+    if _is_help_requested():
+        return
+
+    lab_name = None
+    node_prefix = None
+    if topo_file is None and cfg is None:
+        topo_env = os.environ.get("FCLI_TOPO") or os.environ.get("CLAB_TOPO")
+        if topo_env and Path(topo_env).exists():
+            topo_file = Path(topo_env)
+        else:
+            clab_files = [Path(f) for f in glob.glob("*.clab.y*ml") if os.path.isfile(f)]
+            if len(clab_files) == 1:
+                topo_file = clab_files[0]
+                logger.debug("Auto-discovered containerlab topology: %s", topo_file)
+            elif len(clab_files) > 1:
+                non_examples = [f for f in clab_files if not f.name.startswith("example.")]
+                if len(non_examples) == 1:
+                    topo_file = non_examples[0]
+                    logger.debug("Auto-discovered containerlab topology: %s", topo_file)
+
     if topo_file:
         try:
             with open(topo_file, "r") as f:
                 topo = yaml.safe_load(os.path.expandvars(f.read()))
         except Exception as e:
-            typer.echo(f"Failed to load topology file {topo_file}: {e}")
+            typer.echo(f"Failed to load topology file {topo_file}: {e}", err=True)
             raise typer.Exit(1)
-        lab_name = topo["name"]
+        lab_name = topo.get("name", "")
+        node_prefix = clab.node_prefix(topo)
         hosts = clab.srl_hosts(topo)
         logger.debug(
             "topology '%s' from %s holds %d SR Linux node(s): %s",
@@ -397,23 +444,43 @@ def main(
                         }
                     }
                 )
-                fabric = InitNornir(**conf)
+                try:
+                    fabric = InitNornir(**conf)
+                except Exception as exc:
+                    typer.echo(f"Error initializing inventory from topology '{topo_file}': {exc}", err=True)
+                    raise typer.Exit(1)
     else:
         if cfg is None:
             cfg = Path("nornir_config.yaml")
         if not cfg.exists():
             typer.echo(
-                f"Config file '{cfg}' does not exist. Provide -c/--cfg or -t/--topo-file."
+                f"Config file '{cfg}' does not exist. Provide -c/--cfg or -t/--topo-file.",
+                err=True,
             )
             raise typer.Exit(1)
         logger.debug("initializing Nornir from %s", cfg)
-        fabric = InitNornir(config_file=str(cfg))
-        _apply_tls_options(fabric, cert_file, skip_verify, tls_server_name)
+        try:
+            fabric = InitNornir(config_file=str(cfg))
+            _apply_tls_options(fabric, cert_file, skip_verify, tls_server_name)
+        except Exception as exc:
+            typer.echo(f"Error loading inventory from '{cfg}': {exc}", err=True)
+            typer.echo("Tip: Provide -t/--topo-file <topo.clab.yml> or -c/--cfg <nornir_config.yaml> with a valid inventory.", err=True)
+            raise typer.Exit(1)
 
     i_filter = (
         {k: v for k, v in (f.split("=") for f in inv_filter)} if inv_filter else {}
     )
-    target: Nornir = fabric.filter(**i_filter) if i_filter else fabric
+    resolved_filter = {}
+    for k, v in i_filter.items():
+        attr = "name" if k == "node" else k
+        val = v
+        if attr == "name" and node_prefix and not val.startswith(node_prefix):
+            prefixed = f"{node_prefix}{val}"
+            if prefixed in fabric.inventory.hosts:
+                val = prefixed
+        resolved_filter[attr] = val
+
+    target: Nornir = fabric.filter(**resolved_filter) if resolved_filter else fabric
     logger.debug(
         "inventory holds %d node(s), %d selected by filter %s: %s",
         len(fabric.inventory.hosts),
@@ -422,11 +489,12 @@ def main(
         ", ".join(sorted(target.inventory.hosts)),
     )
     ctx.obj["target"] = target
-    ctx.obj["i_filter"] = i_filter
+    ctx.obj["i_filter"] = resolved_filter
     ctx.obj["box_type"] = box_type.upper() if box_type else None
     ctx.obj["output"] = output
     ctx.obj["log_level"] = log_level.value
     ctx.obj["topo_name"] = lab_name if topo_file else None
+    ctx.obj["node_prefix"] = node_prefix
 
 
 # ------------------------- command helpers -------------------------
@@ -510,6 +578,7 @@ def print_table_shape(
     *,
     box_type: Optional[str] = None,
     output: OutputFormat = OutputFormat.TABLE,
+    node_prefix: Optional[str] = None,
 ) -> None:
     """Print a table in the shape :func:`report_table` returns."""
     # A comparison of two nodes has no Node column: it is the one thing the
@@ -535,6 +604,7 @@ def print_table_shape(
         columns,
         list(per_node.values()),
         box_type=box_type,
+        node_prefix=node_prefix,
     )
 
 
@@ -544,6 +614,7 @@ def print_findings(
     box_type: Optional[str] = None,
     f_filter: Optional[Dict[str, str]] = None,
     output: OutputFormat = OutputFormat.TABLE,
+    node_prefix: Optional[str] = None,
 ) -> None:
     """Print what the checks found, worst node first."""
     columns = [c for c in CHECKS_COLUMNS if c != "Node"]
@@ -567,6 +638,7 @@ def print_findings(
         columns,
         list(per_node.values()),
         box_type=box_type,
+        node_prefix=node_prefix,
     )
 
 
@@ -592,6 +664,7 @@ def run_report(
         i_filter=ctx.obj["i_filter"],
         output=ctx.obj["output"],
         table=spec.table_for(params),
+        node_prefix=ctx.obj.get("node_prefix"),
     )
 
 
@@ -625,6 +698,7 @@ def print_lens(
     output: OutputFormat = OutputFormat.TABLE,
     errors: Optional[List[str]] = None,
     subtitle: str = "",
+    node_prefix: Optional[str] = None,
 ) -> None:
     """Print what a lens answered, one section per node."""
     for error in errors or []:
@@ -660,7 +734,7 @@ def print_lens(
     title = f"[bold]{spec.title}[/bold]"
     if subtitle:
         title += f"\n{subtitle}"
-    print_table(title, columns, sections, box_type=box_type)
+    print_table(title, columns, sections, box_type=box_type, node_prefix=node_prefix)
 
 
 def run_lens(
@@ -707,6 +781,7 @@ def run_lens(
             for (report, node), error in sorted(state.errors.items())
         ],
         subtitle=subtitle,
+        node_prefix=ctx.obj.get("node_prefix"),
     )
 
 
@@ -1149,6 +1224,7 @@ def checks(
             else {}
         ),
         output=ctx.obj["output"],
+        node_prefix=ctx.obj.get("node_prefix"),
     )
     # A fabric with something wrong with it exits non-zero, so this is usable
     # as the last step of a deployment as well as by hand.
@@ -1157,6 +1233,72 @@ def checks(
 
 
 # ------------------------- lenses -------------------------
+
+
+@app.command()
+def summary(
+    ctx: typer.Context,
+) -> None:
+    """Displays an executive summary of the fabric topology, services and health"""
+    from .checks import REQUIRED_REPORTS
+    from .server.topology import _ROLE_NOUNS, summarize_fabric
+
+    target = ctx.obj["target"]
+    reports = tuple(dict.fromkeys(REQUIRED_REPORTS + ("sys_info", "es")))
+    state = collect_lens_state(target, reports)
+    result = summarize_fabric(state)
+
+    output = ctx.obj["output"]
+    if output in (OutputFormat.JSON, OutputFormat.YAML):
+        print_structured(
+            ["summary", "nodes", "roles", "services", "incidents"],
+            [
+                {
+                    "summary": result["summary"],
+                    "nodes": result["nodes"],
+                    "roles": result["roles"],
+                    "services": result["services"],
+                    "incidents": result["incidents"],
+                }
+            ],
+            output,
+        )
+    else:
+        console = Console(theme=TABLE_THEME)
+        console.print("\n[bold]Fabric Summary[/bold]")
+        console.print("─" * 40)
+        for line in result["summary"]:
+            console.print(f"• {line}")
+        console.print("")
+
+        graph = result.get("graph", {})
+        devices = [n for n in graph.get("nodes", []) if n.get("role") in _ROLE_NOUNS]
+        if devices:
+            table = Table(title="Nodes & Roles", highlight=True, box=_box(ctx.obj["box_type"]))
+            table.add_column("Node", no_wrap=True)
+            table.add_column("Role")
+            table.add_column("Platform")
+            table.add_column("Services")
+            table.add_column("Peers")
+            table.add_column("Status")
+
+            node_prefix = ctx.obj.get("node_prefix")
+            for dev in sorted(devices, key=lambda d: (d.get("layer", 0), d.get("name", "")), reverse=True):
+                name = dev.get("name", "")
+                disp = name
+                if node_prefix and disp.startswith(node_prefix):
+                    disp = disp[len(node_prefix):]
+                role = dev.get("role", "")
+                plat = dev.get("platform", "") or "-"
+                srv_count = str(len(dev.get("services", [])))
+                peer_count = str(len(dev.get("peers", [])))
+                status = "connected" if dev.get("connected", True) else "[err]down[/err]"
+                table.add_row(disp, role, plat, srv_count, peer_count, status)
+
+            console.print(table)
+
+    if result["incidents"]["errors"] > 0:
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -1183,6 +1325,7 @@ def incidents(
             for (report, node), error in sorted(state.errors.items())
         ],
         subtitle=f"{sum(len(i.findings) for i in found)} finding(s) in {len(found)} incident(s)",
+        node_prefix=ctx.obj.get("node_prefix"),
     )
     # Like 'checks': a fabric with something wrong with it exits non-zero.
     if any(i.severity == "error" for i in found):

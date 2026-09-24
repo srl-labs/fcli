@@ -404,6 +404,8 @@ def system_prompt(context: Optional[Dict[str, Any]], topo_name: Optional[str]) -
         "You are a read-only SR Linux fabric troubleshooting assistant inside fcli.",
         "Prefer live report tools (bgp_peers, lldp_neighbors, ipv4_rib, mac_table, …) "
         "before logging into a node. Those tables are the same data the UI is streaming.",
+        "For an executive overview of the fabric topology, roles and health, "
+        "start with fabric_summary.",
         "For 'what is wrong', a triage, or any question about the fabric's health, "
         "start with fabric_incidents: it groups every check's findings by root "
         "cause, so a link down arrives together with the BGP, BFD and IGP sessions "
