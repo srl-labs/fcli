@@ -69,8 +69,15 @@ def test_check_names_are_unique():
     assert len({c.name for c in CHECKS}) == len(CHECKS)
 
 
+#: Checks that read the server's timeline rather than a report.
+TIMELINE_CHECKS = {"flapping"}
+
+
 def test_every_check_reads_reports_that_exist():
     for check in CHECKS:
+        if check.name in TIMELINE_CHECKS:
+            assert not check.requires
+            continue
         assert check.requires, f"{check.name} reads no report"
         for report in check.requires:
             assert report in REPORTS_BY_NAME, (
@@ -746,3 +753,29 @@ def test_a_check_that_raises_is_a_finding_rather_than_a_crash(monkeypatch):
 def test_checks_tolerate_a_report_that_came_back_empty():
     state = fabric(bgp_peers={"leaf1": []}, subif={"leaf1": []}, ifstats={"leaf1": []})
     assert run_checks(state) == []
+
+
+def test_a_containerlab_node_s_dropped_packets_are_not_a_finding():
+    """A veth discards IPv6 multicast and the like that a real port forwards."""
+    stats = InterfaceStats("ethernet-1/1", in_discards=3, in_errors=1)
+    state = fabric(ifstats={"leaf1": [stats], "leaf2": [stats]})
+    state.containerlab = {"leaf1"}
+    assert [row["Node"] for row in run("itf_errors", state)] == ["leaf2", "leaf2"]
+
+
+def test_nodes_that_elect_different_designated_forwarders_are_an_error():
+    """Two leaves each electing themselves both forward on a single-active segment."""
+    def segment(df):
+        candidates = tuple(Candidate(a, designated=a == df) for a in ("192.0.2.15", "192.0.2.16"))
+        return EthernetSegment("vES", "00:01:ff", "virtual", "single-active", "up", associations=(Association("ipvrf-1", candidates),))
+
+    state = fabric(es={"leaf5": [segment("192.0.2.15")], "leaf6": [segment("192.0.2.16")]})
+    rows = run("es_df", state)
+    assert [(r["Node"], r["Subject"]) for r in rows] == [("leaf5", "vES/ipvrf-1"), ("leaf6", "vES/ipvrf-1")]
+    assert rows[0]["Detail"] == (
+        "nodes disagree on the designated forwarder: "
+        "192.0.2.15 according to leaf5; 192.0.2.16 according to leaf6"
+    )
+
+    agree = fabric(es={"leaf5": [segment("192.0.2.15")], "leaf6": [segment("192.0.2.15")]})
+    assert run("es_df", agree) == []

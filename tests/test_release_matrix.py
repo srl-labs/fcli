@@ -62,6 +62,13 @@ EXPECTED_MISSING_PATHS: Dict[str, Set[Tuple[str, str]]] = {
     "26.7.1": set(_L3VPN_MISSING),
 }
 
+#: Reports added after the intent-based-ansible-lab recordings were taken.
+#: They are recorded on 26.3.1 from the DCI validated design instead (the
+#: ``leaf1`` and ``dcgw1`` fixtures, which also exercise IS-IS on a gateway);
+#: re-recording the four releases with ``tests/system/matrix.sh`` picks them
+#: up there too, after which this can go.
+NOT_IN_OLDER_RECORDINGS = frozenset({"bfd", "isis", "ospf", "resources", "components", "transceivers"})
+
 
 @lru_cache(maxsize=None)
 def _recording(path: str) -> Recording:
@@ -102,6 +109,8 @@ def test_fixtures_cover_the_report_registry() -> None:
     for path in recording_paths():
         recording = _recording(str(path))
         missing = expected - set(recording.reports)
+        if recording.node.startswith("clab-4l2s-"):
+            missing -= NOT_IN_OLDER_RECORDINGS
         assert not missing, (
             f"{recording.release}/{recording.node} has no recording for "
             f"{sorted(missing)} - re-record it with "

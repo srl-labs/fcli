@@ -19,6 +19,7 @@ from .neighbor_discovery import NeighborDiscoveryMixin
 from .subscription import GnmiSubscription
 from .system import SystemMixin
 from .ifstats import InterfaceStatsMixin
+from .health import HealthMixin
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +97,7 @@ class SrLinux(
     NeighborDiscoveryMixin,
     SystemMixin,
     InterfaceStatsMixin,
+    HealthMixin,
 ):
     def open(
         self,

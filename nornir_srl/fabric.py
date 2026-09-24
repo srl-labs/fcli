@@ -17,9 +17,10 @@ the state already, and builds a :class:`FabricState` out of its gNMI streams.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from .aliases import alias_index
+from .clab import CONTAINERLAB_GROUP
 
 if TYPE_CHECKING:  # pragma: no cover - import cycle at runtime, types only
     from nornir.core import Nornir
@@ -43,6 +44,22 @@ class FabricState:
     hostnames: Dict[str, str] = field(default_factory=dict)
     #: (report, node) -> why that payload is missing.
     errors: Dict[Tuple[str, str], str] = field(default_factory=dict)
+    #: What changed in the fabric lately, oldest first - the
+    #: :class:`~nornir_srl.changes.Change` records of a surface that keeps a
+    #: timeline. Only the live server does; a one-shot reading has no past,
+    #: and what reads this finds it empty there.
+    changes: List[Any] = field(default_factory=list)
+    #: The timeline itself, where the surface keeps one: what answers "what
+    #: changed since ..." and "what drifted from the baseline". ``None``
+    #: everywhere but on the live server.
+    history: Optional[Any] = None
+    #: The nodes that run on containerlab rather than hardware, where some
+    #: counters mean something else: the kernel drops packets on a veth that
+    #: a real port would have forwarded.
+    containerlab: Set[str] = field(default_factory=set)
+    #: The findings someone has acknowledged, as (check, node, subject) -
+    #: kept by the live server; see :mod:`nornir_srl.acks`.
+    acknowledged: Set[Tuple[str, str, str]] = field(default_factory=set)
 
     def nodes(self, report: str) -> List[str]:
         """The nodes *report* was collected from, in inventory order."""
@@ -124,6 +141,18 @@ def as_int(value: Any) -> Optional[int]:
         return None
 
 
+def containerlab_nodes(hosts: Any) -> Set[str]:
+    """The hosts of a Nornir inventory that are containerlab nodes."""
+    found = set()
+    for name, host in hosts.items():
+        try:
+            if host.has_parent_group(CONTAINERLAB_GROUP):
+                found.add(name)
+        except Exception:  # noqa: BLE001 - a host without groups is not one
+            continue
+    return found
+
+
 def collect_fabric_state(
     target: "Nornir", reports: Sequence[str]
 ) -> FabricState:
@@ -142,6 +171,7 @@ def collect_fabric_state(
     state.hostnames = {
         name: (host.hostname or name) for name, host in target.inventory.hosts.items()
     }
+    state.containerlab = containerlab_nodes(target.inventory.hosts)
     for report_name in reports:
         spec = get_report(report_name)
 

@@ -338,7 +338,7 @@ def test_hosts_carry_the_prefixed_name_and_platform():
     assert hosts["clab-lab1-leaf1"] == {
         "hostname": "clab-lab1-leaf1",
         "platform": "srlinux",
-        "groups": ["srl"],
+        "groups": ["srl", "containerlab"],
         "data": {},
     }
 
@@ -359,3 +359,13 @@ def test_a_cert_file_is_passed_to_the_connection():
         "srlinux"
     ]
     assert options["extras"]["path_cert"] == "/tmp/ca.pem"
+
+
+def test_every_node_of_a_topology_is_in_the_containerlab_group():
+    from nornir_srl.clab import CONTAINERLAB_GROUP, srl_groups, srl_hosts
+
+    topo = {"name": "lab", "topology": {"nodes": {"leaf1": {"kind": "nokia_srlinux", "labels": {"role": "leaf"}}}}}
+    host = srl_hosts(topo)["clab-lab-leaf1"]
+    assert CONTAINERLAB_GROUP in host["groups"]
+    assert host["data"] == {"role": "leaf"}, "the group adds no labels"
+    assert srl_groups()[CONTAINERLAB_GROUP] == {}

@@ -7,13 +7,18 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from nornir.core import Nornir
 
-from ..checks import CHECKS_COLUMNS, CHECKS_REPORT, FabricState, REQUIRED_REPORTS, run_checks
+from ..checks import CHECKS_COLUMNS, CHECKS_REPORT, FabricState, Finding, REQUIRED_REPORTS, run_checks
+from ..acks import AckStore, finding_key, mark as mark_acknowledged
+from ..changes import INFO, Change
+from ..incidents import Incident, correlate, locate
 from ..connections.down_reason import STANDBY_STATE, is_intent
 from ..connections.srlinux import CONNECTION_NAME
+from ..fabric import containerlab_nodes
 from ..connections.layer2 import stamp_underlay_sites
 from ..lenses import LensSpec
 from ..records import as_dict
@@ -21,7 +26,8 @@ from ..reports import ReportSpec, SubscriptionSpec, get_report
 from ..rows import cell, clean_columns, flatten, merge_fields, sub_item_keys
 from .devices import CachedDevice, RecordingDevice
 from .stream import HostStream
-from .topology import build_topology, node_facts
+from .timeline import Reading, Timeline, Watcher
+from .topology import annotate_aliasing, annotate_health, build_topology, node_facts
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +46,9 @@ class FabricStore:
         idle_timeout: float = 900.0,
         connect_retry_interval: float = 30.0,
         topo_name: Optional[str] = None,
+        watch_interval: float = 0.0,
+        cabling_file: Optional[Path] = None,
+        ack_file: Optional[Path] = None,
     ) -> None:
         self.nornir = nornir
         self.topo_name = topo_name
@@ -78,6 +87,19 @@ class FabricStore:
         self._shutdown_lock = threading.Lock()
         self._stopped = False
         self._resync_thread: Optional[threading.Thread] = None
+        #: What the fabric was, as the watcher read it every watch_interval.
+        self.timeline = Timeline()
+        #: The findings someone acknowledged, shared by everyone on this server.
+        self.acks = AckStore(ack_file)
+        #: Where the cables LLDP showed are kept across restarts, if anywhere.
+        self.cabling_file = cabling_file
+        if cabling_file is not None:
+            self.timeline.load_cabling(cabling_file)
+        self.watch_interval = watch_interval
+        self.watcher = Watcher(self, self.timeline, interval=watch_interval)
+        #: inv_filter key -> (when, reading), for health asked with no fresh
+        #: watcher reading to answer from.
+        self._health_cache: Dict[Any, Tuple[float, Reading]] = {}
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -112,6 +134,7 @@ class FabricStore:
                 target=self._resync_loop, name="fcli-resync", daemon=True
             )
             self._resync_thread.start()
+        self.watcher.start()
 
     def _connect(self, name: str, host: Any) -> None:
         if self._stop.is_set():
@@ -270,6 +293,7 @@ class FabricStore:
         SSE tasks uvicorn is waiting on can finish.
         """
         self._stop.set()
+        self.watcher.stop()
         with self._shutdown_lock:
             if self._stopped:
                 return
@@ -649,8 +673,14 @@ class FabricStore:
         self,
         inv_filter: Optional[Dict[str, str]] = None,
         reports: Sequence[str] = REQUIRED_REPORTS,
+        history: bool = True,
     ) -> FabricState:
-        """Collect what the sanity checks read, across the filtered inventory."""
+        """Collect what the sanity checks read, across the filtered inventory.
+
+        With *history*, the state carries the timeline too, scoped to the
+        same nodes: the recent changes a flap is counted in, and what answers
+        "what changed". The watcher asks without, as it is what keeps it.
+        """
         names = self._targets(inv_filter)
         self._heal_connections(names)
         state = FabricState()
@@ -659,6 +689,7 @@ class FabricStore:
             for name, host in self.nornir.inventory.hosts.items()
             if name in set(names)
         }
+        state.containerlab = containerlab_nodes(self.nornir.inventory.hosts) & set(names)
         for report_name in reports:
             spec = get_report(report_name)
             try:
@@ -675,7 +706,112 @@ class FabricStore:
                 elif items is not None:
                     payloads[node] = items
             state.reports[report_name] = payloads
+        if history:
+            state.changes = self.timeline.recent(nodes=names)
+            state.history = self.timeline.scoped(names)
+        state.acknowledged = self.acks.keys()
         return state
+
+    # ------------------------------------------------------------------ #
+    # health: findings and incidents
+    # ------------------------------------------------------------------ #
+
+    #: How long an on-demand health reading is reused for.
+    HEALTH_TTL = 10.0
+
+    def health(self, inv_filter: Optional[Dict[str, str]] = None) -> Reading:
+        """The findings and incidents of the (filtered) fabric, as recently as they are known.
+
+        The watcher's latest reading answers when it is fresh and nothing is
+        filtered out of it; otherwise the checks are run here, and the answer
+        is kept a few seconds so that a page polling for it does not run every
+        check on every poll.
+        """
+        latest = self.timeline.latest
+        fresh = self.watch_interval > 0 and latest is not None and (
+            time.time() - latest.at < 3 * self.watch_interval
+        )
+        if fresh and not inv_filter:
+            return latest
+        key = tuple(sorted(inv_filter.items())) if inv_filter else None
+        now = time.time()
+        with self._lock:
+            cached = self._health_cache.get(key)
+        if cached is not None and now - cached[0] < self.HEALTH_TTL:
+            return cached[1]
+        state = self.fabric_state(inv_filter)
+        findings = run_checks(state)
+        reading = Reading(at=now, state=state, findings=findings, incidents=correlate(findings, state))
+        with self._lock:
+            if len(self._health_cache) >= 16:
+                self._health_cache.clear()
+            self._health_cache[key] = (now, reading)
+        return reading
+
+    # ------------------------------------------------------------------ #
+    # acknowledging
+    # ------------------------------------------------------------------ #
+
+    def _incident(self, incident_id: str, inv_filter: Optional[Dict[str, str]] = None) -> Optional[Incident]:
+        """The incident *incident_id*, as the page that shows it was rendered.
+
+        An incident's id is what it is anchored to, and with an inventory
+        filter that can differ from the whole fabric's - a link seen from one
+        end only - so it is looked up in the same view.
+        """
+        for incident in self.health(inv_filter).incidents:
+            if incident.id == incident_id:
+                return incident
+        return None
+
+    def acknowledge(
+        self, incident_id: str, note: str = "", inv_filter: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
+        """Acknowledge every finding the incident *incident_id* holds now."""
+        incident = self._incident(incident_id, inv_filter)
+        if incident is None:
+            raise KeyError(f"no incident '{incident_id}': it may have cleared")
+        made = self.acks.acknowledge(
+            incident.findings, note=note, incident=incident.title, incident_id=incident.id
+        )
+        self._record_ack(incident.node, incident.title, "acknowledged", note or f"{len(made)} finding(s) acknowledged")
+        return {"incident": incident.id, "acknowledged": len(made)}
+
+    def unacknowledge(
+        self, incident_id: str, inv_filter: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
+        """Take the acknowledgement off the incident *incident_id*.
+
+        Both what it holds now and what was acknowledged under its id: an
+        incident can change shape between the two - regrouped, seen through
+        another filter, restored after a restart - and taking an
+        acknowledgement off must not depend on it looking the same.
+        """
+        incident = self._incident(incident_id, inv_filter)
+        keys = self.acks.of_incident(incident_id)
+        if incident is not None:
+            keys |= {finding_key(f) for f in incident.findings}
+        dropped = self.acks.unacknowledge(keys)
+        if incident is None and not dropped:
+            raise KeyError(f"nothing is acknowledged as incident '{incident_id}'")
+        node = incident.node if incident else dropped[0].node
+        title = incident.title if incident else dropped[0].incident
+        self._record_ack(node, title, "unacknowledged", f"{len(dropped)} finding(s) no longer acknowledged")
+        return {"incident": incident_id, "unacknowledged": len(dropped)}
+
+    def _record_ack(self, node: str, title: str, what: str, detail: str) -> None:
+        """Acknowledging is an event on the timeline, like any other."""
+        self.timeline.record([Change(time.time(), node, "ack", title, "", what, INFO, detail)])
+        with self._lock:
+            self._table_cache.clear()
+
+    def set_baseline(self) -> Dict[str, Any]:
+        """Keep the fabric as it is now as what it is compared against."""
+        reading = self.timeline.latest
+        if reading is None or self.watch_interval <= 0:
+            reading = self.health()
+        self.timeline.set_baseline(reading)
+        return self.timeline.status()
 
     def _checks_rows(
         self, inv_filter: Optional[Dict[str, str]]
@@ -704,8 +840,15 @@ class FabricStore:
         show.
         """
         started = time.time()
-        state = self.fabric_state(inv_filter, reports=lens.requires)
-        records = lens.run(state, **(params or {}))
+        if lens.name == "incidents":
+            # The watcher has just run every check and grouped the findings;
+            # answering from its reading spares a page refreshing every two
+            # seconds from running them all again.
+            reading = self.health(inv_filter)
+            state, records = reading.state, mark_acknowledged(reading.incidents, self.acks.keys())
+        else:
+            state = self.fabric_state(inv_filter, reports=lens.requires)
+            records = lens.run(state, **(params or {}))
         rows = lens.rows(records)
         if lens.group_by_node:
             rows.sort(key=lambda r: str(r.get("Node", "")))
@@ -786,13 +929,17 @@ class FabricStore:
         # Each snapshot is taken under its own node's lock and nothing else, so
         # summarizing the fabric does not stall the renders of every report on it.
         health = _Health()
+        # A veth discards what a real port forwards, so on containerlab the
+        # error counters say nothing about the fabric; see check_itf_errors.
+        virtual = containerlab_nodes(self.nornir.inventory.hosts)
         for stream in streams:
             snapshot = stream.snapshot_roots(_OVERVIEW_ROOTS)
             itfs = snapshot.get("interface")
-            _tally_interfaces(health, itfs)
+            _tally_interfaces(health, itfs, count_errors=stream.name not in virtual)
             _tally_network_instances(health, snapshot.get("network-instance"), itfs)
 
         return {
+            "health": self._health_summary(inv_filter, names),
             "nodes": {
                 "total": len(hosts),
                 "connected": sum(1 for h in hosts if h["connected"]),
@@ -816,6 +963,34 @@ class FabricStore:
                 "resync_interval": self.resync_interval,
                 "cached_tables": cached_tables,
             },
+        }
+
+    def _health_summary(
+        self, inv_filter: Optional[Dict[str, str]], names: List[str]
+    ) -> Optional[Dict[str, Any]]:
+        """The incidents and recent changes, counted, for the dashboard."""
+        try:
+            reading = self.health(inv_filter)
+        except Exception as exc:  # noqa: BLE001 - the rest of the dashboard still renders
+            logger.warning("summarizing fabric health failed: %s", exc)
+            return None
+        recent = self.timeline.changes(since=time.time() - 900, nodes=names)
+        baseline = self.timeline.baseline
+        # What is acknowledged is known, and is not what this card is for.
+        incidents = mark_acknowledged(reading.incidents, self.acks.keys())
+        open_ = [i for i in incidents if not i.acknowledged]
+        return {
+            "at": reading.at,
+            "incidents": len(open_),
+            "errors": sum(1 for i in open_ if i.severity == "error"),
+            "warnings": sum(1 for i in open_ if i.severity == "warning"),
+            "findings": sum(len(i.findings) for i in open_),
+            "acknowledged": len(incidents) - len(open_),
+            "worst": open_[0].title if open_ else "",
+            "changes_15m": len(recent),
+            "failures_15m": sum(1 for c in recent if c.severity == "error"),
+            "baseline_at": baseline.at if baseline else None,
+            "watching": self.watch_interval > 0,
         }
 
     def topology(self, inv_filter: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -853,10 +1028,27 @@ class FabricStore:
                     connected=bool(status.get("connected")),
                     error=status.get("error"),
                     egress=_interface_egress(stream),
+                    remembered=self.timeline.cables(name),
                 )
             )
 
         graph = build_topology(facts)
+        try:
+            health = self.health(inv_filter)
+            acked = self.acks.keys()
+            annotate_health(
+                graph,
+                locate(health.findings, health.state),
+                mark_acknowledged(health.incidents, acked),
+                acked=acked,
+            )
+            graph["health_at"] = health.at
+            # The route tables the checks read are also what says which
+            # remote VTEPs load-balance over a virtual segment.
+            annotate_aliasing(graph, health.state)
+        except Exception as exc:  # noqa: BLE001 - the drawing is worth having without its colours
+            logger.warning("annotating the topology with health failed: %s", exc)
+            logger.debug("annotating the topology failed", exc_info=exc)
         graph["generated"] = started
         graph["render_ms"] = round((time.time() - started) * 1000, 1)
         graph["oldest_update"] = _oldest_update(list(streams.values()))
@@ -944,7 +1136,7 @@ def _is_configured(itf: Dict[str, Any], oper_state: str) -> bool:
     return isinstance(ethernet, dict) and bool(ethernet.get("aggregate-id"))
 
 
-def _tally_interfaces(health: _Health, itfs: Any) -> None:
+def _tally_interfaces(health: _Health, itfs: Any, count_errors: bool = True) -> None:
     """Count the configured interfaces of one node by health."""
     if not isinstance(itfs, list):
         return
@@ -963,7 +1155,7 @@ def _tally_interfaces(health: _Health, itfs: Any) -> None:
         if oper_state == "down" and not is_intent(itf.get("oper-down-reason")):
             health.itf_down += 1
         stats = itf.get("statistics", {})
-        if not isinstance(stats, dict):
+        if not count_errors or not isinstance(stats, dict):
             continue
         errors = 0
         for counter in _ERROR_COUNTERS:

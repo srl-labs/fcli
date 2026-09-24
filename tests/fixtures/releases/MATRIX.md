@@ -116,3 +116,19 @@ looked fine throughout.
 Capture and replay both run under `tests/system/replay.deterministic_clock`, which
 pins `now` to the capture time and the sample interval to its nominal value, so
 those columns reproduce exactly.
+
+## The DCI recordings (26.3.1)
+
+`26.3.1/leaf1.json.gz` and `26.3.1/dcgw1.json.gz` are recorded from a second lab,
+the [DCI validated design](https://github.com/nokia/nokia-validated-designs)
+(`validated-designs/dci/dci-without-eda`): two datacenters with an IPv6
+link-local eBGP underlay, BFD towards the spines, and DCGWs stitching EVPN-VXLAN
+to EVPN-MPLS over IS-IS and LDP. They were added with the BFD, IS-IS, OSPF,
+resources, hardware and transceiver reports, which the intent-based-ansible-lab
+recordings above predate; `leaf1` covers BFD and learned EVPN state (ping between
+the multi-homed clients before capturing, or `es_dest` comes back empty), `dcgw1`
+covers IS-IS.
+
+```bash
+python -m tests.system.capture --release 26.3.1 --node leaf1=leaf --node dcgw1=dcgw
+```

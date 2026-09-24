@@ -951,10 +951,17 @@ def test_service_tree_lets_a_gateway_carry_its_wan_side_instance():
     assert "disagree" not in card.subtitle and card.state == "up"
 
 
+#: Lenses that ask the whole fabric one fixed question, so need no argument.
+FABRIC_WIDE = {"incidents", "changes"}
+#: Lenses that answer from the server's timeline rather than from reports.
+FROM_THE_TIMELINE = {"changes"}
+
+
 def test_every_lens_has_a_tree_and_the_params_it_cannot_do_without():
     for lens in LENSES:
         assert callable(lens.tree)
-        assert any(p.required for p in lens.params), f"lens '{lens.name}' requires nothing"
+        if lens.name not in FABRIC_WIDE:
+            assert any(p.required for p in lens.params), f"lens '{lens.name}' requires nothing"
         assert lens.on("server")
 
 
@@ -1018,6 +1025,9 @@ def test_a_record_has_a_field_for_every_kind_it_documents():
 
 def test_every_lens_declares_the_reports_it_reads():
     for lens in LENSES:
+        if lens.name in FROM_THE_TIMELINE:
+            assert not lens.requires
+            continue
         assert lens.requires, f"lens '{lens.name}' reads nothing"
         for report in lens.requires:
             assert report in REPORTS_BY_NAME
@@ -1032,7 +1042,8 @@ def test_every_lens_declares_its_columns_and_params():
         assert len(set(lens.column_names)) == len(lens.column_names), (
             f"lens '{lens.name}' names a column twice"
         )
-        assert lens.params, f"lens '{lens.name}' takes no arguments"
+        if lens.name != "incidents":
+            assert lens.params, f"lens '{lens.name}' takes no arguments"
 
 
 def test_a_lens_is_found_by_either_spelling():
@@ -1043,3 +1054,16 @@ def test_a_lens_is_found_by_either_spelling():
 def test_an_unknown_lens_says_so():
     with pytest.raises(KeyError, match="unknown lens"):
         get_lens("nonsense")
+
+
+def test_an_incident_is_labelled_by_its_severity_not_by_the_colour_it_is_drawn_in():
+    """An error is drawn in the colour of down; the badge must not say DOWN."""
+    from nornir_srl.checks import Finding
+    from nornir_srl.fabric import FabricState
+    from nornir_srl.incidents import correlate
+    from nornir_srl.lenses import tree_incidents
+
+    finding = Finding("es_df", "error", "leaf6", "vES/ipvrf-1", "nodes disagree on the designated forwarder")
+    (card,) = tree_incidents(correlate([finding], FabricState()))
+    assert (card.state, card.label) == ("down", "ERROR")
+    assert card.entries[0].label == "ERROR" and card.entries[0].items[0].label == "ERROR"

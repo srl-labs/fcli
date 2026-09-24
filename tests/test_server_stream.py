@@ -336,6 +336,39 @@ def test_a_candidate_the_target_stopped_sending_is_dropped(es_stream):
     ]
 
 
+_ES_CANDIDATE_WITH_MODULES = (
+    "srl_nokia-system:system/srl_nokia-system-network-instance:network-instance"
+    "/protocols/srl_nokia-system-network-instance-bgp-evpn-ethernet-segments:evpn"
+    "/ethernet-segments/bgp-instance[id=1]/ethernet-segment[name=ES-01]"
+    "/association/network-instance[name=subnet-1]/bgp-instance[instance=1]"
+    "/computed-designated-forwarder-candidates"
+    "/designated-forwarder-candidate[address={address}]/designated-forwarder"
+)
+
+
+def test_a_candidate_is_dropped_when_the_target_names_its_modules(es_stream):
+    """SR Linux names every element with its YANG module in a subscription.
+
+    The envelope an update refreshes was matched against the path as sent, so
+    an envelope named the way a Get answers - without modules - never saw
+    anything arrive, and nothing under it was ever evicted: a BGP neighbour
+    whose link went down stayed 'established' until the next resync.
+    """
+    stream, device = es_stream
+    assert len(_df_candidates(stream)) == 2
+
+    def sample(address: str) -> None:
+        device.push("", [(_ES_CANDIDATE_WITH_MODULES.format(address=address), True)])
+
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline and len(_df_candidates(stream)) != 1:
+        sample("192.168.255.1")
+        time.sleep(0.05)
+    assert _df_candidates(stream) == [
+        {"address": "192.168.255.1", "designated-forwarder": True}
+    ]
+
+
 def test_candidates_the_target_keeps_sending_survive(es_stream):
     stream, device = es_stream
     both = ["192.168.255.1", "192.168.255.2"]
@@ -924,3 +957,128 @@ def test_ifstats_report_counts_errors_over_the_sample_not_since_boot():
 
 def cached_stats(stream: HostStream):
     return CachedDevice(stream).get_ifstats()["ifstats"][0]
+
+
+def test_a_path_the_node_rejects_is_asked_for_once():
+    """A fixed-form chassis has no fabric modules, and says so the same way every time.
+
+    The rejection is kept for as long as the connection lasts: the notifications
+    that clear a failed Get - a node that answers again - say nothing about a
+    path that is not in its schema.
+    """
+    path = "/platform/fabric[slot=*]"
+    device = FakeDevice({})
+    device.get = lambda paths, datatype="config", strip_mod=True: (  # type: ignore[method-assign]
+        device.gets.append((paths[0], datatype))
+        or (_ for _ in ()).throw(
+            Exception("GRPC ERROR Host: n1, Error: Path not valid - unknown element 'fabric'")
+        )
+    )
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    try:
+        for _ in range(3):
+            with pytest.raises(Exception, match="unknown element"):
+                stream.direct_get(path, "state")
+            stream._failed_gets.clear()  # what every arriving notification does
+        assert [p for p, _dt in device.gets] == [path]
+    finally:
+        stream.stop()
+
+
+# --------------------------------------------------------------------------- #
+# the path limit of one Subscribe request
+# --------------------------------------------------------------------------- #
+
+
+def _spec(path: str, interval: int = 10) -> SubscriptionSpec:
+    return SubscriptionSpec(path, "state", "sample", interval)
+
+
+def test_a_path_another_one_covers_is_merged_into_it():
+    from nornir_srl.server.stream import plan_subscription
+
+    request, covered, polled = plan_subscription(
+        [
+            _spec("/interface[name=*]/subinterface", 20),
+            _spec("/interface[name=*]/subinterface[index=*]/ipv4/arp/neighbor", 10),
+            _spec("/interface[name=irb*]/subinterface", 30),
+            _spec("/interface[name=lag*]", 20),
+            _spec("/platform/control[slot=*]", 60),
+            _spec("/platform/control[slot=A]", 10),
+        ]
+    )
+    assert [s.path for s in request] == [
+        "/interface[name=*]/subinterface",
+        "/interface[name=lag*]",
+        "/platform/control[slot=*]",
+    ]
+    # the covering path is sampled as fast as the fastest it stands in for
+    assert {s.path: s.sample_interval for s in request}["/interface[name=*]/subinterface"] == 10
+    assert {s.path: s.sample_interval for s in request}["/platform/control[slot=*]"] == 10
+    assert covered["/interface[name=irb*]/subinterface"] == "/interface[name=*]/subinterface"
+    assert "/interface[name=lag*]" not in covered, "lag* is not everything under name=*"
+    assert polled == []
+
+
+def test_a_narrower_key_does_not_cover_a_wider_one():
+    from nornir_srl.server.stream import _covers
+
+    assert not _covers(_spec("/interface[name=lag*]"), _spec("/interface[name=*]/subinterface"))
+    assert not _covers(_spec("/network-instance[name=default]"), _spec("/network-instance[name=*]/type"))
+    assert _covers(_spec("/network-instance[name=*]"), _spec("/network-instance[name=default]/type"))
+
+
+def test_what_does_not_fit_is_polled_slowest_first():
+    from nornir_srl.server.stream import plan_subscription
+
+    specs = [_spec(f"/a{i}", 10) for i in range(4)] + [_spec("/slow", 60), _spec("/slow/child", 60)]
+    request, covered, polled = plan_subscription(specs, limit=4)
+    assert len(request) == 4 and "/slow" not in {s.path for s in request}
+    # what the polled path covered is polled with it
+    assert polled == ["/slow", "/slow/child"] and covered == {}
+
+
+def test_a_stream_never_asks_for_more_paths_than_a_request_may_carry(monkeypatch):
+    monkeypatch.setattr(stream_module, "MAX_SUBSCRIBED_PATHS", 3)
+    paths = [f"/p{i}" for i in range(5)]
+    device = FakeDevice({p: [{p.strip("/"): {"x": 1}}] for p in paths})
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE)
+    try:
+        stream.ensure_paths([_spec(p, 10 + i) for i, p in enumerate(paths)])
+        assert wait_for(lambda: device.subscribe_requests)
+        request = device.subscribe_requests[-1]["subscription"]
+        assert len(request) == 3
+        status = {p["path"]: p for p in stream.status()["paths"]}
+        assert [p for p in paths if status[p]["polled"]] == ["/p3", "/p4"]
+        # a polled path is not served from a tree nothing keeps current
+        assert stream.snapshot("/p4") is None
+        assert stream.snapshot("/p0") is not None
+    finally:
+        stream.stop()
+
+
+def test_a_node_that_allows_fewer_paths_is_believed(monkeypatch):
+    """SR Linux says how many it takes when it refuses a request."""
+    paths = [f"/p{i}" for i in range(4)]
+    device = FakeDevice({p: [{p.strip("/"): {"x": 1}}] for p in paths})
+    refused = RuntimeError(
+        "<_MultiThreadedRendezvous of RPC that terminated with: status = StatusCode.OUT_OF_RANGE "
+        'details = "Exceeded the maximum of 2 subscribed paths per subscribe request">'
+    )
+    original = device.gnmi_subscribe
+
+    def subscribe(request):
+        if len(request["subscription"]) > 2:
+            device.subscribe_requests.append(request)
+            raise refused
+        return original(request)
+
+    device.gnmi_subscribe = subscribe  # type: ignore[method-assign]
+    stream = HostStream("leaf1", device, restart_debounce=TEST_DEBOUNCE, reconnect_delay=0.05)
+    try:
+        stream.ensure_paths([_spec(p) for p in paths])
+        assert wait_for(lambda: stream.connected, timeout=5)
+        assert stream.max_paths == 2
+        assert len(device.subscribe_requests[-1]["subscription"]) == 2
+    finally:
+        stream.stop()

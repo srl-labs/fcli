@@ -35,11 +35,13 @@ one topology, however many clients happen to be plugged into both of them.
 
 from __future__ import annotations
 
+import ipaddress
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..aliases import alias_index, resolve, tail
 from ..connections.down_reason import STANDBY_STATE, is_intent, root_reason
+from ..connections.layer2 import _df_candidates, _es_next_hops
 
 #: The tiers of a fabric, bottom up, as ``(layer, role, label)``.
 LAYERS: Tuple[Tuple[int, str, str], ...] = (
@@ -92,6 +94,10 @@ class Adjacency:
     peer: str
     peer_port: str = ""
     oper_state: str = ""
+    #: Not seen over LLDP now, but seen before: a cable that went down takes
+    #: its LLDP adjacency with it, and a drawing that dropped it would hide
+    #: the one link that matters.
+    lost: bool = False
 
 
 @dataclass
@@ -105,6 +111,30 @@ class Segment:
 
     name: str
     esi: str
+
+
+@dataclass
+class VirtualSegment:
+    """A virtual ethernet-segment: no port, a next-hop tracked in a routed service.
+
+    It is what L3 aliasing is built on. The leaves that can reach the
+    next-hop advertise the segment, and a remote VTEP that learns a prefix
+    behind it load-balances over all of them rather than only the one that
+    advertised the prefix.
+    """
+
+    name: str
+    esi: str
+    mode: str = ""
+    oper: str = ""
+    #: Each tracked next-hop and the EVIs configured under it.
+    next_hops: List[Tuple[str, List[str]]] = field(default_factory=list)
+    #: Per network-instance it is associated with: the DF candidates (system
+    #: addresses) and the one elected.
+    associations: Dict[str, Tuple[List[str], str]] = field(default_factory=dict)
+    #: Each next-hop, with the bridge domain whose IRB subnet it is in - how
+    #: the next-hop is reached - where one is.
+    via: Dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -153,6 +183,13 @@ class NodeFacts:
     segments: Dict[str, Segment] = field(default_factory=dict)
     #: Egress of each interface, in bits per second, from streamed counters.
     egress: Dict[str, int] = field(default_factory=dict)
+    #: The mac-vrfs and ip-vrfs it carries, by name: what a service overlay
+    #: lights the node up for.
+    services: List[str] = field(default_factory=list)
+    #: Its virtual ethernet-segments, and the address it is a VTEP on - what
+    #: a segment's DF candidates are named by.
+    virtual_segments: List[VirtualSegment] = field(default_factory=list)
+    system_address: str = ""
 
     @property
     def label(self) -> str:
@@ -169,6 +206,7 @@ def node_facts(
     connected: bool = True,
     error: Optional[str] = None,
     egress: Optional[Dict[str, int]] = None,
+    remembered: Optional[Dict[str, Tuple[str, str]]] = None,
 ) -> NodeFacts:
     """Read one node's contribution out of its streamed state.
 
@@ -209,13 +247,34 @@ def node_facts(
                 kind = "routed"
             else:
                 continue
+            facts.services.append(str(instance.get("name", "")))
             facts.attachments.extend(
                 _attachments(instance, kind, details, port_reasons)
             )
             if _is_stitched(instance):
                 facts.stitched += 1
 
-    facts.adjacencies = _adjacencies(system, _interface_states(snapshot))
+    details = _subinterface_details(snapshot)
+    facts.system_address = _first_prefix(details.get("system0.0", {})).split("/", 1)[0]
+    facts.virtual_segments = _virtual_segments(system, instances if isinstance(instances, list) else [], details)
+    itf_states = _interface_states(snapshot)
+    facts.adjacencies = _adjacencies(system, itf_states)
+    # *remembered* is every cable seen on a port before, as (peer, peer port).
+    # One LLDP no longer reports is drawn all the same, in the state its port
+    # is in now - which, for a cable that stopped carrying LLDP, is usually
+    # the reason it did.
+    seen = {adj.local_port for adj in facts.adjacencies}
+    for port, (peer, peer_port) in sorted((remembered or {}).items()):
+        if port not in seen and not _out_of_band(port):
+            facts.adjacencies.append(
+                Adjacency(
+                    local_port=port,
+                    peer=peer,
+                    peer_port=peer_port,
+                    oper_state=itf_states.get(port, "down") or "down",
+                    lost=True,
+                )
+            )
     facts.segments = _segments(system)
     return facts
 
@@ -270,6 +329,7 @@ def build_topology(facts: Iterable[NodeFacts]) -> Dict[str, Any]:
         # A client that named itself over LLDP is no longer a stray neighbour.
         outside.pop(client["name"], None)
 
+    virtual = _virtual_segment_nodes(nodes, clients, links)
     counts = _client_counts(clients)
     payload = [
         _node_payload(node, roles[node.name], sorted(peers[node.name]), counts.get(node.name, 0))
@@ -279,6 +339,7 @@ def build_topology(facts: Iterable[NodeFacts]) -> Dict[str, Any]:
         _external_payload(name, sorted(seen_by)) for name, seen_by in sorted(outside.items())
     )
     payload.extend(segments)
+    payload.extend(virtual)
     payload.extend(clients)
     payload.sort(key=lambda n: (-n["layer"], n["site"], _row_order(n), n["label"]))
     layer_of = {node["name"]: node["layer"] for node in payload}
@@ -343,6 +404,8 @@ def _node_payload(node: NodeFacts, role: str, peers: List[str], clients: int) ->
         "ip_vrfs": node.ip_vrfs,
         "stitched": node.stitched,
         "clients": clients,
+        "services": sorted(set(node.services)),
+        "system_address": node.system_address,
         "peers": peers,
         "ports": len(node.adjacencies),
         "connected": node.connected,
@@ -749,7 +812,14 @@ def _record_link(
         pair = (adj.local_port, adj.peer_port)
     else:
         pair = (adj.peer_port, adj.local_port)
-    link["ports"].setdefault(pair, {"a_port": pair[0], "b_port": pair[1]})
+    fresh = pair not in link["ports"]
+    port = link["ports"].setdefault(pair, {"a_port": pair[0], "b_port": pair[1]})
+    # Both ends have to have lost it: a cable one end still hears LLDP on is
+    # one-sided, which is a finding of its own, not a lost cable.
+    if adj.lost and fresh:
+        port["lost"] = True
+    elif not adj.lost:
+        port.pop("lost", None)
     if adj.oper_state:
         link["states"].add(adj.oper_state)
 
@@ -837,7 +907,15 @@ def _link_payload(
         "intra_layer": layer_of.get(link["a"]) == layer_of.get(link["b"]),
         # Set for a cable to a client rather than to another node of the fabric.
         "access": bool(link.get("access")),
+        # Set when LLDP no longer reports any cable of it, and it is drawn
+        # from what was seen before.
+        "lost": bool(ports) and all(p.get("lost") for p in ports),
     }
+    # A virtual segment's links are not cables: what they are, what to say
+    # about them, and the service overlays they are drawn in.
+    for key in ("kind", "note", "overlay_only", "df"):
+        if link.get(key):
+            payload[key] = link[key]
     # Each end is coloured from the hottest interface on that side of the cable.
     if a_rates:
         payload["a_out_bps"] = max(a_rates)
@@ -1101,3 +1179,420 @@ def _norm(value: Any) -> str:
     if not value:
         return ""
     return str(value).lower().split(":")[-1]
+
+
+# --------------------------------------------------------------------------- #
+# health: what the checks found, drawn onto the fabric
+# --------------------------------------------------------------------------- #
+
+_SEVERITY_RANK = {"error": 2, "warning": 1}
+
+#: Findings listed per node in the drawing; the count on its badge is all of them.
+_MAX_ISSUES = 50
+
+
+def _worse(a: str, b: str) -> str:
+    return a if _SEVERITY_RANK.get(a, 0) >= _SEVERITY_RANK.get(b, 0) else b
+
+
+def _finding_payload(finding: Any, acked: bool = False) -> Dict[str, Any]:
+    return {
+        "severity": finding.severity,
+        "check": finding.check,
+        "node": finding.node,
+        "subject": finding.subject,
+        "detail": finding.detail,
+        "acknowledged": acked,
+    }
+
+
+def annotate_health(
+    graph: Dict[str, Any],
+    located: Iterable[Tuple[Any, Optional[str]]],
+    incidents: Iterable[Any],
+    acked: Optional[Set[Tuple[str, str, str]]] = None,
+) -> Dict[str, Any]:
+    """Put each finding on the node and the cable it is about.
+
+    *located* is every finding with the port it is on, where it is on one
+    (:func:`nornir_srl.incidents.locate`). A node gets the count of its
+    findings by severity and the worst of them as its ``health``; a cable
+    gets the findings on either of its ends. The incidents are listed as
+    they are, for the drawing to say what the colours add up to.
+
+    A finding in *acked* - one someone acknowledged - is still listed, marked
+    so, but no longer counts towards a badge or a colour: those are there to
+    say *look here*, and it has been looked at.
+    """
+    acked = acked or set()
+    by_name = {node["name"]: node for node in graph.get("nodes", [])}
+    for node in by_name.values():
+        node["findings"] = {"error": 0, "warning": 0}
+        node["issues"] = []
+        node["health"] = "ok" if not node.get("external") and node.get("role") not in ("client", "segment") else ""
+    ends: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for link in graph.get("links", []):
+        link["findings"] = []
+        link["health"] = "ok"
+        for pair in link.get("ports", []):
+            for side in ("a", "b"):
+                port = pair.get(f"{side}_port")
+                if port:
+                    ends.setdefault((link[side], port), []).append(link)
+    # A segment's findings are about the segment as much as about the node
+    # that reported them, and a virtual one is drawn as a node of its own.
+    segments = {
+        name: node for node in by_name.values() if node.get("virtual") for name in [node.get("esi")] + node.get("names", [])
+    }
+    for finding, port in located:
+        is_acked = (finding.check, finding.node, finding.subject) in acked
+        segment = segments.get(finding.subject.split("/", 1)[0]) if finding.check == "es_df" else None
+        if segment is not None:
+            if len(segment["issues"]) < _MAX_ISSUES:
+                segment["issues"].append(_finding_payload(finding, is_acked))
+            if not is_acked:
+                segment["findings"][finding.severity] = segment["findings"].get(finding.severity, 0) + 1
+                segment["health"] = _worse(finding.severity, segment["health"] or "ok")
+        node = by_name.get(finding.node)
+        if node is not None:
+            if len(node["issues"]) < _MAX_ISSUES:
+                node["issues"].append(_finding_payload(finding, is_acked))
+            if not is_acked:
+                counts = node["findings"]
+                counts[finding.severity] = counts.get(finding.severity, 0) + 1
+                node["health"] = _worse(finding.severity, node["health"])
+        if port is None:
+            continue
+        for link in ends.get((finding.node, port), []):
+            link["findings"].append(_finding_payload(finding, is_acked))
+            if not is_acked:
+                link["health"] = _worse(finding.severity, link["health"])
+    graph["incidents"] = [
+        {
+            "id": incident.id,
+            "severity": incident.severity,
+            "kind": incident.kind,
+            "title": incident.title,
+            "explanation": incident.explanation,
+            "node": incident.node,
+            "nodes": list(incident.nodes),
+            "findings": len(incident.findings),
+            "acknowledged": bool(getattr(incident, "acknowledged", False)),
+        }
+        for incident in incidents
+    ]
+    graph["summary"] = summarize(graph)
+    return graph
+
+
+_ROLE_NOUNS = {
+    "spine": ("spine", "spines"),
+    "leaf": ("leaf", "leaves"),
+    "dcgw": ("DCGW", "DCGWs"),
+    "core": ("WAN/core router", "WAN/core routers"),
+    "unknown": ("unclassified node", "unclassified nodes"),
+}
+
+
+def _counted(count: int, nouns: Tuple[str, str]) -> str:
+    return f"{count} {nouns[0] if count == 1 else nouns[1]}"
+
+
+def summarize(graph: Dict[str, Any]) -> List[str]:
+    """The fabric in a few lines, the way someone would brief it.
+
+    What it is built of, what it carries, and what is wrong with it - the
+    three things to know before looking at any single table.
+    """
+    nodes = graph.get("nodes", [])
+    devices = [n for n in nodes if n.get("role") in _ROLE_NOUNS]
+    roles = graph.get("roles", {})
+    built = ", ".join(
+        _counted(roles[role], _ROLE_NOUNS[role]) for role in ("spine", "leaf", "dcgw", "core", "unknown") if roles.get(role)
+    )
+    lines = [f"{len(devices)} nodes: {built}" if built else "No nodes have reported yet"]
+    fabrics = graph.get("fabrics") or []
+    if len(fabrics) > 1:
+        lines[0] += f", in {len(fabrics)} fabrics ({', '.join(f['label'] for f in fabrics)})"
+    elif graph.get("sites") and len(graph["sites"]) > 1:
+        lines[0] += f", across sites {', '.join(graph['sites'])}"
+
+    clients = [n for n in nodes if n.get("role") == "client"]
+    services = {name for n in devices for name in n.get("services", [])}
+    stitched = sum(n.get("stitched", 0) for n in devices)
+    carried = []
+    if services:
+        carried.append(_counted(len(services), ("service", "services")))
+    if stitched:
+        carried.append(f"{stitched} stitched on the gateways")
+    if clients:
+        multihomed = sum(1 for n in clients if len({a["node"] for a in n.get("attachments", [])}) > 1)
+        carried.append(
+            _counted(len(clients), ("client", "clients"))
+            + (f", {multihomed} multi-homed" if multihomed else "")
+        )
+    if carried:
+        lines.append("Carries " + "; ".join(carried))
+
+    down = [n["label"] for n in devices if not n.get("connected")]
+    everything = graph.get("incidents", [])
+    incidents = [i for i in everything if not i.get("acknowledged")]
+    acknowledged = len(everything) - len(incidents)
+    errors = sum(1 for i in incidents if i["severity"] == "error")
+    warnings = sum(1 for i in incidents if i["severity"] == "warning")
+    if down:
+        lines.append(f"Not answering: {', '.join(sorted(down))}")
+    if incidents:
+        findings = sum(i["findings"] for i in incidents)
+        worst = incidents[0]
+        lines.append(
+            f"{_counted(errors, ('error incident', 'error incidents'))}, "
+            f"{_counted(warnings, ('warning', 'warnings'))} ({findings} findings); "
+            f"worst: {worst['title']}"
+            + (f"; {acknowledged} acknowledged" if acknowledged else "")
+        )
+    elif acknowledged:
+        lines.append(f"Nothing open: {_counted(acknowledged, ('incident', 'incidents'))} acknowledged")
+    elif "incidents" in graph:
+        lines.append("No findings: every check passes")
+    return lines
+
+# --------------------------------------------------------------------------- #
+# virtual ethernet-segments: L3 aliasing in a routed service
+# --------------------------------------------------------------------------- #
+
+
+def _virtual_segments(
+    system: Dict[str, Any], instances: List[Any], details: Dict[str, Dict[str, Any]]
+) -> List[VirtualSegment]:
+    """The virtual ethernet-segments configured on one node."""
+    evpn = _branch(system, "network-instance", "protocols", "evpn", "ethernet-segments")
+    irbs = _irb_domains(instances, details)
+    found = []
+    for bgp_instance in _as_list(evpn.get("bgp-instance")):
+        for segment in _as_list(bgp_instance.get("ethernet-segment")):
+            if _norm(segment.get("type")) != "virtual" or not segment.get("esi"):
+                continue
+            associations: Dict[str, Tuple[List[str], str]] = {}
+            for vrf in _as_list(_branch(segment, "association").get("network-instance")):
+                candidates = _df_candidates(vrf)
+                associations[str(vrf.get("name", ""))] = (
+                    [c.address for c in candidates],
+                    next((c.address for c in candidates if c.designated), ""),
+                )
+            next_hops = _es_next_hops(segment)
+            found.append(
+                VirtualSegment(
+                    name=str(segment.get("name") or ""),
+                    esi=str(segment["esi"]),
+                    mode=_norm(segment.get("oper-multi-homing-mode") or segment.get("multi-homing-mode")),
+                    oper=_norm(segment.get("oper-state")),
+                    next_hops=next_hops,
+                    associations=associations,
+                    via={address: domain for address, _evis in next_hops if (domain := _domain_of(address, irbs))},
+                )
+            )
+    return found
+
+
+def _irb_domains(instances: List[Any], details: Dict[str, Dict[str, Any]]) -> List[Tuple[Any, str]]:
+    """Each IRB subnet on the node, with the bridge domain the IRB is in."""
+    domain_of: Dict[str, str] = {}
+    for instance in instances:
+        if isinstance(instance, dict) and _norm(instance.get("type")) == "mac-vrf":
+            for itf in _as_list(instance.get("interface")):
+                name = str(itf.get("name", ""))
+                if name.startswith("irb"):
+                    domain_of[name] = str(instance.get("name", ""))
+    subnets = []
+    for name, detail in details.items():
+        if name not in domain_of:
+            continue
+        for family in ("ipv4", "ipv6"):
+            for address in _as_list(_branch(detail, family).get("address")):
+                try:
+                    subnets.append((ipaddress.ip_network(str(address.get("ip-prefix")), strict=False), domain_of[name]))
+                except ValueError:
+                    continue
+    return subnets
+
+
+def _domain_of(address: str, subnets: List[Tuple[Any, str]]) -> str:
+    try:
+        ip = ipaddress.ip_address(address)
+    except ValueError:
+        return ""
+    return next((domain for network, domain in subnets if ip in network and network.prefixlen < network.max_prefixlen), "")
+
+
+def _virtual_key(esi: str) -> str:
+    return f"ves:{esi}"
+
+
+def _virtual_segment_nodes(
+    nodes: List[NodeFacts],
+    clients: List[Dict[str, Any]],
+    links: Dict[Tuple[str, str], Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """One node per virtual segment, cabled to the leaves it is attached to.
+
+    *Attached* is what the segment's DF election says: the leaves among its
+    candidates, which are the ones that can reach its next-hop. A leaf that
+    has it configured but is not a candidate is listed, not drawn. The
+    next-hop itself is drawn as a link to the client that owns it: the one
+    attached, on an attached leaf, to the bridge domain whose IRB subnet
+    the next-hop is in.
+
+    None of this is a cable, so it is drawn only in the service overlay of
+    the routed services the segment serves.
+    """
+    by_address = {n.system_address: n.name for n in nodes if n.system_address}
+    grouped: Dict[str, List[Tuple[NodeFacts, VirtualSegment]]] = {}
+    for node in nodes:
+        for segment in node.virtual_segments:
+            grouped.setdefault(segment.esi, []).append((node, segment))
+    payload = []
+    for esi, members in sorted(grouped.items()):
+        name = _virtual_key(esi)
+        services = sorted({ni for _node, seg in members for ni in seg.associations})
+        candidates = {addr for _node, seg in members for cands, _df in seg.associations.values() for addr in cands}
+        attached = sorted({by_address[a] for a in candidates if a in by_address})
+        label = {n.name: n.label for n in nodes}
+        # Each node elects a DF for itself; they should agree, and on a
+        # single-active segment two of them forwarding is the fault.
+        views: Dict[str, Dict[str, str]] = {}
+        for node, seg in members:
+            for ni, (_cands, elected) in seg.associations.items():
+                if elected:
+                    views.setdefault(ni, {})[label[node.name]] = label.get(by_address.get(elected, ""), elected)
+        df = {ni: sorted(set(v.values())) for ni, v in views.items()}
+        conflict = sorted(ni for ni, elected in df.items() if len(elected) > 1)
+        next_hops: Dict[str, Dict[str, Any]] = {}
+        for node, seg in members:
+            for address, evis in seg.next_hops:
+                entry = next_hops.setdefault(address, {"address": address, "evis": sorted(set(evis)), "via": ""})
+                if node.name in attached and seg.via.get(address):
+                    entry["via"] = seg.via[address]
+        oper = "up" if any(seg.oper == "up" for node, seg in members if node.name in attached) else "down"
+        for node_name in attached:
+            key = (node_name, name) if node_name <= name else (name, node_name)
+            link = links.setdefault(key, {"a": key[0], "b": key[1], "ports": {}, "states": set()})
+            link.update(kind="ves", overlay_only=services, access=True)
+            link["states"].add(oper)
+            if any(label[node_name] in elected for elected in df.values()):
+                link["df"] = True
+                link["note"] = "designated forwarder" + (" - but not the only one" if conflict else "")
+        owners = set()
+        for hop in next_hops.values():
+            for client in clients:
+                if any(a["node"] in attached and a["service"] == hop["via"] for a in client["attachments"]):
+                    owners.add(client["name"])
+                    key = (client["name"], name) if client["name"] <= name else (name, client["name"])
+                    link = links.setdefault(key, {"a": key[0], "b": key[1], "ports": {}, "states": set()})
+                    link.update(kind="ves-nh", overlay_only=services, access=True, note=f"next-hop {hop['address']} via {hop['via']}")
+                    link["states"].add(oper)
+        segments = {seg.name for _node, seg in members if seg.name}
+        payload.append(
+            {
+                "name": name,
+                "label": "vES",
+                "names": sorted(segments),
+                "role": "segment",
+                "layer": _LAYER_OF["segment"],
+                "site": "",
+                "mac_vrfs": 0,
+                "ip_vrfs": 0,
+                "stitched": 0,
+                "clients": len(owners),
+                "peers": attached + sorted(owners),
+                "ports": len(attached),
+                "connected": True,
+                "error": None,
+                "external": False,
+                "attachments": [
+                    {
+                        "node": node_name,
+                        "port": "",
+                        "subinterface": "",
+                        "service": ni,
+                        "vlan": "",
+                        "ip": ", ".join(next_hops),
+                        "state": oper,
+                        "esi": esi,
+                        "kind": "virtual",
+                    }
+                    for node_name in attached
+                    for ni in services
+                ],
+                "services": services,
+                "esi": esi,
+                "virtual": True,
+                "overlay_only": services,
+                "ves": {
+                    "mode": next((seg.mode for _n, seg in members if seg.mode), ""),
+                    "oper": oper,
+                    "next_hops": sorted(next_hops.values(), key=lambda h: h["address"]),
+                    "df": df,
+                    "df_views": views,
+                    "df_conflict": conflict,
+                    "attached": attached,
+                    "configured": sorted({node.name for node, _seg in members}),
+                    "owners": sorted(owners),
+                    "aliasing": [],
+                },
+            }
+        )
+    return payload
+
+
+def annotate_aliasing(graph: Dict[str, Any], state: Any) -> Dict[str, Any]:
+    """Which remote VTEPs actually load-balance over each virtual segment.
+
+    The evidence is the remote node's own route table in the routed service:
+    the next-hop's host route installed over two or more of the segment's
+    attached VTEPs, and the prefixes that resolve through that next-hop. Each
+    such node gets an ``alias`` link to the segment, drawn in the service's
+    overlay, saying over how many VTEPs it spreads the traffic.
+    """
+    names = {n["name"]: n for n in graph.get("nodes", [])}
+    for segment in [n for n in graph.get("nodes", []) if n.get("virtual")]:
+        ves = segment["ves"]
+        vteps = {names[a]["system_address"]: a for a in ves["attached"] if names.get(a, {}).get("system_address")}
+        hosts = {h["address"] for h in ves["next_hops"]}
+        for report in ("ipv4_rib", "ipv6_rib"):
+            for node, table in state.items(report):
+                if node in ves["attached"] or table.ni not in segment["services"] or node not in names:
+                    continue
+                spread: Set[str] = set()
+                behind: List[str] = []
+                for route in table.routes:
+                    host = route.prefix.split("/", 1)[0]
+                    if host in hosts and route.prefix.endswith(("/32", "/128")):
+                        spread |= {vteps[h.address] for h in route.next_hops if h.address in vteps}
+                    elif any(
+                        h.resolving_route.split("/", 1)[0] in hosts or h.address in hosts for h in route.next_hops
+                    ):
+                        behind.append(route.prefix)
+                if len(spread) < 2:
+                    continue
+                ves["aliasing"].append(
+                    {"node": node, "ni": table.ni, "vteps": sorted(spread), "prefixes": sorted(behind)}
+                )
+                graph["links"].append(
+                    {
+                        "a": node,
+                        "b": segment["name"],
+                        "count": 1,
+                        "ports": [],
+                        "state": "up",
+                        "intra_layer": False,
+                        "access": True,
+                        "lost": False,
+                        "kind": "alias",
+                        "overlay_only": [table.ni],
+                        "note": f"L3 aliasing: ECMP over {', '.join(sorted(names[v].get('label', v) for v in spread))}"
+                        + (f" for {', '.join(sorted(behind)[:4])}" if behind else ""),
+                    }
+                )
+    return graph
+

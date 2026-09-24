@@ -13,6 +13,8 @@ A single unified registry (`nornir_srl/lenses.py`) powers the CLI commands, MCP 
 
 | Lens | CLI Command | MCP Tool | Web UI | Purpose |
 | --- | --- | --- | --- | --- |
+| **Incidents** | `incidents` | `fabric_incidents` | Yes | Groups every check's findings by root cause - a link, a node, a BGP session, the underlay, or one cause repeated across the fabric - so a broken cable reads as one incident rather than a dozen findings. See [Health](health.md). |
+| **Changes** | - | - (server only) | Yes | What changed and when, from the server's timeline, or with `since=baseline` the drift from the baseline. See [Health](health.md). |
 | **Where** | `where <mac\|ip>` | `locate_address` | Yes | Pinpoints which nodes own an address, which learned it via EVPN/VXLAN, and highlights duplicate IP/MAC conflicts. |
 | **Path** | `path <from> <to> [--ni <vrf>]` | `trace_path` | Yes | Traces route lookups hop by hop across route tables, following all ECMP branches through VXLAN, LDP, or SR-MPLS tunnels to the destination ARP/ND. |
 | **Service** | `service <name>` | `service_detail` | Yes | Consolidates all nodes participating in a network-instance (MAC-VRF or IP-VRF), displaying EVI, VNI, RTs, interfaces, and active MAC counts side by side. |

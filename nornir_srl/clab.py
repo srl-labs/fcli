@@ -93,6 +93,11 @@ def _labels(topology: Dict[str, Any], node_spec: Dict[str, Any]) -> Dict[str, An
     return labels
 
 
+#: The Nornir group every node of a containerlab topology is in. A Nornir
+#: inventory of containerlab nodes can put its hosts in it too.
+CONTAINERLAB_GROUP = "containerlab"
+
+
 def srl_hosts(topo: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     """The SR Linux nodes of *topo*, as a Nornir hosts inventory."""
     topology = _mapping(topo, "topology")
@@ -108,7 +113,10 @@ def srl_hosts(topo: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         hosts[name] = {
             "hostname": name,
             "platform": "srlinux",
-            "groups": ["srl"],
+            # 'containerlab' says the node is virtual, which some checks read:
+            # a veth drops what a real port would not. It carries no data, so
+            # it adds nothing a filter or the labels would see.
+            "groups": ["srl", CONTAINERLAB_GROUP],
             "data": _labels(topology, node_spec),
         }
     return hosts
@@ -131,6 +139,7 @@ def srl_groups(
         # the name containerlab gives the container it runs in.
         extras["override"] = str(tls_server_name)
     return {
+        CONTAINERLAB_GROUP: {},
         "srl": {
             "connection_options": {
                 "srlinux": {

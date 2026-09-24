@@ -31,6 +31,10 @@
   // that as a tone taken from one column, and that column's cell names it.
   const ROW_TONES = {
     checks: { column: "Severity", tone: (severity) => severity }, // error / warning
+    // An acknowledged incident is known, and drawn without its colour.
+    incidents: { column: "Severity", tone: (severity) => severity, quiet: (row) => Boolean(row.Ack) },
+    // A recovery reads as good news; something merely new or gone as neither.
+    changes: { column: "Severity", tone: (severity) => (severity === "info" ? "" : severity) },
     bgp_peers: { column: "state", tone: (session) => (session ? (session === "up" ? "ok" : "down") : "") },
   };
 
@@ -90,6 +94,15 @@
     servicesTreeView: el("services-tree-view"),
     pathGraphView: el("path-graph-view"),
     viewModeBtn: el("view-mode-btn"),
+    baselineBtn: el("baseline-btn"),
+    topoOverlay: el("topo-overlay"),
+    topoSummary: el("topo-summary"),
+    chatTriage: el("chat-triage"),
+    kpiCardHealth: el("kpi-card-health"),
+    kpiHealthValue: el("kpi-health-value"),
+    kpiHealthSub: el("kpi-health-sub"),
+    kpiHealthWorst: el("kpi-health-worst"),
+    kpiHealthChanges: el("kpi-health-changes"),
     headRow: el("head-row"),
     filterRow: el("filter-row"),
     gridCols: el("grid-cols"),
@@ -170,6 +183,8 @@
     topoZoom: 1,
     topoFit: true,
     topoFabric: null, // the fabric being drawn, or "all"
+    // What the drawing is coloured by: "traffic", "health", or "service:<name>".
+    topoOverlay: "traffic",
     collapsedCards: new Set(),
     collapsedNodes: new Set(),
     collapsedSections: new Set(),
@@ -544,6 +559,7 @@
       const url = "/api/overview" + (inv ? `?${params}` : "");
       const res = await fetch(url);
       const data = await res.json();
+      renderHealthKpi(data.health);
       dom.kpiNodesTotal.textContent = data.nodes.total;
       dom.kpiNodesConnected.textContent = `${data.nodes.connected} connected`;
       dom.kpiNodesStreaming.textContent = `${data.nodes.streaming} streaming`;
@@ -650,6 +666,37 @@
     }
   }
 
+  /** The Fabric Health card: incidents by severity, the worst, and what changed. */
+  function renderHealthKpi(health) {
+    if (!dom.kpiCardHealth) return;
+    dom.kpiCardHealth.classList.remove("kpi-ok", "kpi-warn", "kpi-err");
+    if (!health) {
+      dom.kpiHealthValue.textContent = "—";
+      dom.kpiHealthSub.textContent = "checks not available";
+      dom.kpiHealthWorst.textContent = "";
+      dom.kpiHealthChanges.textContent = "";
+      return;
+    }
+    dom.kpiHealthValue.textContent = health.incidents;
+    const acked = health.acknowledged ? ` · ${health.acknowledged} acknowledged` : "";
+    dom.kpiHealthSub.textContent = health.incidents
+      ? `open incident(s): ${health.errors} error · ${health.warnings} warning · ${health.findings} findings${acked}`
+      : health.acknowledged
+        ? `nothing open${acked}`
+        : "no findings: every check passes";
+    dom.kpiHealthWorst.textContent = health.worst ? `worst: ${health.worst}` : "";
+    dom.kpiCardHealth.classList.add(health.errors ? "kpi-err" : health.warnings ? "kpi-warn" : "kpi-ok");
+    if (!health.watching) {
+      dom.kpiHealthChanges.textContent = "timeline off (--watch-interval 0)";
+    } else {
+      const baseline = health.baseline_at
+        ? ` · baseline ${new Date(health.baseline_at * 1000).toLocaleTimeString()}`
+        : " · baseline pending";
+      const failures = health.failures_15m ? ` (${health.failures_15m} failures)` : "";
+      dom.kpiHealthChanges.textContent = `${health.changes_15m} change(s) in 15 min${failures}${baseline}`;
+    }
+  }
+
   /* ------------------------------------------------------------- topology */
 
   const SVG_NS = "http://www.w3.org/2000/svg";
@@ -715,6 +762,8 @@
       const key = topoStructureKey(graph);
       if (key === state.topoKey) {
         recolorTopoLinks(graph);
+        // The incidents can change while every node keeps its colour.
+        renderTopoSummary(graph);
         if (state.topoSelection && state.topoSelection.kind === "link") {
           renderTopoLinkDetail(state.topoSelection.id);
         }
@@ -786,7 +835,9 @@
     // Everything below draws one fabric; the whole graph stays in state, so a
     // node of another one is still there to be looked up and walked to.
     renderTopoTabs(whole);
-    const graph = topoFabricView(whole);
+    renderTopoSummary(whole);
+    renderTopoOverlayOptions(whole);
+    const graph = topoOverlayView(topoFabricView(whole));
     dom.topoCanvas.replaceChildren();
     renderTopoLegend(graph);
     renderTopoHeatLegend();
@@ -837,6 +888,7 @@
     svg.append(renderTopoLinks(graph, layout));
     svg.append(renderTopoNodes(graph, layout));
     dom.topoCanvas.append(svg);
+    applyTopoService(svg, graph);
     applyTopoZoom();
 
     svg.addEventListener("mouseover", (event) => {
@@ -853,6 +905,158 @@
     });
 
     applyTopoSelection();
+  }
+
+  /* -------------------------------------------------------- topology health */
+
+  /** The fabric briefed in a few lines, the last of them what is wrong. */
+  function renderTopoSummary(graph) {
+    if (!dom.topoSummary) return;
+    const lines = graph.summary || [];
+    dom.topoSummary.replaceChildren();
+    dom.topoSummary.hidden = !lines.length;
+    const incidents = (graph.incidents || []).filter((i) => !i.acknowledged);
+    lines.forEach((text, index) => {
+      const line = document.createElement("span");
+      line.className = "topo-summary-line";
+      line.textContent = text;
+      const last = index === lines.length - 1 && "incidents" in graph;
+      if (last) {
+        const worst = incidents.some((i) => i.severity === "error")
+          ? "error"
+          : incidents.length
+            ? "warning"
+            : "ok";
+        line.classList.add("is-health", `tone-${worst}`);
+        if (incidents.length) {
+          const open = document.createElement("button");
+          open.type = "button";
+          open.className = "topo-summary-link";
+          open.textContent = "open incidents";
+          open.addEventListener("click", () => {
+            const report = state.reports.find((r) => r.name === "incidents");
+            if (report) selectReport(report);
+          });
+          line.append(" ", open);
+        }
+      }
+      dom.topoSummary.append(line);
+    });
+  }
+
+  /** Traffic, health, and one entry per service the fabric carries. */
+  function renderTopoOverlayOptions(graph) {
+    if (!dom.topoOverlay) return;
+    const services = [
+      ...new Set((graph.nodes || []).flatMap((node) => node.services || [])),
+    ].sort();
+    const wanted = ["traffic", "health", ...services.map((name) => `service:${name}`)];
+    const have = [...dom.topoOverlay.options].map((option) => option.value);
+    if (wanted.join("\u0000") !== have.join("\u0000")) {
+      dom.topoOverlay.replaceChildren(new Option("traffic", "traffic"), new Option("health", "health"));
+      if (services.length) {
+        const group = document.createElement("optgroup");
+        group.label = "service";
+        for (const name of services) group.append(new Option(name, `service:${name}`));
+        dom.topoOverlay.append(group);
+      }
+    }
+    if (!wanted.includes(state.topoOverlay)) state.topoOverlay = "traffic";
+    dom.topoOverlay.value = state.topoOverlay;
+    // The heat scale only means something while traffic is what is drawn.
+    const heat = document.getElementById("topo-heat");
+    if (heat) heat.hidden = state.topoOverlay !== "traffic";
+  }
+
+  /** Light up what carries the chosen service; everything else steps back. */
+  function applyTopoService(svg, graph) {
+    const overlay = state.topoOverlay || "";
+    const service = overlay.startsWith("service:") ? overlay.slice("service:".length) : null;
+    svg.classList.toggle("is-service", Boolean(service));
+    if (!service) return;
+    const carrying = new Set(
+      (graph.nodes || [])
+        .filter(
+          (node) =>
+            (node.services || []).includes(service) ||
+            (node.attachments || []).some((a) => a.service === service)
+        )
+        .map((node) => node.name)
+    );
+    // The client whose address a virtual segment tracks is part of the
+    // routed service through it, whatever bridge domain it sits in.
+    for (const link of graph.links || []) {
+      if (link.kind !== "ves-nh") continue;
+      if (carrying.has(link.a)) carrying.add(link.b);
+      if (carrying.has(link.b)) carrying.add(link.a);
+    }
+    svg.querySelectorAll("[data-node]").forEach((cell) => {
+      cell.classList.toggle("in-service", carrying.has(cell.dataset.node));
+    });
+    svg.querySelectorAll("[data-link]").forEach((pair) => {
+      pair.classList.toggle("in-service", carrying.has(pair.dataset.a) && carrying.has(pair.dataset.b));
+    });
+  }
+
+  /** How many findings a node has, on its top-right corner, in the worst one's colour. */
+  function topoBadge(node, box) {
+    const counts = node.findings || {};
+    const total = (counts.error || 0) + (counts.warning || 0);
+    if (!total) return null;
+    const tone = counts.error ? "error" : "warning";
+    const badge = svgEl("g", { class: `topo-badge tone-${tone}` });
+    const cx = box.x + box.w - 2;
+    const cy = box.y + 2;
+    badge.append(svgEl("circle", { cx, cy, r: total > 9 ? 10 : 8 }));
+    const text = svgEl("text", { x: cx, y: cy + 3.5, "text-anchor": "middle" });
+    text.textContent = total > 99 ? "99+" : String(total);
+    badge.append(text);
+    return badge;
+  }
+
+  /** What the checks found, as a list in a detail panel. */
+  function appendTopoIssues(panel, issues, noun) {
+    if (!issues.length) return;
+    const heading = document.createElement("h3");
+    heading.textContent = `${issues.length} ${noun}`;
+    panel.append(heading);
+    const list = document.createElement("ul");
+    list.className = "topo-issue-list";
+    for (const issue of issues) {
+      const item = document.createElement("li");
+      item.className = `topo-issue tone-${issue.severity}${issue.acknowledged ? " is-acked" : ""}`;
+      const head = document.createElement("div");
+      head.className = "topo-issue-head";
+      head.textContent = `${issue.acknowledged ? "✓ " : ""}${issue.node} ${issue.check} ${issue.subject}`;
+      if (issue.acknowledged) head.title = "acknowledged";
+      const detail = document.createElement("div");
+      detail.className = "muted";
+      detail.textContent = issue.detail;
+      item.append(head, detail);
+      list.append(item);
+    }
+    panel.append(list);
+  }
+
+  /**
+   * The graph without what only one service overlay draws: a virtual
+   * ethernet-segment and its aliasing are not cables, and belong on the
+   * drawing only while the routed service they serve is the one shown.
+   */
+  function topoOverlayView(graph) {
+    const overlay = state.topoOverlay || "";
+    const service = overlay.startsWith("service:") ? overlay.slice("service:".length) : null;
+    const shown = (item) => !item.overlay_only || (service !== null && item.overlay_only.includes(service));
+    const nodes = graph.nodes.filter(shown);
+    const names = new Set(nodes.map((node) => node.name));
+    return {
+      ...graph,
+      nodes,
+      links: graph.links.filter((link) => shown(link) && names.has(link.a) && names.has(link.b)),
+      layers: graph.layers
+        .map((layer) => ({ ...layer, nodes: layer.nodes.filter((name) => names.has(name)) }))
+        .filter((layer) => layer.nodes.length),
+    };
   }
 
   /* ------------------------------------------------------- topology fabrics */
@@ -1073,7 +1277,7 @@
       if (!a || !b) continue;
       const id = `${link.a}\u0000${link.b}`;
       const pair = svgEl("g", {
-        class: `topo-link-pair${link.access ? " is-access" : ""}`,
+        class: `topo-link-pair${link.access ? " is-access" : ""}${link.lost ? " is-lost" : ""}`,
         "data-link": id,
         "data-a": link.a,
         "data-b": link.b,
@@ -1132,6 +1336,16 @@
         badge.textContent = `${link.count}\u00d7`;
         pair.append(badge);
       }
+      if (link.kind === "alias" || link.df) {
+        const tag = svgEl("text", {
+          class: "topo-link-tag",
+          x: (a.cx + b.cx) / 2,
+          y: (a.cy + b.cy) / 2 - 3,
+          "text-anchor": "middle",
+        });
+        tag.textContent = link.kind === "alias" ? "L3 alias" : "DF";
+        pair.append(tag);
+      }
       // Only a single cable can be labelled without the two ends colliding;
       // a bundle shows its size instead, and its ports in the detail panel.
       if (dom.topoPortLabels.checked && !link.intra_layer && link.count === 1) {
@@ -1186,6 +1400,21 @@
 
   function topoHalfClass(link, bps) {
     const parts = ["topo-link"];
+    // What a virtual segment is tied in with is drawn by what it is, not by
+    // what it carries: none of it is a cable with a rate of its own.
+    if (link.kind) {
+      parts.push(`link-${link.kind}`);
+      if (link.df) parts.push("is-df");
+      if (stateKind(link.state) === "down") parts.push("link-down");
+      return parts.join(" ");
+    }
+    // Coloured by what the checks found on it rather than by what it
+    // carries; a down cable stays dashed, which is the other half of it.
+    if (state.topoOverlay === "health" && !link.access) {
+      if (stateKind(link.state) === "down") parts.push("link-down");
+      parts.push(`health-${link.health || "ok"}`);
+      return parts.join(" ");
+    }
     // A cable that carries nothing gets no bandwidth colour: a down one has
     // nothing to forward, and a standby one is not forwarding on purpose -
     // which is why standby is coloured apart from down rather than red.
@@ -1234,7 +1463,10 @@
       access: link.access,
       ports: (link.ports || []).map((port) => ({ a_port: port.a_port, b_port: port.b_port })),
     }));
-    return JSON.stringify(graph.nodes) + JSON.stringify(links);
+    // A finding's detail carries counts that move every sample; the badge
+    // and colour a node is drawn with are what the drawing depends on.
+    const nodes = (graph.nodes || []).map(({ issues, ...node }) => node);
+    return JSON.stringify(nodes) + JSON.stringify(links) + state.topoOverlay;
   }
 
   function trimBw(text) {
@@ -1304,7 +1536,7 @@
       const box = layout.positions.get(node.name);
       if (!box) continue;
       const cell = svgEl("g", {
-        class: `topo-node role-${node.role}${node.connected ? "" : " is-down"}`,
+        class: `topo-node role-${node.role}${node.connected ? "" : " is-down"}${node.virtual ? " is-virtual" : ""}`,
         "data-node": node.name,
         tabindex: "0",
       });
@@ -1336,6 +1568,8 @@
         platform.textContent = node.platform;
         cell.append(platform);
       }
+      const badge = topoBadge(node, box);
+      if (badge) cell.append(badge);
       const title = svgEl("title");
       title.textContent = topoNodeTitle(node);
       cell.append(title);
@@ -1345,6 +1579,10 @@
   }
 
   function topoNodeSub(node) {
+    if (node.virtual) {
+      const hops = ((node.ves && node.ves.next_hops) || []).map((hop) => hop.address);
+      return hops.length ? `nh ${hops.join(", ")}` : "virtual ES";
+    }
     if (isTopoAttached(node)) {
       // Being multi-homed is said before what is carried: the leaves under the
       // box are the point of it being a single box.
@@ -1386,6 +1624,10 @@
     if (node.stitched) lines.push(`${node.stitched} stitched service(s)`);
     if (node.clients) lines.push(`${node.clients} client(s)`);
     if (node.error) lines.push(node.error);
+    const counts = node.findings || {};
+    if (counts.error || counts.warning) {
+      lines.push(`${counts.error || 0} error / ${counts.warning || 0} warning finding(s)`);
+    }
     return lines.join(" - ");
   }
 
@@ -1406,6 +1648,12 @@
     if (link.a_out_bps != null || link.b_out_bps != null) {
       parts.push(`${link.a} out ${formatBps(link.a_out_bps)}`);
       parts.push(`${link.b} out ${formatBps(link.b_out_bps)}`);
+    }
+    if (link.lost) parts.push("LLDP lost: drawn from what was seen before");
+    if (link.note) parts.push(link.note);
+    for (const finding of link.findings || []) {
+      const ack = finding.acknowledged ? " (acknowledged)" : "";
+      parts.push(`${finding.severity}: ${finding.node} ${finding.check} ${finding.subject}${ack}`);
     }
     return parts.join(" · ");
   }
@@ -1812,6 +2060,8 @@
     }
     if (node.clients) panel.append(topoDetailRow("clients", String(node.clients)));
     if (node.error) panel.append(topoDetailRow("error", node.error));
+    if ((node.services || []).length) panel.append(topoDetailRow("carries", node.services.join(", ")));
+    appendTopoIssues(panel, node.issues || [], "finding(s) on this node");
 
     const links = graph.links.filter((l) => l.a === name || l.b === name);
     const heading = document.createElement("h3");
@@ -1847,6 +2097,10 @@
 
   /** A client or a segment is its attachments: where it lands, in which service. */
   function renderTopoAttachedDetail(node, graph) {
+    if (node.virtual) {
+      renderTopoVirtualDetail(node, graph);
+      return;
+    }
     const label = (name) => {
       const peer = graph.nodes.find((n) => n.name === name);
       return peer ? peer.label : name;
@@ -1891,6 +2145,61 @@
     panel.append(list);
   }
 
+  /**
+   * A virtual segment: the next-hop it tracks and how that is reached, the
+   * leaves it is attached on and which of them is DF, and the remote VTEPs
+   * whose route tables load-balance over it.
+   */
+  function renderTopoVirtualDetail(node, graph) {
+    const label = (name) => {
+      const peer = graph.nodes.find((n) => n.name === name);
+      return peer ? peer.label : name;
+    };
+    const ves = node.ves || {};
+    const panel = topoDetailShell(`vES ${(node.names || []).join(" · ") || node.esi}`, node.esi);
+    panel.append(topoDetailRow("serves", (node.services || []).join(", ")));
+    panel.append(topoDetailRow("mode", `${ves.mode || "-"} · ${ves.oper || "-"}`));
+    for (const hop of ves.next_hops || []) {
+      const via = hop.via ? ` via ${hop.via}` : "";
+      const evis = (hop.evis || []).length ? ` (evi ${hop.evis.join(", ")})` : "";
+      panel.append(topoDetailRow("next-hop", `${hop.address}${via}${evis}`));
+    }
+    if ((ves.owners || []).length) panel.append(topoDetailRow("owned by", ves.owners.map(label).join(", ")));
+    panel.append(topoDetailRow("attached", (ves.attached || []).map(label).join(", ") || "none"));
+    const idle = (ves.configured || []).filter((name) => !(ves.attached || []).includes(name));
+    if (idle.length) panel.append(topoDetailRow("configured only", idle.map(label).join(", ")));
+    for (const [ni, elected] of Object.entries(ves.df || {})) {
+      const views = Object.entries((ves.df_views || {})[ni] || {})
+        .map(([viewer, df]) => `${viewer}: ${df}`)
+        .join(" · ");
+      const row = topoDetailRow(`DF ${ni}`, elected.length > 1 ? `CONFLICT - ${views}` : elected.join(", "));
+      if (elected.length > 1) row.classList.add("is-conflict");
+      panel.append(row);
+    }
+    const heading = document.createElement("h3");
+    heading.textContent = `${(ves.aliasing || []).length} remote VTEP(s) aliasing`;
+    panel.append(heading);
+    const list = document.createElement("ul");
+    list.className = "topo-peer-list";
+    for (const alias of ves.aliasing || []) {
+      const item = document.createElement("li");
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "topo-peer";
+      const title = document.createElement("span");
+      title.textContent = label(alias.node);
+      const detail = document.createElement("span");
+      detail.className = "muted";
+      const over = `ECMP over ${alias.vteps.map(label).join(" + ")}`;
+      detail.textContent = alias.prefixes.length ? `${over} · ${alias.prefixes.join(", ")}` : over;
+      button.append(title, detail);
+      button.addEventListener("click", () => selectTopo({ kind: "node", id: alias.node }));
+      item.append(button);
+      list.append(item);
+    }
+    panel.append(list);
+  }
+
   function renderTopoLinkDetail(id) {
     const graph = state.topology;
     if (!graph) return;
@@ -1906,6 +2215,8 @@
     };
     const panel = topoDetailShell(`${label(a)} ↔ ${label(b)}`, "");
     panel.append(topoDetailRow("state", link.state));
+    if (link.lost) panel.append(topoDetailRow("lldp", "lost - drawn from what was seen before"));
+    appendTopoIssues(panel, link.findings || [], "finding(s) on this link");
     panel.append(topoDetailRow("cables", String(link.count)));
     panel.append(topoDetailRow(`${label(a)} out`, formatBps(link.a_out_bps)));
     panel.append(topoDetailRow(`${label(b)} out`, formatBps(link.b_out_bps)));
@@ -2061,6 +2372,7 @@
     state.windowSize = WINDOW_STEP;
     dom.title.textContent = report.title;
     dom.desc.textContent = report.description;
+    if (dom.baselineBtn) dom.baselineBtn.hidden = report.name !== "changes";
     dom.body.replaceChildren();
     dom.headRow.replaceChildren();
     dom.filterRow.replaceChildren();
@@ -4289,7 +4601,7 @@
     title.className = "bd-vrf-title";
     title.textContent = item.title;
     header.append(title);
-    if (item.state) header.append(lensStateBadge(item.state, item.state.toUpperCase()));
+    if (item.state) header.append(lensStateBadge(item.state, item.label || item.state.toUpperCase()));
     block.append(header);
     const details = document.createElement("div");
     details.className = "bd-details";
@@ -4320,7 +4632,7 @@
     name.textContent = entry.title;
     title.append(chevron, name);
     if (entry.state) {
-      const badge = lensStateBadge(entry.state, entry.state.toUpperCase());
+      const badge = lensStateBadge(entry.state, entry.label || entry.state.toUpperCase());
       badge.className = `bd-node-state ${LENS_BADGE_CLASS[entry.state] || ""}`.trim();
       title.append(badge);
     }
@@ -4384,13 +4696,17 @@
     title.className = "bd-title";
     title.textContent = card.title;
     top.append(chevron, icon, title);
-    if (card.state) top.append(lensStateBadge(card.state, card.state.toUpperCase()));
+    // The label, where the lens gives one: an incident's colour is that of
+    // down, but what it is is an error, not something reported down.
+    if (card.state || card.label) top.append(lensStateBadge(card.state, card.label || card.state.toUpperCase()));
     if (card.badge) {
       const badge = document.createElement("span");
       badge.className = "bd-badge-count";
       badge.textContent = card.badge;
       top.append(badge);
     }
+    if (card.action && card.key) top.append(ackButton(card));
+    if (card.action === "unack") el.classList.add("is-acked");
     header.append(top);
     if (card.subtitle) {
       const sub = document.createElement("div");
@@ -4427,6 +4743,52 @@
       }
     });
     return el;
+  }
+
+  /**
+   * ACK / un-ACK on an incident's card. Acknowledging takes the incident out
+   * of the overview, the badges and the colours until a finding it did not
+   * hold joins it, or it clears.
+   */
+  function ackButton(card) {
+    const acking = card.action === "ack";
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "btn btn-ghost bd-ack";
+    button.textContent = acking ? "✓ ACK" : "↺ Un-ACK";
+    button.title = acking
+      ? "Acknowledge: known, keep it out of the overview, badges and colours until it changes or clears"
+      : "Take the acknowledgement off: count and colour it again";
+    button.addEventListener("click", async (event) => {
+      event.stopPropagation();
+      let note = "";
+      if (acking) {
+        const typed = window.prompt(`Acknowledge "${card.title}"\n\nNote (optional):`, "");
+        if (typed === null) return; // cancelled
+        note = typed;
+      }
+      button.disabled = true;
+      try {
+        const res = await fetch(acking ? "/api/ack" : "/api/unack", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          // The incident's id is of the fabric as this page shows it.
+          body: JSON.stringify({ incident: card.key, note, inv_filter: dom.invFilter.value.trim() }),
+        });
+        if (!res.ok) {
+          const body = await res.json().catch(() => ({}));
+          // Not the error bar: the next table the stream pushes clears it,
+          // and the click would look like it did nothing at all.
+          window.alert(`${acking ? "ACK" : "Un-ACK"} failed: ${body.error || res.status}`);
+        }
+      } catch (_err) {
+        window.alert(`${acking ? "ACK" : "Un-ACK"} failed: the server did not answer`);
+      } finally {
+        button.disabled = false;
+        connect(); // the answer changes at once, not at the next refresh
+      }
+    });
+    return button;
   }
 
   // What a lens found, as cards: one per thing found, the nodes inside it,
@@ -4682,7 +5044,10 @@
       } else if (!state.firstPaint && previous === undefined) {
         tr.className = "added";
       }
-      const tone = toned ? toned.tone(String(row[toned.column] ?? "").toLowerCase()) : "";
+      const tone =
+        toned && !(toned.quiet && toned.quiet(row))
+          ? toned.tone(String(row[toned.column] ?? "").toLowerCase())
+          : "";
       if (tone) tr.classList.add("tone-" + tone);
       for (const column of columns) {
         const value = row[column] ?? "";
@@ -5028,6 +5393,50 @@
 
   dom.clearFiltersBtn.addEventListener("click", clearAllFilters);
 
+  const openReport = (name) => {
+    const report = state.reports.find((r) => r.name === name);
+    if (report) selectReport(report);
+  };
+
+  if (dom.kpiCardHealth) dom.kpiCardHealth.addEventListener("click", () => openReport("incidents"));
+
+  if (dom.baselineBtn) {
+    dom.baselineBtn.addEventListener("click", async () => {
+      dom.baselineBtn.disabled = true;
+      try {
+        const res = await fetch("/api/baseline", { method: "POST" });
+        const status = await res.json();
+        const at = status.baseline_at ? new Date(status.baseline_at * 1000).toLocaleTimeString() : "now";
+        dom.streamInfo.textContent = `baseline set at ${at}`;
+        // Asking for the drift right after setting the baseline shows it
+        // empty, which is the point: everything from here on is a change.
+        state.reportParams.set("since", "baseline");
+        renderReportParams();
+        updateFilterUI();
+        connect();
+        syncCurrentVisit();
+      } catch (_err) {
+        showErrors([{ node: "server", error: "setting the baseline failed" }]);
+      } finally {
+        dom.baselineBtn.disabled = false;
+      }
+    });
+  }
+
+  if (dom.topoOverlay) {
+    dom.topoOverlay.addEventListener("change", () => {
+      state.topoOverlay = dom.topoOverlay.value;
+      try {
+        localStorage.setItem("fcli-topo-overlay", state.topoOverlay);
+      } catch (_err) {
+        /* storage may be unavailable */
+      }
+      if (state.topology) renderTopology(state.topology);
+    });
+  }
+
+  if (dom.chatTriage) dom.chatTriage.addEventListener("click", triage);
+
   if (dom.kpiCardBd) {
     dom.kpiCardBd.addEventListener("click", () => {
       const report = state.reports.find((r) => r.name === "bridge_domains");
@@ -5239,6 +5648,11 @@
   }
   restoreTopoZoom();
   restoreTopoFabric();
+  try {
+    state.topoOverlay = localStorage.getItem("fcli-topo-overlay") || "traffic";
+  } catch (_err) {
+    /* storage may be unavailable */
+  }
   restoreTopoMaxBw();
   initSideSplit();
 
@@ -5806,6 +6220,18 @@
         onEvent(event, payload);
       }
     }
+  }
+
+  // One click for the question every session starts with. The agent is told
+  // in its system prompt to answer it from the incidents and the timeline.
+  const TRIAGE_PROMPT =
+    "Triage the fabric: what is wrong, what changed recently, the most likely root cause, " +
+    "and what I should check next. Start from the incidents and the recent changes.";
+
+  function triage() {
+    if (!state.chatEnabled || state.chatBusy) return;
+    dom.chatInput.value = TRIAGE_PROMPT;
+    sendChat();
   }
 
   async function sendChat(event) {

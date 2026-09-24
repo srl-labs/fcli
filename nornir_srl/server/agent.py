@@ -404,6 +404,18 @@ def system_prompt(context: Optional[Dict[str, Any]], topo_name: Optional[str]) -
         "You are a read-only SR Linux fabric troubleshooting assistant inside fcli.",
         "Prefer live report tools (bgp_peers, lldp_neighbors, ipv4_rib, mac_table, …) "
         "before logging into a node. Those tables are the same data the UI is streaming.",
+        "For 'what is wrong', a triage, or any question about the fabric's health, "
+        "start with fabric_incidents: it groups every check's findings by root "
+        "cause, so a link down arrives together with the BGP, BFD and IGP sessions "
+        "that went down over it. An incident's root is the cause to explain; its "
+        "related findings are consequences, not separate problems to chase. A "
+        "'pattern' incident is one cause repeated in many places - say so rather "
+        "than listing each place. An incident marked acknowledged is known to "
+        "the operators: mention it briefly, and focus on the open ones.",
+        "Then call recent_changes: since='15m' (or longer) for what happened and "
+        "when, since='baseline' for how the fabric drifted from its known-good "
+        "state. A change that happened just before the incident is usually its "
+        "trigger. Quote change times as given.",
         "For 'where is this address', 'how does A reach B' and 'show me this "
         "service everywhere' use locate_address, trace_path and service_detail: "
         "each joins several reports across every node in one call.",
@@ -621,15 +633,19 @@ class ChatService:
             answer = self.store.lens_table(lens, parse_kv(arguments.get("inv_filter")), params)
         except ValueError as exc:
             return json.dumps({"error": str(exc)})
-        return dumps_truncated(
-            {
-                "lens": lens.name,
-                "title": lens.title,
-                "records": answer["records"],
-                "errors": answer["errors"],
-                "nodes": answer["nodes"],
-            }
-        )
+        payload = {
+            "lens": lens.name,
+            "title": lens.title,
+            "records": answer["records"],
+            "errors": answer["errors"],
+            "nodes": answer["nodes"],
+        }
+        if lens.name == "changes":
+            # A change is stamped with a Unix time; the rows carry it as the
+            # time of day the user sees on the timeline, which is what an
+            # answer should quote.
+            payload["records"] = answer["rows"]
+        return dumps_truncated(payload)
 
     def _jsonrpc_unreachable(self) -> Optional[str]:
         """Why node_cli is pointless right now, if a node already proved it is."""

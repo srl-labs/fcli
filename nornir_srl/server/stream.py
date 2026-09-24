@@ -14,17 +14,23 @@ to find in the returned structure.
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from ..connections.helpers import strip_modules
-from ..connections.routing import _gnmi_path_missing
+# One suppressor for the whole process: it swaps pygnmi's handlers out and back
+# under a refcount, and two copies with a count each would restore them while
+# the other still meant them gone.
+from ..connections.routing import _gnmi_path_missing, _suppress_pygnmi_client_logging
 from ..reports import SubscriptionSpec
 from .tree import (
     ListNode,
+    key_matches,
+    split_path,
+    strip_module,
     delete,
     get_node,
     insert,
@@ -37,34 +43,6 @@ from .tree import (
 
 logger = logging.getLogger(__name__)
 
-_pygnmi_suppress_lock = threading.Lock()
-_pygnmi_suppress_depth = 0
-_pygnmi_suppress_saved = None
-
-
-@contextmanager
-def _suppress_pygnmi_client_logging():
-    global _pygnmi_suppress_depth, _pygnmi_suppress_saved
-    log = logging.getLogger("pygnmi.client")
-    with _pygnmi_suppress_lock:
-        if _pygnmi_suppress_depth == 0:
-            _pygnmi_suppress_saved = (list(log.handlers), log.level, log.propagate)
-            log.handlers.clear()
-            log.setLevel(logging.CRITICAL + 1)
-            log.propagate = False
-        _pygnmi_suppress_depth += 1
-    try:
-        yield
-    finally:
-        with _pygnmi_suppress_lock:
-            _pygnmi_suppress_depth -= 1
-            if _pygnmi_suppress_depth == 0 and _pygnmi_suppress_saved is not None:
-                handlers, prev_level, prev_propagate = _pygnmi_suppress_saved
-                _pygnmi_suppress_saved = None
-                log.setLevel(prev_level)
-                log.propagate = prev_propagate
-                for h in handlers:
-                    log.addHandler(h)
 
 
 # Counters used to derive interface rates from consecutive streamed samples.
@@ -198,6 +176,98 @@ def _extract_item_path(item: Any) -> str:
     return ""
 
 
+#: How many paths SR Linux accepts in one Subscribe request. Beyond it the
+#: whole request is refused with OUT_OF_RANGE - every path of the node stops
+#: streaming - so a request is planned to stay within it; see
+#: :func:`plan_subscription`. A device that says it allows fewer is believed.
+MAX_SUBSCRIBED_PATHS = 36
+
+_MAX_PATHS_ERROR = re.compile(r"maximum of (\d+) subscribed paths")
+
+
+def _covers(outer: SubscriptionSpec, inner: SubscriptionSpec) -> bool:
+    """Whether subscribing to *outer* delivers everything *inner* would.
+
+    It does when *outer* is a prefix of *inner* element by element, and each
+    key it constrains selects at least what *inner*'s does: ``name=*`` covers
+    ``name=irb*`` and ``name=default``, but ``name=lag*`` does not cover
+    ``name=*``, and a key *inner* leaves open is one *outer* must too.
+    """
+    if outer.path == inner.path or outer.mode != inner.mode:
+        return False
+    outer_elems, inner_elems = parse_path(outer.path), parse_path(inner.path)
+    if len(outer_elems) > len(inner_elems):
+        return False
+    for (o_name, o_keys), (i_name, i_keys) in zip(outer_elems, inner_elems):
+        if o_name != i_name:
+            return False
+        for key, pattern in o_keys.items():
+            value = i_keys.get(key)
+            if value is None:
+                if pattern != "*":
+                    return False
+            elif not key_matches(pattern, value) or ("*" in value and pattern != "*" and pattern != value):
+                return False
+    return True
+
+
+def plan_subscription(
+    specs: List[SubscriptionSpec], limit: int = MAX_SUBSCRIBED_PATHS
+) -> Tuple[List[SubscriptionSpec], Dict[str, str], List[str]]:
+    """What goes into one Subscribe request, for *specs* to all be served.
+
+    Returns the request's specs, the paths left out because another path of
+    the request delivers them (path -> the path that does), and the paths
+    left out because the request would otherwise exceed *limit* - which are
+    served by polling instead.
+
+    A path another one covers is merged into it, taking the faster of the two
+    sample intervals: the same updates land in the same tree either way. What
+    still does not fit is decided by how fast it is sampled - the slowest are
+    polled, as the ones for which a Get every so often loses the least.
+    """
+    specs = sorted(specs, key=lambda s: len(parse_path(s.path)))
+    roots: List[SubscriptionSpec] = []
+    covered: Dict[str, str] = {}
+    for spec in specs:
+        root = next((r for r in roots if _covers(r, spec)), None)
+        if root is None:
+            roots.append(spec)
+            continue
+        covered[spec.path] = root.path
+        if spec.sample_interval < root.sample_interval:
+            faster = SubscriptionSpec(root.path, root.datatype, root.mode, spec.sample_interval)
+            roots[roots.index(root)] = faster
+    polled: List[str] = []
+    if len(roots) > limit:
+        by_speed = sorted(roots, key=lambda s: (-s.sample_interval, s.path))
+        for spec in by_speed[: len(roots) - limit]:
+            roots.remove(spec)
+            polled.append(spec.path)
+            # What it covered goes with it: nothing in the request delivers it.
+            polled.extend(path for path, root in covered.items() if root == spec.path)
+        covered = {path: root for path, root in covered.items() if path not in polled}
+    roots.sort(key=lambda s: s.path)
+    return roots, covered, sorted(polled)
+
+
+def _bare(path: str) -> str:
+    """*path* with the YANG module prefix taken off every element name.
+
+    SR Linux names elements with their module in a subscription update -
+    ``srl_nokia-network-instance:network-instance[name=default]/protocols/
+    srl_nokia-bgp:bgp/...`` - while an envelope is named as a Get answers,
+    which is without. Only the names are touched: a key value keeps its
+    colons, which an IPv6 address is made of.
+    """
+    elems = []
+    for elem in split_path(path):
+        bracket = elem.find("[")
+        name, keys = (elem, "") if bracket == -1 else (elem[:bracket], elem[bracket:])
+        elems.append(strip_module(name) + keys)
+    return "/".join(elems)
+
+
 def _under(path: str, envelope: str) -> bool:
     """Whether an update *path* lies under *envelope* (``network-instance``,
     ``system/lldp``); the root envelope holds everything."""
@@ -271,6 +341,17 @@ class HostStream:
         ] = {}
         #: Failed Gets, kept for the same TTL as successful ones.
         self._failed_gets: Dict[Tuple[str, str], Tuple[float, Exception]] = {}
+        #: Paths this node rejected as not in its schema - the fabric modules
+        #: of a fixed-form chassis. Unlike a failure, that does not change
+        #: while the connection lasts, so they are not asked for again; a
+        #: reconnect (an upgrade is one) starts a new stream and asks afresh.
+        self._rejected: Dict[Tuple[str, str], Exception] = {}
+        #: The most paths one Subscribe request may carry on this node.
+        self.max_paths = MAX_SUBSCRIBED_PATHS
+        #: How the current request was planned: paths another one delivers,
+        #: and paths polled because the request had no room for them.
+        self._covered: Dict[str, str] = {}
+        self._polled: Set[str] = set()
         self.rates = RateTracker()
 
         self._thread: Optional[threading.Thread] = None
@@ -349,6 +430,12 @@ class HostStream:
         with self._lock:
             state = self._paths.get(spec.path)
         if state is None:  # retired while we were getting to it
+            return False
+        rejected = self._rejected.get((spec.path, spec.datatype))
+        if rejected is not None:
+            # Discovery has just asked, and the node said it has no such path.
+            with self._lock:
+                state.error = str(rejected)
             return False
         # Deliberately outside the lock: this is a network round-trip, and every
         # render of every report on this node would queue up behind it.
@@ -525,9 +612,19 @@ class HostStream:
         with self._lock:
             self._generation += 1
             generation = self._generation
-            specs = [
+            wanted = [
                 s.spec for s in self._paths.values() if s.streamable and s.bootstrapped
             ]
+            specs, self._covered, polled = plan_subscription(wanted, self.max_paths)
+            self._polled = set(polled)
+        if polled:
+            logger.info(
+                "%s: %d path(s) do not fit the %d a subscription may carry, polling them: %s",
+                self.name,
+                len(polled),
+                self.max_paths,
+                ", ".join(polled),
+            )
         logger.debug(
             "%s: restarting subscription (generation %d) with %d path(s): %s",
             self.name,
@@ -590,6 +687,12 @@ class HostStream:
                 if self._alive(generation):
                     self.error = str(exc)
                     logger.warning("%s: subscription failed: %s", self.name, exc)
+                    limit = _MAX_PATHS_ERROR.search(str(exc))
+                    if limit and int(limit.group(1)) < self.max_paths:
+                        # The same request would be refused again: plan a new
+                        # one within what the node says it takes.
+                        self.max_paths = int(limit.group(1))
+                        self._dirty.set()
                 # Otherwise this is the RPC we cancelled ourselves to re-subscribe
                 # with a changed path set, which says nothing about the node.
             finally:
@@ -663,8 +766,9 @@ class HostStream:
                 path = join_path(prefix, item_path)
                 val = item.get("val") if isinstance(item, dict) else None
                 insert(self._tree, path, val)
+                bare = _bare(path)
                 for env in envelopes:
-                    if _under(path, env):
+                    if _under(bare, env):
                         self._envelope_seen[env] = arrived
                 itf = _touched_interface(path)
                 if itf:
@@ -786,6 +890,10 @@ class HostStream:
         """Return the streamed state for *path* shaped like a gNMI Get response."""
         with self._lock:
             state = self._paths.get(path)
+            if path in self._polled:
+                # Not in the subscription, so the tree is not kept current for
+                # it: the caller Gets it instead, at its sample interval.
+                return None
             if state is None or not state.bootstrapped or not state.streamable:
                 return self._borrowed_snapshot(path)
             state.last_read = time.time()
@@ -870,16 +978,23 @@ class HostStream:
         cache_key = (path, datatype)
         now = time.time()
         with self._lock:
+            state = self._paths.get(path)
+            # A path polled in place of streaming is as fresh as its sample
+            # interval asks for, not as the Get cache would otherwise keep it.
+            ttl = state.spec.sample_interval if path in self._polled and state else self.get_ttl
             cached = self._direct_cache.get(cache_key)
-            if cached and now - cached[0] < self.get_ttl:
+            if cached and now - cached[0] < ttl:
                 logger.debug(
                     "%s: serving %s from the %.0fs Get cache (%.1fs old)",
                     self.name,
                     path,
-                    self.get_ttl,
+                    ttl,
                     now - cached[0],
                 )
                 return cached[1]
+            rejected = self._rejected.get(cache_key)
+            if rejected is not None:
+                raise rejected
             failed = self._failed_gets.get(cache_key)
             if failed and now - failed[0] < self.get_ttl:
                 logger.debug(
@@ -893,7 +1008,10 @@ class HostStream:
             resp = self._raw_get(path, datatype)
         except Exception as exc:  # noqa: BLE001 - re-raised to the caller
             with self._lock:
-                self._failed_gets[cache_key] = (now, exc)
+                if _gnmi_path_missing(exc):
+                    self._rejected[cache_key] = exc
+                else:
+                    self._failed_gets[cache_key] = (now, exc)
             raise
         with self._lock:
             self._failed_gets.pop(cache_key, None)
@@ -945,6 +1063,7 @@ class HostStream:
                         path,
                         exc,
                     )
+                    self._rejected[(path, datatype)] = exc
                     self._failing_since = None
                     self._get_error = None
                     raise
@@ -1055,11 +1174,17 @@ class HostStream:
                     "path": state.spec.path,
                     "mode": state.spec.mode,
                     "sample_interval": state.spec.sample_interval,
-                    "streaming": state.streamable and state.bootstrapped,
+                    "streaming": state.streamable
+                    and state.bootstrapped
+                    and state.spec.path not in self._polled,
                     # Empty when the report was opened, so the envelope shape is
                     # not known yet; served by TTL-cached Gets until it fills up.
                     "pending": state.streamable and not state.bootstrapped,
                     "error": state.error,
+                    # Delivered by another path of the subscription, or left
+                    # out of it for room and polled instead.
+                    "covered_by": self._covered.get(state.spec.path),
+                    "polled": state.spec.path in self._polled,
                 }
                 for state in self._paths.values()
             ]

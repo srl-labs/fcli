@@ -48,6 +48,7 @@ from .fakes import (
     NH_RESPONSE,
     NHGROUP_PATH,
     NHGROUP_RESPONSE,
+    HEALTH_RESPONSES,
     SYS_INFO_RESPONSES,
     FakeDevice,
     es_response,
@@ -107,6 +108,7 @@ def _responses(name="leaf1"):
             }
         ],
         **SYS_INFO_RESPONSES,
+        **HEALTH_RESPONSES,
     }
 
 
@@ -1088,10 +1090,22 @@ def test_reports_endpoint_lists_the_lenses_as_what_they_are(client):
     test_client, _devices = client
     payload = test_client.get("/api/reports").json()
     lenses = {r["name"]: r for r in payload["reports"] if r.get("kind") == "lens"}
-    assert set(lenses) == {lens.name for lens in lenses_for(SERVER)} == {"where", "path", "service"}
+    assert set(lenses) == {lens.name for lens in lenses_for(SERVER)} == {
+        "incidents",
+        "changes",
+        "where",
+        "path",
+        "service",
+    }
     assert all(r["category"] == "Lenses" for r in lenses.values())
     required = {name: [p["name"] for p in r["params"] if p["required"]] for name, r in lenses.items()}
-    assert required == {"where": ["target"], "path": ["source", "destination"], "service": ["name"]}
+    assert required == {
+        "incidents": [],
+        "changes": [],
+        "where": ["target"],
+        "path": ["source", "destination"],
+        "service": ["name"],
+    }
 
 
 def test_reports_endpoint_returns_topo_name(fabric):

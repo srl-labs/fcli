@@ -653,6 +653,111 @@ ES_TABLE = Table(
 )
 
 
+def _usecs(value: Optional[int]) -> str:
+    """A BFD interval, in the milliseconds it is configured in."""
+    return f"{value // 1000}ms" if value else ""
+
+
+BFD_TABLE = Table(
+    columns=(Column("NI", "ni"),),
+    each="sessions",
+    each_columns=(
+        Column("remote", "remote_address"),
+        Column("state", "state"),
+        Column("remote-state", "remote_state"),
+        Column("interface", "interface"),
+        Column("local", "local_address"),
+        Column("clients", lambda s: _joined(s.protocols)),
+        Column("last-change", "last_transition"),
+        Column("failures", "failures"),
+        Column("diag", lambda s: s.local_diagnostic if s.local_diagnostic != "no_diagnostic" else ""),
+        Column("tx/rx", lambda s: f"{_usecs(s.tx_interval)}/{_usecs(s.rx_interval)}".strip("/")),
+    ),
+)
+
+ISIS_TABLE = Table(
+    columns=(
+        Column("NI", "ni"),
+        Column("instance", "instance"),
+        Column("interface", "name"),
+        Column("oper", "oper"),
+        Column("circuit", lambda i: "passive" if i.passive else i.circuit_type),
+    ),
+    each="adjacencies",
+    each_columns=(
+        Column("neighbor", lambda a: a.hostname or a.system_id),
+        Column("system-id", "system_id"),
+        Column("level", "level"),
+        Column("state", "state"),
+        Column("nbr-ipv4", "ipv4"),
+        Column("last-change", "last_transition"),
+        Column("flaps", "transitions"),
+        Column("down-reason", "down_reason"),
+    ),
+)
+
+OSPF_TABLE = Table(
+    columns=(
+        Column("NI", "ni"),
+        Column("instance", "instance"),
+        Column("area", "area"),
+        Column("interface", "name"),
+        Column("oper", "oper"),
+        Column("type", lambda i: "passive" if i.passive else i.interface_type),
+    ),
+    each="neighbors",
+    each_columns=(
+        Column("router-id", "router_id"),
+        Column("address", "address"),
+        Column("state", "state"),
+        Column("last-established", "last_established"),
+        Column("changes", "state_changes"),
+    ),
+)
+
+RESOURCES_TABLE = Table(
+    columns=(
+        Column("component", "component"),
+        Column("resource", "name"),
+        Column("used-%", "used_percent"),
+        Column("used", "used"),
+        Column("free", "free"),
+    ),
+)
+
+COMPONENTS_TABLE = Table(
+    columns=(
+        Column("kind", "kind"),
+        Column("id", "id"),
+        Column("oper", "oper"),
+        Column("health", "health"),
+        Column("type", "type"),
+        Column("serial", "serial_number"),
+    ),
+)
+
+
+def _dbm(value: Optional[float]) -> str:
+    return f"{value:.2f}" if value is not None else ""
+
+
+TRANSCEIVERS_TABLE = Table(
+    columns=(
+        Column("interface", "interface"),
+        Column("oper", "oper"),
+        Column("form-factor", "form_factor"),
+        Column("pmd", "pmd"),
+        Column("vendor", "vendor"),
+        Column("part", "part_number"),
+        Column("temp-C", lambda t: f"{t.temperature:.1f}" if t.temperature is not None else ""),
+        Column("rx-dBm", lambda t: _joined(_dbm(c.input_power) for c in t.channels)),
+        Column("tx-dBm", lambda t: _joined(_dbm(c.output_power) for c in t.channels)),
+        Column("alarms", lambda t: _joined(t.alarms)),
+        Column("warnings", lambda t: _joined(t.warnings)),
+    ),
+)
+
+
 def _route_next_hop(nh: Any) -> str:
     """A next-hop as the table names it: its address, or what it resolves through."""
     if nh.type == "indirect" and nh.resolving_route:
@@ -1328,6 +1433,98 @@ REPORTS: List[ReportSpec] = [
         subscribe=(
             SubscriptionSpec("/interface[name=*]/subinterface[index=*]/ipv6/neighbor-discovery/neighbor", datatype="all"),
             SubscriptionSpec("/network-instance[name=*]/interface", datatype="config"),
+        ),
+    ),
+    ReportSpec(
+        name="bfd",
+        table=BFD_TABLE,
+        resource="bfd",
+        key_columns=("Node", "NI", "remote"),
+        title="BFD Sessions",
+        description="BFD sessions, the protocols they protect, and how often they failed.",
+        getter=lambda d: d.get_bfd(),
+        category="Routing",
+        mcp_name="bfd_sessions",
+        sample_interval=10,
+        subscribe=(
+            SubscriptionSpec("/bfd/network-instance[name=*]/peer", sample_interval=10),
+        ),
+    ),
+    ReportSpec(
+        name="isis",
+        table=ISIS_TABLE,
+        resource="isis",
+        key_columns=("Node", "NI", "interface", "system-id", "level"),
+        title="IS-IS Adjacencies",
+        description="IS-IS interfaces and the adjacencies formed on them.",
+        getter=lambda d: d.get_isis(),
+        category="Routing",
+        mcp_name="isis_adjacencies",
+        sample_interval=15,
+        subscribe=(
+            SubscriptionSpec(
+                "/network-instance[name=*]/protocols/isis/instance[name=*]/interface[interface-name=*]",
+                datatype="all",
+                sample_interval=15,
+            ),
+        ),
+    ),
+    ReportSpec(
+        name="ospf",
+        table=OSPF_TABLE,
+        resource="ospf",
+        key_columns=("Node", "NI", "interface", "router-id"),
+        title="OSPF Neighbors",
+        description="OSPF interfaces and the neighbours on them.",
+        getter=lambda d: d.get_ospf(),
+        category="Routing",
+        mcp_name="ospf_neighbors",
+        sample_interval=15,
+        subscribe=(
+            SubscriptionSpec(
+                "/network-instance[name=*]/protocols/ospf/instance[name=*]/area[area-id=*]/interface[interface-name=*]",
+                datatype="all",
+                sample_interval=15,
+            ),
+        ),
+    ),
+    ReportSpec(
+        name="resources",
+        table=RESOURCES_TABLE,
+        resource="resources",
+        key_columns=("Node", "component", "resource"),
+        title="Resources",
+        description="CPU, memory and forwarding-table utilization per node.",
+        getter=lambda d: d.get_resources(),
+        category="System",
+        mcp_name="platform_resources",
+        sample_interval=30,
+    ),
+    ReportSpec(
+        name="components",
+        table=COMPONENTS_TABLE,
+        resource="components",
+        key_columns=("Node", "kind", "id"),
+        title="Hardware",
+        description="Control and line cards, fabric modules, fans and power supplies.",
+        getter=lambda d: d.get_components(),
+        category="System",
+        mcp_name="hardware_components",
+        sample_interval=60,
+    ),
+    ReportSpec(
+        name="transceivers",
+        table=TRANSCEIVERS_TABLE,
+        resource="transceivers",
+        key_columns=("Node", "interface"),
+        title="Transceivers",
+        description="Optics with their light levels, temperature and the DOM "
+        "thresholds they report as crossed.",
+        getter=lambda d: d.get_transceivers(),
+        category="Interfaces",
+        sample_interval=30,
+        subscribe=(
+            SubscriptionSpec("/interface[name=*]/transceiver", sample_interval=30),
         ),
     ),
     ReportSpec(

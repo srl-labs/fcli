@@ -416,3 +416,24 @@ SYS_INFO_RESPONSES: Dict[str, List[Dict[str, Any]]] = {
         {"platform/control[slot=A]": {"software-version": "v24.10.1-492-gabc"}}
     ],
 }
+
+#: The paths of the BFD, IGP and platform reports, answered as a node that has
+#: none of it configured does: with nothing. The fake fabric runs neither BFD
+#: nor an IGP, and a Get for a subtree that holds nothing is an empty answer
+#: rather than an error.
+HEALTH_RESPONSES: Dict[str, List[Dict[str, Any]]] = {
+    path: []
+    for path in (
+        "/bfd/network-instance[name=*]/peer",
+        "/network-instance[name=*]/protocols/isis/instance[name=*]/interface[interface-name=*]",
+        "/network-instance[name=*]/protocols/ospf/instance[name=*]/area[area-id=*]/interface[interface-name=*]",
+        "/platform/control[slot=*]/cpu[index=all]/total",
+        "/platform/control[slot=*]/memory",
+        "/platform/linecard[slot=*]/forwarding-complex[name=*]/datapath",
+        "/platform/control[slot=*]",
+        "/platform/linecard[slot=*]",
+        "/platform/fan-tray[id=*]",
+        "/platform/power-supply[id=*]",
+        "/interface[name=*]/transceiver",
+    )
+}

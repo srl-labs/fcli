@@ -226,10 +226,15 @@ def check_itf_errors(state: FabricState) -> List[Finding]:
 
     The counters are the change over the sampling interval, not the totals, so
     a finding means it is happening now rather than that it once did.
+
+    Not on a containerlab node: the kernel discards on a veth what a real
+    port forwards - IPv6 multicast the container's own stack does not want,
+    for one - so the counters move on a healthy lab all the time and say
+    nothing about the fabric.
     """
     findings = []
     for node, stats in state.items("ifstats"):
-        if _out_of_band(stats.name):
+        if _out_of_band(stats.name) or node in state.containerlab:
             continue
         if stats.in_errors or stats.out_errors:
             findings.append(
@@ -710,6 +715,37 @@ def check_es_df(state: FabricState) -> List[Finding]:
                 )
             )
 
+    # Every node computes the DF of a segment in a network-instance itself, and
+    # they have to come to the same answer: two that each elect themselves both
+    # forward, which on a single-active segment is what it exists to prevent.
+    elected: Dict[Tuple[str, str], Dict[str, str]] = {}
+    for node, segment in state.items("es"):
+        for association in segment.associations:
+            if segment.esi and association.designated is not None:
+                elected.setdefault((segment.esi, association.ni), {})[node] = association.designated
+    owner = {address: node for node, addresses in system_addresses(state).items() for address in addresses}
+    names = {segment.esi: segment.name for _node, segment in state.items("es") if segment.name}
+    for (esi, ni), by_node in sorted(elected.items()):
+        if len(set(by_node.values())) < 2:
+            continue
+        views: Dict[str, List[str]] = {}
+        for node, df in by_node.items():
+            views.setdefault(df, []).append(node)
+        said = "; ".join(
+            f"{df}{f' ({owner[df]})' if df in owner else ''} according to {', '.join(sorted(nodes))}"
+            for df, nodes in sorted(views.items())
+        )
+        for node in sorted(by_node):
+            findings.append(
+                Finding(
+                    check="es_df",
+                    severity=ERROR,
+                    node=node,
+                    subject=f"{names.get(esi, esi)}/{ni}",
+                    detail=f"nodes disagree on the designated forwarder: {said}",
+                )
+            )
+
     for esi, by_node in sorted(modes.items()):
         if len({mode for mode in by_node.values() if mode}) < 2:
             continue
@@ -729,6 +765,238 @@ def check_es_df(state: FabricState) -> List[Finding]:
                     ),
                 )
             )
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# liveness: BFD and the IGPs
+# --------------------------------------------------------------------------- #
+
+#: BFD states that are not a fault: up, or taken down on purpose.
+_BFD_FINE = {"up", "admin-down", "admin_down"}
+
+#: OSPF neighbour states that are a working adjacency. Two routers on a
+#: broadcast segment that are neither of them DR stop at two-way, correctly.
+_OSPF_FINE = {"full", "two-way", "2-way"}
+
+#: Interfaces an IGP runs on without ever forming an adjacency, by name.
+_IGP_LOOPBACKS = ("system", "lo")
+
+
+def check_bfd_down(state: FabricState) -> List[Finding]:
+    """A BFD session that is not up.
+
+    BFD is what tells BGP or IS-IS that a link has stopped forwarding within
+    a second rather than a hold time, so a session down leaves the protocol
+    it protects blind - or, where the protocol waits for it, down as well.
+    """
+    findings = []
+    for node, instance, session in state.sub_items("bfd", "sessions"):
+        if session.state in _BFD_FINE:
+            continue
+        where = f" on {session.interface}" if session.interface else ""
+        diagnostic = session.local_diagnostic if session.local_diagnostic not in ("", "no_diagnostic") else ""
+        silent = session.remote_discriminator == 0 and not session.failures
+        findings.append(
+            Finding(
+                check="bfd_down",
+                severity=ERROR,
+                node=node,
+                subject=f"{instance.ni}/{session.remote_address}",
+                detail=(
+                    f"session is {session.state or 'unknown'}{where}, protecting "
+                    f"{', '.join(session.protocols) or 'nothing'}"
+                    + (f", diagnostic {diagnostic}" if diagnostic else "")
+                    + (
+                        "; the far end has never answered - is BFD enabled there?"
+                        if silent
+                        else ""
+                    )
+                ),
+            )
+        )
+    return findings
+
+
+def check_igp_adjacency_down(state: FabricState) -> List[Finding]:
+    """An IS-IS adjacency or OSPF neighbour that is not up."""
+    findings = []
+    for node, itf, adjacency in state.sub_items("isis", "adjacencies"):
+        if adjacency.state == "up":
+            continue
+        neighbor = adjacency.hostname or adjacency.system_id
+        reason = f", {adjacency.down_reason}" if adjacency.down_reason else ""
+        findings.append(
+            Finding(
+                check="igp_adjacency_down",
+                severity=ERROR,
+                node=node,
+                subject=itf.name,
+                detail=f"IS-IS {adjacency.level} adjacency to {neighbor} is {adjacency.state or 'unknown'}{reason}",
+            )
+        )
+    for node, itf, neighbor in state.sub_items("ospf", "neighbors"):
+        if neighbor.state in _OSPF_FINE:
+            continue
+        findings.append(
+            Finding(
+                check="igp_adjacency_down",
+                severity=ERROR,
+                node=node,
+                subject=itf.name,
+                detail=f"OSPF neighbour {neighbor.router_id} in area {itf.area} is {neighbor.state or 'unknown'}",
+            )
+        )
+    return findings
+
+
+def check_igp_no_adjacency(state: FabricState) -> List[Finding]:
+    """An IGP interface that is up and meant to form an adjacency, but has none.
+
+    Nothing reports this as down: the interface is up, the IGP runs on it,
+    and there is simply nobody on the other end - a mismatched area, level or
+    authentication, or an MTU the hellos do not fit through.
+    """
+    findings = []
+    for report, noun, key in (("isis", "IS-IS", "adjacencies"), ("ospf", "OSPF", "neighbors")):
+        for node, itf in state.items(report):
+            if itf.passive or itf.oper != "up" or getattr(itf, key):
+                continue
+            if itf.name.startswith(_IGP_LOOPBACKS):
+                continue
+            findings.append(
+                Finding(
+                    check="igp_no_adjacency",
+                    severity=WARNING,
+                    node=node,
+                    subject=itf.name,
+                    detail=f"{noun} runs on it and it is up, but no adjacency formed",
+                )
+            )
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# the platform
+# --------------------------------------------------------------------------- #
+
+#: Utilization at which a resource is worth a look, and at which it is about
+#: to refuse the next route, MAC or process.
+RESOURCE_WARNING = 80
+RESOURCE_ERROR = 95
+
+
+def check_resource_high(state: FabricState) -> List[Finding]:
+    """CPU, memory or a forwarding table close to full.
+
+    A full forwarding table is the failure nothing else explains: the route
+    is in the RIB, BGP is happy, and the packet is dropped anyway because
+    the hardware had no room left to program it.
+    """
+    findings = []
+    for node, resource in state.items("resources"):
+        used = resource.used_percent
+        if used is None or used < RESOURCE_WARNING:
+            continue
+        counts = f" ({resource.used} used, {resource.free} free)" if resource.used is not None else ""
+        findings.append(
+            Finding(
+                check="resource_high",
+                severity=ERROR if used >= RESOURCE_ERROR else WARNING,
+                node=node,
+                subject=f"{resource.component} {resource.name}",
+                detail=f"{used}% in use{counts}",
+            )
+        )
+    return findings
+
+
+def check_hardware_fault(state: FabricState) -> List[Finding]:
+    """A card, fan or power supply that is fitted and not working."""
+    findings = []
+    for node, component in state.items("components"):
+        if component.oper in ("", "empty", "up", "booting"):
+            if component.health != "unhealthy":
+                continue
+        findings.append(
+            Finding(
+                check="hardware_fault",
+                severity=ERROR,
+                node=node,
+                subject=f"{component.kind} {component.id}",
+                detail=f"oper-state {component.oper or 'unknown'}, health {component.health or 'unknown'}",
+            )
+        )
+    return findings
+
+
+def check_optic_dom(state: FabricState) -> List[Finding]:
+    """An optic reporting one of its own alarm or warning thresholds as crossed.
+
+    Light that is fading is a link that is going to start dropping frames -
+    usually with CRC errors first, and then flapping - so the optic saying so
+    is the earliest warning there is.
+    """
+    findings = []
+    for node, optic in state.items("transceivers"):
+        for severity, crossed in ((ERROR, optic.alarms), (WARNING, optic.warnings)):
+            if not crossed:
+                continue
+            reading = []
+            rx = optic.lowest_input_power
+            if rx is not None:
+                reading.append(f"lowest rx {rx:.2f} dBm")
+            if optic.temperature is not None:
+                reading.append(f"{optic.temperature:.1f} C")
+            findings.append(
+                Finding(
+                    check="optic_dom",
+                    severity=severity,
+                    node=node,
+                    subject=optic.interface,
+                    detail=(
+                        f"{'alarm' if severity == ERROR else 'warning'}: {', '.join(crossed)}"
+                        + (f" ({', '.join(reading)})" if reading else "")
+                    ),
+                )
+            )
+    return findings
+
+
+# --------------------------------------------------------------------------- #
+# history
+# --------------------------------------------------------------------------- #
+
+
+def check_flapping(state: FabricState) -> List[Finding]:
+    """Something that keeps changing state: a session, a port, a MAC.
+
+    Each reading on its own shows it up - or down - and nothing wrong; only
+    the timeline shows it going back and forth. A MAC that moves between two
+    ports over and over is a loop or two hosts sharing an address.
+
+    Reads :attr:`FabricState.changes`, which only the live server keeps, so
+    elsewhere this finds nothing.
+    """
+    from .changes import FLAP_WINDOW, flaps  # noqa: PLC0415 - changes imports fabric
+
+    findings = []
+    for flap in flaps(state.changes):
+        minutes = round(FLAP_WINDOW / 60)
+        if flap.kind == "mac":
+            ni, _, mac = flap.subject.partition(" ")
+            subject, what = f"{ni}/{mac}", f"moved {flap.count} times between {', '.join(flap.values)}"
+        else:
+            subject, what = flap.subject, f"changed {flap.count} times ({' / '.join(flap.values)})"
+        findings.append(
+            Finding(
+                check="flapping",
+                severity=WARNING,
+                node=flap.node,
+                subject=subject,
+                detail=f"{flap.kind} {what} in the last {minutes} minutes",
+            )
+        )
     return findings
 
 
@@ -794,9 +1062,53 @@ CHECKS: Tuple[Check, ...] = (
     ),
     Check(
         name="es_df",
-        title="Ethernet segments without a designated forwarder",
-        requires=("es",),
+        title="Ethernet segments without a designated forwarder, or with two",
+        # The system addresses say which node a DF address is.
+        requires=("es", "ni"),
         run=check_es_df,
+    ),
+    Check(
+        name="bfd_down",
+        title="BFD sessions that are not up",
+        requires=("bfd",),
+        run=check_bfd_down,
+    ),
+    Check(
+        name="igp_adjacency_down",
+        title="IS-IS adjacencies and OSPF neighbours that are not up",
+        requires=("isis", "ospf"),
+        run=check_igp_adjacency_down,
+    ),
+    Check(
+        name="igp_no_adjacency",
+        title="IGP interfaces that are up but formed no adjacency",
+        requires=("isis", "ospf"),
+        run=check_igp_no_adjacency,
+    ),
+    Check(
+        name="resource_high",
+        title="CPU, memory or forwarding tables close to full",
+        requires=("resources",),
+        run=check_resource_high,
+    ),
+    Check(
+        name="hardware_fault",
+        title="Cards, fans and power supplies that are fitted and not working",
+        requires=("components",),
+        run=check_hardware_fault,
+    ),
+    Check(
+        name="optic_dom",
+        title="Optics reporting a DOM alarm or warning",
+        requires=("transceivers",),
+        run=check_optic_dom,
+    ),
+    Check(
+        name="flapping",
+        title="Sessions, ports and MACs that keep changing state",
+        # The timeline rather than a report: only the live server keeps one.
+        requires=(),
+        run=check_flapping,
     ),
 )
 
@@ -832,7 +1144,7 @@ def run_checks(
     selected = [c for c in CHECKS if not only or c.name in only]
     findings: List[Finding] = []
     for check in selected:
-        if not any(state.reports.get(report) for report in check.requires):
+        if check.requires and not any(state.reports.get(report) for report in check.requires):
             continue
         try:
             findings.extend(check.run(state))

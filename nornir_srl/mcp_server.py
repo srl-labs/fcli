@@ -36,6 +36,7 @@ from nornir.core import Nornir
 from nornir.core.task import Result, Task
 
 from . import clab
+from .changes import WATCH_REPORTS
 from .checks import CHECKS, collect_fabric_state, run_checks
 from .connections.srlinux import CONNECTION_NAME
 from .connections.helpers import clean_structured_key
@@ -825,6 +826,150 @@ def ipv6_neighbors(
 
 
 @mcp.tool()
+def bfd_sessions(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get BFD sessions: the liveness checks under BGP, IS-IS and static routes.
+
+    Returns one object per network-instance per node: node, ni and sessions,
+    each with local_address, remote_address, state ('up', 'down', 'init',
+    'admin-down'), remote_state, remote_discriminator (0 while the far end has
+    never answered - on a session that never came up, BFD is usually not
+    enabled over there), interface (the subinterface of a link-local
+    session), protocols (the clients it protects), last_transition, failures
+    (times it went down after having been up), local_diagnostic,
+    remote_diagnostic, tx_interval / rx_interval (microseconds) and multiplier.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'state=up'). Values are case-insensitive regexes.
+    """
+    return _run_report("bfd", inv_filter, field_filter)
+
+
+@mcp.tool()
+def isis_adjacencies(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get IS-IS interfaces and the adjacencies formed on them.
+
+    Returns one object per IS-IS interface per node: node, ni, instance, name,
+    oper, passive (a passive interface is meant to have no adjacency),
+    circuit_type and adjacencies, each with system_id, hostname (the
+    neighbour's dynamic hostname), level ('L1', 'L2'), state ('up', 'down',
+    'init', 'failed'), down_reason, ipv4, ipv6, last_transition and
+    transitions (how often it went up or down).
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'state=up'). Values are case-insensitive regexes.
+    """
+    return _run_report("isis", inv_filter, field_filter)
+
+
+@mcp.tool()
+def ospf_neighbors(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get OSPF interfaces and the neighbours on them.
+
+    Returns one object per OSPF interface per node: node, ni, instance, area,
+    name, oper, passive, interface_type and neighbors, each with router_id,
+    address, state ('full' is a working adjacency, 'two-way' a correct one
+    between two non-DR routers on a broadcast segment), priority,
+    last_established and state_changes.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'state=up'). Values are case-insensitive regexes.
+    """
+    return _run_report("ospf", inv_filter, field_filter)
+
+
+@mcp.tool()
+def platform_resources(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get CPU, memory and forwarding-table utilization per node.
+
+    Returns one object per resource per node: node, component ('control A', or
+    'linecard 1/0' for a forwarding complex), name ('cpu' as a five-minute
+    average, 'memory', or a datapath table such as 'ip-lpm-routes',
+    'mac-addresses', 'ecmp-groups'), used_percent, used and free (entries,
+    or bytes for memory). A table close to full is a route in the RIB that
+    never makes it into hardware.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'state=up'). Values are case-insensitive regexes.
+    """
+    return _run_report("resources", inv_filter, field_filter)
+
+
+@mcp.tool()
+def hardware_components(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get the chassis components: control and line cards, fabric modules, fans and PSUs.
+
+    Returns one object per component per node: node, kind ('control',
+    'linecard', 'fabric', 'fan-tray', 'power-supply'), id, oper ('up',
+    'down', 'empty', 'failed', ...), health ('healthy', 'unhealthy',
+    'unspecified'), type and serial_number. Virtual nodes report fans and
+    PSUs as 'empty'.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'state=up'). Values are case-insensitive regexes.
+    """
+    return _run_report("components", inv_filter, field_filter)
+
+
+@mcp.tool()
+def transceivers(
+    inv_filter: Optional[str] = None,
+    field_filter: Optional[str] = None,
+) -> str:
+    """Get the optics plugged into each port, with their digital diagnostics.
+
+    Returns one object per fitted transceiver per node: node, interface, oper,
+    down_reason, form_factor, pmd, vendor, part_number, serial_number,
+    temperature (C), voltage (V), channels (each with index, input_power and
+    output_power in dBm, laser_bias in mA), and alarms / warnings: the DOM
+    thresholds the optic itself reports as crossed, e.g. 'input-power low'.
+    Empty cages are left out; virtual nodes have none.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs (e.g. 'role=leaf,site=dc1').
+            Supports wildcards. Matches against node labels from the topology file; use
+            'show_topology' to see available keys. Omit to target all nodes.
+        field_filter: Field filter as comma-separated key=value pairs to filter output rows
+            (e.g. 'state=up'). Values are case-insensitive regexes.
+    """
+    return _run_report("transceivers", inv_filter, field_filter)
+
+
+@mcp.tool()
 def routing_policies(
     inv_filter: Optional[str] = None,
 ) -> str:
@@ -865,15 +1010,18 @@ def fabric_checks(
     correlates one or more reports across every node at once, so it can see
     faults a single table cannot: a link only one end reports, two leaves that
     disagree about the VNI of a service, an ethernet-segment with no designated
-    forwarder. Prefer this over reading the individual reports when the question
-    is 'what is broken', and follow up with the specific report a finding names.
+    forwarder. fabric_incidents groups these same findings by root cause and
+    is usually the better first call; use this one for the flat list, or to
+    run a single check.
 
     Returns a JSON list of findings, worst first, each with:
         Severity: 'error' (the fabric is not doing what it was built to do) or
             'warning' (legitimate in some fabrics, a fault in most).
         Check: which check found it. One of: bgp_down, bgp_af_down,
             bgp_no_routes, itf_down, itf_errors, lldp_one_sided, mtu_mismatch,
-            evpn_service_mismatch, es_df. 'collection' means a report could not
+            mtu_outlier, evpn_service_mismatch, es_df, bfd_down,
+            igp_adjacency_down, igp_no_adjacency, resource_high,
+            hardware_fault, optic_dom. 'collection' means a report could not
             be read from a node, so that node went unchecked.
         Node, Subject, Detail: where it is and what is wrong.
 
@@ -923,6 +1071,123 @@ def _run_lens(lens: str, inv_filter: Optional[str] = None, **params: Any) -> str
             for (report, node), error in sorted(state.errors.items())
         ]
     return json.dumps(payload, indent=2, default=str)
+
+
+@mcp.tool()
+def fabric_incidents(inv_filter: Optional[str] = None) -> str:
+    """Every check's findings grouped by root cause: the first tool to call for 'what is wrong'.
+
+    Runs the same checks as fabric_checks, then groups their findings by what
+    they are about, so one broken cable reads as one incident - the interface
+    down, with the BGP, BFD and IGP sessions that went down over it - rather
+    than a dozen unrelated rows. The same cause in several places (BFD down
+    on every leaf-spine link) is folded into one 'pattern' incident.
+
+    Returns {"records": [...]}, worst incident first, each with:
+        id, severity ('error' or 'warning'), kind ('link', 'port', 'node',
+            'session', 'underlay', 'platform', 'segment', 'pattern' or
+            'finding' for one that stands alone), title, node (where the root
+            cause is), nodes (every node involved).
+        root: the finding that explains the others - check, severity, node,
+            subject, detail. 'node_unreachable' and 'underlay_unreachable' are
+            roots no single check reports: a node that answered nothing, and
+            an overlay session to a loopback there is no route to.
+        related: every other finding the incident accounts for.
+        explanation: one sentence saying what the incident is and holds.
+    Plus "not_collected" when a node's report could not be read.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs. Omit it
+            unless the fabric is large: correlation needs both ends of a link.
+    """
+    return _run_lens("incidents", inv_filter)
+
+
+#: What 'mark_baseline' kept, for 'changes_since_baseline' to compare against.
+_baseline: Dict[str, Any] = {}
+
+
+@mcp.tool()
+def mark_baseline(inv_filter: Optional[str] = None) -> str:
+    """Remember the fabric as it is now, to compare it against later.
+
+    Call it before a change - a maintenance, a config push, a test - and call
+    changes_since_baseline afterwards to see exactly what the change did:
+    sessions and ports that went down or came up, LLDP neighbours lost, DF
+    elections that moved, MACs that moved, route counts that fell, findings
+    raised and cleared. The baseline lives as long as this MCP server does,
+    and is replaced by the next call.
+
+    Returns when the baseline was taken, how many nodes it covers, and the
+    findings the checks had at that point.
+
+    Args:
+        inv_filter: Inventory filter as comma-separated key=value pairs. The
+            comparison later covers the nodes both readings have in common.
+    """
+    import time as _time  # noqa: PLC0415
+
+
+    i_filter, _ = _parse_filters(inv_filter, None)
+    nornir = get_nornir()
+    target = nornir.filter(**i_filter) if i_filter else nornir
+    state = collect_lens_state(target, WATCH_REPORTS)
+    findings = run_checks(state)
+    _baseline.clear()
+    _baseline.update(at=_time.time(), state=state, findings=findings, inv_filter=inv_filter)
+    return json.dumps(
+        {
+            "baseline_at": _time.strftime("%Y-%m-%dT%H:%M:%S", _time.localtime(_baseline["at"])),
+            "nodes": len(target.inventory.hosts),
+            "findings": len(findings),
+            "not_collected": [
+                {"node": node, "report": report, "error": error}
+                for (report, node), error in sorted(state.errors.items())
+            ],
+        },
+        indent=2,
+    )
+
+
+@mcp.tool()
+def changes_since_baseline() -> str:
+    """What changed in the fabric since mark_baseline was called.
+
+    Reads the fabric again, over the same nodes, and compares it with the
+    baseline. Only differences are returned, worst first: an empty list means
+    nothing the reports can see has changed.
+
+    Returns {"baseline_at": ..., "changes": [...]}, each change with:
+        time, node, kind ('bgp', 'bgp-routes', 'interface', 'lldp', 'bfd',
+            'isis', 'ospf', 'es', 'es-df', 'mac', 'routes', 'hardware',
+            'optic' or 'finding'), subject (the peer, port, MAC or finding),
+        before, after (empty where it did not exist on that side),
+        severity ('error' something stopped working, 'warning', 'ok' something
+            recovered, 'info' something new or gone that was not working
+            anyway), detail.
+    """
+    import time as _time  # noqa: PLC0415
+
+    from .changes import as_row, diff_fabric, diff_findings  # noqa: PLC0415
+
+    if not _baseline:
+        return json.dumps({"error": "no baseline: call mark_baseline first"}, indent=2)
+    i_filter, _ = _parse_filters(_baseline.get("inv_filter"), None)
+    nornir = get_nornir()
+    target = nornir.filter(**i_filter) if i_filter else nornir
+    state = collect_lens_state(target, WATCH_REPORTS)
+    now = _time.time()
+    changes = diff_fabric(_baseline["state"], state, at=now) + diff_findings(
+        _baseline["findings"], run_checks(state), at=now
+    )
+    return json.dumps(
+        {
+            "baseline_at": _time.strftime("%Y-%m-%dT%H:%M:%S", _time.localtime(_baseline["at"])),
+            "changes": [as_row(change) for change in changes],
+        },
+        indent=2,
+        default=str,
+    )
 
 
 @mcp.tool()

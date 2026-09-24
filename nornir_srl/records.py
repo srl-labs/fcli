@@ -814,14 +814,210 @@ class BgpRib:
     routes: Tuple[BgpRoute, ...] = ()
 
 
+# --------------------------------------------------------------------------- #
+# bfd: the liveness sessions under the routing protocols
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class BfdSession:
+    """One BFD session, as the node that runs it sees it."""
+
+    local_address: str
+    remote_address: str
+    #: ``up``, ``down``, ``init`` or ``admin-down``.
+    state: str
+    remote_state: str = ""
+    #: The discriminator the far end chose, or ``0`` while it has never
+    #: answered - which, on a session that never came up, usually means BFD
+    #: is not enabled over there at all.
+    remote_discriminator: Optional[int] = None
+    #: The subinterface a link-local session runs on; empty for one that is
+    #: not bound to a single link, a multihop session to a loopback.
+    interface: str = ""
+    #: The protocols it tells about a failure: ``BGP``, ``ISIS``, ``STATIC``...
+    protocols: Tuple[str, ...] = ()
+    last_transition: str = ""
+    #: Times it went down after having been up: a flap counter the device keeps.
+    failures: int = 0
+    local_diagnostic: str = ""
+    remote_diagnostic: str = ""
+    #: Negotiated intervals, in microseconds, and the detection multiplier.
+    tx_interval: Optional[int] = None
+    rx_interval: Optional[int] = None
+    multiplier: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class BfdInstance:
+    """The BFD sessions of one network-instance."""
+
+    ni: str
+    sessions: Tuple[BfdSession, ...] = ()
+
+
+# --------------------------------------------------------------------------- #
+# isis / ospf: the IGP adjacencies
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class IsisAdjacency:
+    """One IS-IS adjacency formed on an interface."""
+
+    system_id: str
+    #: The neighbour's dynamic hostname, which is how it matches back to a node.
+    hostname: str = ""
+    #: ``L1``, ``L2``, or ``L1L2`` on a point-to-point circuit.
+    level: str = ""
+    #: ``up``, ``down``, ``initializing`` or ``failed``.
+    state: str = ""
+    down_reason: str = ""
+    ipv4: str = ""
+    ipv6: str = ""
+    last_transition: str = ""
+    transitions: int = 0
+
+
+@dataclass(frozen=True)
+class IsisInterface:
+    """One interface an IS-IS instance runs on, and the adjacencies on it."""
+
+    ni: str
+    instance: str
+    name: str
+    oper: str = ""
+    #: A passive interface is advertised but never forms an adjacency, so
+    #: having none is what it is for.
+    passive: bool = False
+    circuit_type: str = ""
+    adjacencies: Tuple[IsisAdjacency, ...] = ()
+
+
+@dataclass(frozen=True)
+class OspfNeighbor:
+    """One OSPF neighbour on an interface."""
+
+    router_id: str
+    address: str = ""
+    #: ``full`` is a working adjacency; ``two-way`` one that is correct
+    #: between two routers that are neither of them DR; anything else is not
+    #: finished forming.
+    state: str = ""
+    priority: Optional[int] = None
+    last_established: str = ""
+    state_changes: int = 0
+
+
+@dataclass(frozen=True)
+class OspfInterface:
+    """One interface an OSPF instance runs on, and the neighbours on it."""
+
+    ni: str
+    instance: str
+    area: str
+    name: str
+    oper: str = ""
+    passive: bool = False
+    #: ``point-to-point`` or ``broadcast``.
+    interface_type: str = ""
+    neighbors: Tuple[OspfNeighbor, ...] = ()
+
+
+# --------------------------------------------------------------------------- #
+# resources / hardware: the platform itself
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Resource:
+    """How much of one finite resource is in use."""
+
+    #: Where it lives: ``control A``, ``linecard 1/0`` (a forwarding complex).
+    component: str
+    #: ``cpu``, ``memory``, or a datapath table - ``ip-lpm-routes``,
+    #: ``mac-addresses``, ``ecmp-groups``...
+    name: str
+    used_percent: Optional[int] = None
+    used: Optional[int] = None
+    free: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class Component:
+    """One replaceable part of the chassis and whether it works."""
+
+    #: ``control``, ``linecard``, ``fan-tray``, ``power-supply``, ``fabric``.
+    kind: str
+    id: str
+    #: ``up``, ``down``, ``empty``, ``failed``, ``booting``...
+    oper: str = ""
+    #: What the platform health model thinks of it: ``healthy``,
+    #: ``unhealthy``, or ``unspecified`` where it has no opinion.
+    health: str = ""
+    type: str = ""
+    serial_number: str = ""
+
+
+# --------------------------------------------------------------------------- #
+# transceivers: the optics and what their diagnostics say
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class TransceiverChannel:
+    """One lane of a transceiver: the light it sends and receives."""
+
+    index: int
+    #: dBm.
+    input_power: Optional[float] = None
+    output_power: Optional[float] = None
+    #: mA.
+    laser_bias: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class Transceiver:
+    """The optic plugged into one port, with its digital diagnostics.
+
+    Only a port with something plugged in is a record: an empty cage has no
+    diagnostics to say anything about.
+    """
+
+    interface: str
+    oper: str = ""
+    down_reason: str = ""
+    form_factor: str = ""
+    pmd: str = ""
+    vendor: str = ""
+    part_number: str = ""
+    serial_number: str = ""
+    #: Celsius and volts.
+    temperature: Optional[float] = None
+    voltage: Optional[float] = None
+    channels: Tuple[TransceiverChannel, ...] = ()
+    #: The thresholds the optic itself reports as crossed, as
+    #: ``<measure> <high|low>``: ``input-power low``, ``temperature high``.
+    alarms: Tuple[str, ...] = ()
+    warnings: Tuple[str, ...] = ()
+
+    @property
+    def lowest_input_power(self) -> Optional[float]:
+        powers = [c.input_power for c in self.channels if c.input_power is not None]
+        return min(powers) if powers else None
+
+
 __all__ = [
     "Association",
+    "BfdInstance",
+    "BfdSession",
     "BgpPeers",
     "BgpRib",
     "BgpRoute",
     "BgpVpnInstance",
     "BridgeTable",
     "Candidate",
+    "Component",
     "Egress",
     "EsDestination",
     "EsDestinations",
@@ -834,6 +1030,8 @@ __all__ = [
     "IrbArp",
     "IrbInterface",
     "IrbNd",
+    "IsisAdjacency",
+    "IsisInterface",
     "Lag",
     "LagMember",
     "LldpInterface",
@@ -844,6 +1042,9 @@ __all__ = [
     "NeighborEntry",
     "NetworkInstance",
     "NextHop",
+    "OspfInterface",
+    "OspfNeighbor",
+    "Resource",
     "Route",
     "RouteNextHop",
     "RouteTable",
@@ -856,6 +1057,8 @@ __all__ = [
     "Tunnel",
     "TunnelNextHop",
     "TunnelTable",
+    "Transceiver",
+    "TransceiverChannel",
     "VxlanDestination",
     "VxlanInterface",
     "as_dict",

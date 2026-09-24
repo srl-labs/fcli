@@ -55,3 +55,27 @@ A single inventory may contain multiple disjoint fabrics. Nodes that share no in
 * **Zoom and pan**: Navigate large fabrics using `−` / `+` buttons, `ctrl` + mouse wheel (or trackpad pinch), or `-`, `+`, and `0` keyboard shortcuts. Dragging pans the canvas without accidentally triggering node selection.
 * **Fit to window**: The **fit** button scales the active fabric to fit the browser viewport and dynamically adjusts as detail panels open or close. Manual zoom levels are persisted across page reloads.
 * **Outside & unclassified nodes**: Neighbours discovered via LLDP that do not match inventory nodes are drawn as *outside* nodes. Inventory nodes that have not yet streamed telemetry are rendered as *unclassified* rather than omitted.
+
+## Health overlay and lost cables
+
+The graph `/api/topology` returns is annotated with what the checks found (see [Health](health.md)):
+
+* every node carries `findings` (counts by severity), `health` (the worst of them) and `issues` (the findings themselves), drawn as a badge on its corner;
+* every link carries the `findings` on either of its ends and a `health`, which the **health** overlay colours it by;
+* `incidents` lists the incidents, and `summary` briefs the fabric in a few lines above the drawing.
+
+The **service** overlay lights up the nodes and clients that carry one mac-vrf or ip-vrf, from the service names each node reports (`services`).
+
+A cable LLDP no longer reports is not dropped. The server remembers every adjacency it has seen - kept on disk per fabric in `~/.local/state/fcli/cabling/`, so a server restarted during an outage still knows it - and draws a cable both ends have lost from memory, marked `lost` and dotted, in the state its ports are in now. A link that went down is the one that matters, so it stays on the drawing.
+
+
+## Virtual ethernet-segments (L3 aliasing)
+
+A virtual ethernet-segment has no port: it tracks a next-hop in a routed service, such as a host multi-homed to two leaves that advertises its own prefixes over BGP. It lets every remote VTEP load-balance those prefixes over all the leaves that can reach the host, not only the one that advertised them. None of it is a cable, so it is drawn **only in the service overlay of the ip-vrf it serves**:
+
+* a **vES** node in the segment tier, labelled with the next-hop it tracks;
+* its links to the leaves it is **attached** on, meaning the DF candidates of its election. The designated forwarder is drawn solid and tagged `DF`. Leaves that only have it configured are listed in the detail panel, not drawn;
+* a dotted link to the **client that owns the next-hop**: the client attached, on an attached leaf, to the bridge domain whose IRB subnet holds the next-hop;
+* an `L3 alias` link from every **remote VTEP that actually load-balances over it**. The evidence is that VTEP's own route table in the ip-vrf: the next-hop's host route installed over two or more of the attached VTEPs. The detail panel lists the prefixes that resolve through it.
+
+Each node elects the DF itself. When they disagree, which on a single-active segment means two leaves forwarding, the detail panel shows every node's view, and the `es_df` check raises it as an incident: *"ethernet-segment vES-host6-tenant1: designated forwarder disagreement in ipvrf-1"*.

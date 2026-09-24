@@ -21,6 +21,7 @@ Inventory comes from a [containerlab](https://containerlab.dev/) topology file o
 - [Live server](#live-server)
   - [In the browser](#in-the-browser)
   - [Topology](#topology)
+  - [Health, incidents and the timeline](#health-incidents-and-the-timeline)
   - [Ask (LLM troubleshooting)](#ask-llm-troubleshooting)
   - [How the live data works](#how-the-live-data-works)
   - [gNMI sessions](#gnmi-sessions)
@@ -302,6 +303,13 @@ The global options are the same as for the CLI, so the server can be pointed at 
 │                                     path subscribed for the lifetime of the  │
 │                                     server                                   │
 │                                     [default: 900]                           │
+│ --watch-interval           FLOAT    How often (seconds) the fabric is read   │
+│                                     to keep the change timeline, the         │
+│                                     baseline and the health on the           │
+│                                     topology; 0 disables the timeline        │
+│                                     [default: 15.0]                          │
+│ --persist-acks                      Keep acknowledged incidents across       │
+│                                     server restarts                          │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -310,7 +318,8 @@ The server binds to localhost by default. It has no authentication of its own, s
 ### In the browser
 
 * **Reports** are listed in the sidebar, grouped by category, with a filter box on top. The selected report is kept in the URL fragment (`http://localhost:8080/#bgp_peers`), so a view can be bookmarked or shared.
-* **Overview** is a KPI dashboard: node connectivity, interface and BGP-session health, derived from the same streamed trees as the tables.
+* **Overview** is a KPI dashboard: fabric health (incidents by severity, the worst one, changes in the last 15 minutes and when the baseline was taken), node connectivity, interface and BGP-session health, derived from the same streamed trees as the tables. Click the health card for the incidents.
+* **Incidents** and **Changes** head the lenses: the checks' findings grouped by root cause, and what changed and when. See [Health, incidents and the timeline](#health-incidents-and-the-timeline).
 * **Lenses** sit under the reports: *Where*, *Path* and *Service* take an argument in the bar above the table and answer from the state the server is already streaming, re-asked at the refresh interval. The answer is drawn hierarchically, the way the services pages fold a fabric into cards — one card per address, hop or service, the nodes inside it, and under each node what it reports — with a **Table View** toggle for the flat rows. *Path* opens as a **Path View**: the walk drawn hop by hop, one box per lookup, an edge to each lookup it leads to, so the ECMP fan-out and where it converges again are visible at a glance and a branch that dies ends in a red stop. A lens's arguments are kept in the URL (`#path?source=leaf1&destination=10.0.2.51&ni=ipvrf-1`), so a walk can be shared. The **Ask** chat can call them too.
 * **Sorting**: click a column header to sort, click again to reverse. Sorting is natural, so `ethernet-1/10` comes after `ethernet-1/2`.
 * **Filtering**: each column has its own filter box, and the search box above the table filters on all visible columns at once. Both accept a regular expression and fall back to a substring match if the expression is not valid (yet).
@@ -331,11 +340,30 @@ The **Topology** page draws the fabric from LLDP, one tier per row, and works ou
 
 Cables are de-duplicated from LLDP, annotated with parallel link counts (`2×`), and colored by interface oper-state. Disjoint fabrics are cleanly partitioned into separate tabs with zoom and pan controls.
 
+A few lines above the drawing brief the fabric: what it is built of, what it carries, and what is wrong with it. Every node carries a badge counting its findings. The **overlay** selector colours the cables by **traffic** (the default), by **health** (the worst finding on either end), or lights up one **service** and the nodes and clients that carry it. A cable that goes down is still drawn, dotted, after LLDP has lost it: the server remembers every cable it has seen, across restarts. Clicking a node or a cable lists its findings.
+
 See [Fabric Topology](docs/topology.md) for the complete design document on tier inference, client grouping, multi-fabric partitioning, and navigation.
+
+### Health, incidents and the timeline
+
+The server reads the fabric every `--watch-interval` seconds (15 by default) and keeps:
+
+* **Incidents**: every check's findings grouped by root cause. A link that goes down arrives as *one* incident, together with the BGP, BFD and IGP sessions that went down over it. A node that stopped answering becomes the root of everything that points at it. The same cause in many places folds into one pattern, e.g. *"BFD session down on 16 links: the far end has never answered — is BFD enabled there?"*.
+* **A timeline** of what changed: sessions, ports, LLDP neighbours, BFD and IGP adjacencies, DF elections, MAC moves, route counts that halved, nodes that stopped answering, and findings raised and cleared. It feeds the **flapping** check.
+* **Acknowledgements**: **✓ ACK** on an incident's card takes a known problem out of the Overview, the topology badges, colours and summary, with an optional note. It comes back on its own if a new finding joins it, and the acknowledgement ends when the fault clears. **↺ Un-ACK** undoes it. Acks last as long as the server runs; add `--persist-acks` to keep them across restarts.
+* **A baseline**: the fabric as it was once the server settled, or whenever you press **📌 Set baseline** on the Changes page. `since: baseline` shows the drift from it, which is what a maintenance window or a config push actually changed.
+
+```
+❯ fcli -t topo.clab.yml incidents          # the same grouping, one shot
+```
+
+See [Health](docs/health.md) for how findings are anchored to links, nodes and sessions, what the timeline records, and the checks behind it.
 
 ### Ask (LLM troubleshooting)
 
 **Ask** (top bar) opens a read-only troubleshooting chat as soon as one LLM provider has a key on the server process. The agent uses the live report tables, then JSON-RPC `show` / `info` on a node if needed (containerlab enables JSON-RPC on mgmt; hardware fabrics may not). Keys never go to the browser.
+
+**🩺 Triage** asks the question every session starts with: what is wrong, what changed, the likely root cause and what to check next. The agent is told to answer it from the incidents and the timeline first.
 
 The drawer shows what the agent is doing while it works — thinking, or which tool it is running, with how long each one took — and **Send** turns into **Stop** for as long as a turn is running. Answers are rendered as markdown. Drag the drawer's left edge to widen it (double-click the edge to reset).
 
@@ -377,9 +405,13 @@ The UI is a client of a small JSON API, which is just as usable from scripts:
 | `GET /api/inventory` | Inventory nodes, labels and connection state |
 | `GET /api/status` | Per-node subscription state |
 | `GET /api/overview` | Fabric KPI dashboard payload |
-| `GET /api/topology` | The fabric graph: nodes with their inferred tier and the fabric they are cabled into, the clients hanging off them, and the links between them |
+| `GET /api/topology` | The fabric graph: nodes with their inferred tier and the fabric they are cabled into, the clients hanging off them, and the links between them, each with the findings on it; plus the incidents and a summary |
 | `GET /api/report/{name}` | One rendered table as JSON |
 | `GET /api/stream/{name}` | The same table, pushed as server-sent events |
+| `GET /api/timeline` | How many changes the timeline holds, and when the latest reading and the baseline were taken |
+| `POST /api/baseline` | Keep the fabric as it is now as the baseline |
+| `GET /api/acks` | The acknowledged findings, with when and the note |
+| `POST /api/ack`, `POST /api/unack` | Acknowledge an incident, or take the acknowledgement off: `{"incident": "<id>", "note": "..."}` |
 | `POST /api/chat` | LLM troubleshooting turn (SSE: `start`, `token`, `tool`, `error`, `done`). Takes an optional `provider` (`openai`, `claude`, `grok`) and `effort`; 503 unless a provider key is set |
 
 Report, stream, overview and topology endpoints accept `inv_filter=key=value,key=value`; the stream endpoint also accepts `refresh=<seconds>`.
@@ -432,10 +464,17 @@ Commands:
   es-dest       Displays ES Destinations on the bridge table
   vxlan         Displays VXLAN tunnel interfaces and unicast destinations
   lldp          Displays LLDP Neighbors
+  bfd           Displays BFD sessions and how often they failed
+  isis          Displays IS-IS interfaces and adjacencies
+  ospf          Displays OSPF interfaces and neighbors
+  resources     Displays CPU, memory and forwarding-table utilization
+  components    Displays cards, fabric modules, fans and power supplies
+  transceivers  Displays optics with their light levels and DOM alarms
   arp           Displays ARP table
   nd            Displays IPv6 Neighbors
   routing-pol   Displays Routing Policies (json/yaml only)
   checks        Runs the fabric sanity checks and lists what they found
+  incidents     Groups the checks' findings by root cause, worst first
   where         Finds which nodes know about a MAC or IP address
   path          Walks the route tables hop by hop towards a destination
   service       Shows one service as every node that carries it sees it
@@ -544,6 +583,8 @@ It can start with no topology loaded. These tools then pick or switch the fabric
 
 Report tools take the same `inv_filter` and `field_filter` as the CLI (comma-separated `key=value`).
 
+For "what is wrong", `fabric_incidents` is the tool to start with: the checks' findings grouped by root cause. `mark_baseline` and `changes_since_baseline` bracket a change: mark before a maintenance or a config push, then ask what it did.
+
 ### Claude Desktop
 
 ```json
@@ -596,9 +637,15 @@ One registry drives all three surfaces, so a report cannot drift between CLI, MC
 | L2-ES Destinations | `es-dest` | yes | ES destinations in the bridge table |
 | VXLAN Tunnels | `vxlan` | yes | VXLAN interfaces and unicast destinations |
 | LLDP Neighbors | `lldp` | yes | Neighbours per interface |
+| BFD Sessions | `bfd` | yes | Session state, the protocols protected, failures, diagnostics |
+| IS-IS Adjacencies | `isis` | yes | IS-IS interfaces and their adjacencies, with level, state and flap count |
+| OSPF Neighbors | `ospf` | yes | OSPF interfaces and their neighbours per area |
+| Resources | `resources` | yes | CPU, memory and forwarding-table (ASIC/XDP) utilization |
+| Hardware | `components` | yes | Control and line cards, fabric modules, fans, power supplies |
+| Transceivers | `transceivers` | yes | Optics with rx/tx power, temperature and the DOM thresholds crossed |
 | ARP Table | `arp` | yes | IPv4 neighbours per sub-interface |
 | IPv6 Neighbors | `nd` | yes | ND entries per sub-interface |
-| Checks | `checks` | yes | Fabric sanity checks, worst first; exits non-zero on an error |
+| Checks | `checks` | yes | Fabric sanity checks, worst first - BGP, BFD, IGP, interfaces, LLDP, MTU, EVPN services, ethernet-segments, resources, hardware, optics, flapping; exits non-zero on an error |
 
 A getter and the table it renders as are split apart. Every getter-backed report returns records (`nornir_srl/records.py`) — a network-instance with its subinterfaces as a list, a BGP neighbour with each address family as an object carrying its route counts, a bridge-table entry with its destination already read apart into interface, VTEP, VNI or ESI, a route with each next-hop resolved to the interface, tunnel or prefix it leaves through, a BGP route with every path attribute and the route-targets, SoO and tunnel encapsulation read out of its communities, an interface with its subinterfaces and their resolved down reason, an interface's counters with the errors and discards counted over the sample, an LLDP interface with its neighbours, an ARP or ND cache with each entry's time left as a number of seconds, an irb with each address's flags and its ARP/ND settings as fields, a LAG with its members, a tunnel with each next-hop's port and label stack — and the table is declared next to the report as the columns that read a record. `bgp-rib` has one table per family and EVPN route type, and `--detail` only adds columns to it: the records always carry everything. `-o json` and `-o yaml`, like the MCP tools, emit the records rather than the table's cells (`"families": [{"name": "evpn", "received": 74, ...}]` instead of `"evpn Rx/Act/Tx": "74/0/94"`); the table and `-o csv` are unchanged. The checks and lenses read the same records, so nothing downstream parses a cell back apart. What has no table is what no getter produces: the server-only services and dashboards, which the store builds from its streams, the nested `routing-pol`, and `checks`, whose findings are collected fabric-wide.
 
@@ -610,6 +657,8 @@ One registry (`nornir_srl/lenses.py`) drives the CLI commands, MCP tools, browse
 
 | Lens | CLI | MCP tool | Browser | What it answers |
 | --- | --- | --- | --- | --- |
+| Incidents | `incidents` | `fabric_incidents` | yes | The checks' findings grouped by root cause: a link, a node, a session, the underlay, or one cause repeated as a pattern |
+| Changes | | `mark_baseline` + `changes_since_baseline` | yes | What changed and when, or the drift from the baseline (server only: it keeps the timeline) |
 | Where | `where <mac\|ip>` | `locate_address` | yes | Which node owns an address, which learned it over the overlay, and duplicate conflicts |
 | Path | `path <from> <to>` | `trace_path` | yes | Hop by hop from the route tables, every ECMP branch, through VXLAN or MPLS tunnels to ARP/ND |
 | Service | `service <name>` | `service_detail` | yes | One network-instance, one row per node: EVI, VNI, RTs, interfaces, VTEPs, MAC counts, ES |

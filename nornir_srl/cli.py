@@ -758,6 +758,19 @@ def server(
         help="Where saved report snapshots are kept "
         "(default: ~/.local/state/fcli/snapshots)",
     ),
+    watch_interval: float = typer.Option(
+        15.0,
+        "--watch-interval",
+        help="How often (seconds) the fabric is read to keep the change timeline, "
+        "the baseline and the health on the topology; 0 disables the timeline",
+    ),
+    persist_acks: bool = typer.Option(
+        False,
+        "--persist-acks",
+        help="Keep acknowledged incidents across server restarts "
+        "(in ~/.local/state/fcli/acks/, next to --snapshot-dir). "
+        "By default they last as long as the server runs",
+    ),
 ) -> None:
     """Serves live report tables over HTTP, fed by gNMI subscriptions"""
     from .server.app import serve
@@ -782,6 +795,8 @@ def server(
         log_level=ctx.obj["log_level"],
         topo_name=ctx.obj.get("topo_name"),
         snapshot_dir=snapshot_dir,
+        watch_interval=watch_interval,
+        persist_acks=persist_acks,
     )
 
 
@@ -1013,6 +1028,60 @@ def nd(
 
 
 @app.command()
+def bfd(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays BFD sessions and how often they failed"""
+    run_report(ctx, "bfd", field_filter)
+
+
+@app.command()
+def isis(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays IS-IS interfaces and adjacencies"""
+    run_report(ctx, "isis", field_filter)
+
+
+@app.command()
+def ospf(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays OSPF interfaces and neighbors"""
+    run_report(ctx, "ospf", field_filter)
+
+
+@app.command()
+def resources(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays CPU, memory and forwarding-table utilization"""
+    run_report(ctx, "resources", field_filter)
+
+
+@app.command()
+def components(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays cards, fabric modules, fans and power supplies"""
+    run_report(ctx, "components", field_filter)
+
+
+@app.command()
+def transceivers(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Displays optics with their light levels and DOM alarms"""
+    run_report(ctx, "transceivers", field_filter)
+
+
+@app.command()
 def routing_pol(ctx: typer.Context) -> None:
     """Displays Routing Policies"""
     spec = get_report("routing_pol")
@@ -1088,6 +1157,36 @@ def checks(
 
 
 # ------------------------- lenses -------------------------
+
+
+@app.command()
+def incidents(
+    ctx: typer.Context,
+    field_filter: Optional[List[str]] = FIELD_FILTER,
+) -> None:
+    """Groups the checks' findings by root cause, worst first"""
+    spec = get_lens("incidents")
+    state = collect_lens_state(ctx.obj["target"], spec.requires)
+    found = spec.run(state)
+    print_lens(
+        spec,
+        found,
+        box_type=ctx.obj["box_type"],
+        f_filter=(
+            {k: v for k, v in (f.split("=") for f in field_filter)}
+            if field_filter
+            else {}
+        ),
+        output=ctx.obj["output"],
+        errors=[
+            f"{node}: {report} not collected: {error}"
+            for (report, node), error in sorted(state.errors.items())
+        ],
+        subtitle=f"{sum(len(i.findings) for i in found)} finding(s) in {len(found)} incident(s)",
+    )
+    # Like 'checks': a fabric with something wrong with it exits non-zero.
+    if any(i.severity == "error" for i in found):
+        raise typer.Exit(1)
 
 
 @app.command()

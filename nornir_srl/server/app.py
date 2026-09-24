@@ -25,7 +25,7 @@ from ..diff import diff_nodes, diff_tables
 from ..lenses import LENSES_BY_NAME, coerce_lens_params, lenses_for
 from ..reports import SERVER, ReportSpec, coerce_params, get_report, reports_for
 from .agent import NO_PROVIDER, ChatService
-from .snapshots import SnapshotStore, comparable
+from .snapshots import SnapshotStore, _slug, comparable
 from .store import FabricStore
 
 logger = logging.getLogger(__name__)
@@ -177,11 +177,20 @@ def create_app(
     connect_retry_interval: float = 30.0,
     topo_name: Optional[str] = None,
     snapshot_dir: Optional[Path] = None,
+    watch_interval: float = 0.0,
+    persist_acks: bool = False,
     chat_client_factory: Optional[Callable[[], Any]] = None,
     jsonrpc_call: Optional[Callable[..., Any]] = None,
 ) -> Starlette:
     """Build the fcli server application around an initialized Nornir inventory."""
     snapshot_store = SnapshotStore(snapshot_dir)
+    # The cables are kept beside the snapshots, one file per fabric, so a
+    # server restarted during an outage still knows what the down link was.
+    cabling_file = (
+        snapshot_store.directory.parent / "cabling" / f"{_slug(topo_name or 'fabric')}.json"
+        if watch_interval > 0
+        else None
+    )
     store = FabricStore(
         nornir,
         sample_interval=sample_interval,
@@ -191,6 +200,16 @@ def create_app(
         restart_debounce=restart_debounce,
         connect_retry_interval=connect_retry_interval,
         topo_name=topo_name,
+        watch_interval=watch_interval,
+        cabling_file=cabling_file,
+        # In memory unless asked otherwise: then kept beside the cabling, one
+        # file per fabric, so a restart does not bring back everything that
+        # was acknowledged.
+        ack_file=(
+            snapshot_store.directory.parent / "acks" / f"{_slug(topo_name or 'fabric')}.json"
+            if persist_acks
+            else None
+        ),
     )
     chat_kwargs: Dict[str, Any] = {}
     if chat_client_factory is not None:
@@ -250,6 +269,47 @@ def create_app(
     async def topology(request: Request) -> Response:
         inv_filter = parse_kv(request.query_params.get("inv_filter"))
         return JSONResponse(await anyio.to_thread.run_sync(store.topology, inv_filter))
+
+    async def timeline(_request: Request) -> Response:
+        """Where the timeline stands: how much it holds, and when the baseline is from."""
+        return JSONResponse({**store.timeline.status(), "watch_interval": store.watch_interval})
+
+    async def acks(_request: Request) -> Response:
+        """Every acknowledged finding."""
+        return JSONResponse({"acks": [dict(a.__dict__) for a in store.acks.all()]})
+
+    async def ack_change(request: Request) -> Response:
+        """Acknowledge an incident, or take the acknowledgement off it.
+
+        Takes ``{"incident": <id>, "note": "...", "inv_filter": "k=v"}``; the
+        path says which.
+        """
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - bad client body
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        incident = body.get("incident") if isinstance(body, dict) else None
+        if not isinstance(incident, str) or not incident:
+            return JSONResponse({"error": "give the 'incident' id"}, status_code=400)
+        note = body.get("note") or ""
+        if not isinstance(note, str):
+            return JSONResponse({"error": "note must be a string"}, status_code=400)
+        # The filter the page was rendered with, which the incident's id is of.
+        inv_filter = parse_kv(body.get("inv_filter") or None)
+        acknowledging = request.url.path.endswith("/ack")
+        try:
+            if acknowledging:
+                result = await anyio.to_thread.run_sync(store.acknowledge, incident, note, inv_filter)
+            else:
+                result = await anyio.to_thread.run_sync(store.unacknowledge, incident, inv_filter)
+        except KeyError as exc:
+            return JSONResponse({"error": exc.args[0] if exc.args else "no such incident"}, status_code=404)
+        return JSONResponse(result)
+
+    async def baseline(_request: Request) -> Response:
+        """Keep the fabric as it is now as the baseline it is compared against."""
+        status = await anyio.to_thread.run_sync(store.set_baseline)
+        return JSONResponse(status)
 
     def streamable_report(name: str) -> ReportSpec:
         """The named report, provided the server is able to stream it."""
@@ -472,6 +532,11 @@ def create_app(
         Route("/api/network-instances", network_instances),
         Route("/api/overview", overview),
         Route("/api/topology", topology),
+        Route("/api/timeline", timeline),
+        Route("/api/baseline", baseline, methods=["POST"]),
+        Route("/api/acks", acks),
+        Route("/api/ack", ack_change, methods=["POST"]),
+        Route("/api/unack", ack_change, methods=["POST"]),
         Route("/api/report/{name}", report_once),
         Route("/api/stream/{name}", report_stream),
         Route("/api/diff/{name}", report_diff),
@@ -510,6 +575,8 @@ def serve(
     log_level: str = "info",
     topo_name: Optional[str] = None,
     snapshot_dir: Optional[Path] = None,
+    watch_interval: float = 15.0,
+    persist_acks: bool = False,
 ) -> None:
     """Run the fcli server with uvicorn (blocking)."""
     import uvicorn
@@ -523,6 +590,8 @@ def serve(
         idle_timeout=idle_timeout,
         topo_name=topo_name,
         snapshot_dir=snapshot_dir,
+        watch_interval=watch_interval,
+        persist_acks=persist_acks,
     )
     store = app.store
     config = uvicorn.Config(

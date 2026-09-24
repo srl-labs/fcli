@@ -65,8 +65,12 @@ from .checks import (
     underlay_domains,
     underlay_hosts,
 )
+from .acks import mark as mark_acknowledged
+from .changes import parse_since
+from .checks import REQUIRED_REPORTS, run_checks
+from .incidents import correlate
 from .records import BgpVpnInstance, NeighborCache, NeighborEntry, Route, as_dict
-from .reports import ALL_SURFACES, ParamSpec
+from .reports import ALL_SURFACES, SERVER, ParamSpec
 from .rows import Column, countdown
 
 #: How far a path walk follows the fabric before deciding it is going in
@@ -254,6 +258,9 @@ class Item:
 
     title: str
     state: str = ""
+    #: What the state badge says, where the state is only its colour - an
+    #: incident's severity is drawn in the colour of down without being one.
+    label: str = ""
     details: Tuple[Detail, ...] = ()
 
 
@@ -263,6 +270,9 @@ class Entry:
 
     title: str
     state: str = ""
+    #: What the state badge says, where the state is only its colour - an
+    #: incident's severity is drawn in the colour of down without being one.
+    label: str = ""
     badge: str = ""
     items: Tuple[Item, ...] = ()
 
@@ -275,14 +285,30 @@ class Card:
     subtitle: str = ""
     icon: str = ""
     state: str = ""
+    #: What the state badge says, where the state is only its colour - an
+    #: incident's severity is drawn in the colour of down without being one.
+    label: str = ""
     badge: str = ""
     entries: Tuple[Entry, ...] = ()
+    #: What identifies the thing on the card to the server, for an action
+    #: taken on it: an incident's id.
+    key: str = ""
+    #: The action the card offers on it: ``ack`` or ``unack``.
+    action: str = ""
 
 
 def _entries(
-    records: Iterable[Any], item: Callable[[Any], Item], noun: str, sort: bool = True
+    records: Iterable[Any],
+    item: Callable[[Any], Item],
+    noun: str,
+    sort: bool = True,
+    by_severity: bool = False,
 ) -> Tuple[Entry, ...]:
-    """The records grouped by node, each node's state the worst of its items."""
+    """The records grouped by node, each node's state the worst of its items.
+
+    *by_severity* labels a node by the severity its colour stands for, where
+    the items are findings or changes rather than things that are up or down.
+    """
     by_node: Dict[str, List[Any]] = {}
     for record in records:
         by_node.setdefault(record.node, []).append(record)
@@ -294,6 +320,7 @@ def _entries(
             Entry(
                 title=node or "-",
                 state=_worst(i.state for i in items),
+                label=_severity_label(_severity_of(_worst(i.state for i in items))) if by_severity else "",
                 badge=_count(len(items), noun),
                 items=items,
             )
@@ -1426,10 +1453,213 @@ def tree_service(services: List[Service]) -> List[Card]:
 
 
 # --------------------------------------------------------------------------- #
+# incidents: the findings, grouped by what they have in common
+# --------------------------------------------------------------------------- #
+
+#: Finding and change severities as the state a card or pill is drawn in.
+_TONE = {"error": _DOWN, "warning": _WARN, "ok": _UP}
+
+
+def _severity_of(state: str) -> str:
+    """The severity a colour state was drawn for."""
+    return next((severity for severity, tone in _TONE.items() if tone == state), "")
+
+
+def _severity_label(severity: str) -> str:
+    """What a severity's badge says: the severity, never the colour's state name."""
+    return severity.upper() if severity in _TONE else ""
+
+_INCIDENT_ICONS = {
+    "link": "🔗",
+    "port": "🔌",
+    "node": "🖥",
+    "session": "🤝",
+    "underlay": "🛤",
+    "platform": "🌡",
+    "segment": "🧷",
+    "finding": "⚠",
+    "pattern": "🔁",
+}
+
+
+def lens_incidents(state: FabricState) -> List[Any]:
+    """Every check's findings, grouped into incidents with a root cause each.
+
+    The ones someone acknowledged come last, marked as such.
+    """
+    return mark_acknowledged(correlate(run_checks(state), state), state.acknowledged)
+
+
+INCIDENT_COLUMNS: Tuple[Column, ...] = (
+    Column("Severity", "severity"),
+    Column("Incident", "title"),
+    Column("Root cause", lambda i: i.root.check),
+    Column("Findings", lambda i: len(i.findings)),
+    Column("Ack", lambda i: "acknowledged" if i.acknowledged else ""),
+    Column("Explanation", "explanation"),
+)
+
+
+def tree_incidents(incidents: List[Any]) -> List[Card]:
+    cards = []
+    for incident in incidents:
+        by_node: Dict[str, List[Item]] = {}
+        for finding in incident.findings:
+            is_root = finding is incident.root
+            by_node.setdefault(finding.node, []).append(
+                Item(
+                    title=f"{'root cause: ' if is_root else ''}{finding.check} {finding.subject}",
+                    state=_TONE.get(finding.severity, ""),
+                    label=_severity_label(finding.severity),
+                    details=(Detail("detail", finding.detail),),
+                )
+            )
+        entries = tuple(
+            Entry(
+                title=node,
+                state=_worst(item.state for item in items),
+                label=_severity_label(_severity_of(_worst(item.state for item in items))),
+                badge=_count(len(items), "finding"),
+                items=tuple(items),
+            )
+            for node, items in sorted(by_node.items(), key=lambda kv: (kv[0] != incident.root.node, kv[0]))
+        )
+        acked = incident.acknowledged
+        cards.append(
+            Card(
+                title=f"✓ {incident.title}" if acked else incident.title,
+                subtitle=incident.explanation,
+                icon=_INCIDENT_ICONS.get(incident.kind, "⚠"),
+                # Acknowledged is known: drawn without the colour that says
+                # look here, but still listed until it is fixed.
+                state="" if acked else _TONE.get(incident.severity, ""),
+                label="ACKNOWLEDGED" if acked else _severity_label(incident.severity),
+                badge=("acknowledged · " if acked else "") + _count(len(incident.findings), "finding"),
+                entries=entries,
+                key=incident.id,
+                action="unack" if acked else "ack",
+            )
+        )
+    return cards
+
+
+# --------------------------------------------------------------------------- #
+# changes: what is different from before
+# --------------------------------------------------------------------------- #
+
+#: What ``since`` is set to, to compare against the baseline rather than the
+#: timeline.
+BASELINE = "baseline"
+
+
+def lens_changes(state: FabricState, since: str = "") -> List[Any]:
+    """What changed lately, or how the fabric has drifted from its baseline.
+
+    Answered from :attr:`FabricState.history`, which only the live server
+    keeps: everywhere else there is no past to answer from.
+    """
+    history = state.history
+    if history is None:
+        return []
+    if str(since).strip().lower() == BASELINE:
+        return history.drift()
+    return history.changes(since=parse_since(since))
+
+
+CHANGE_COLUMNS: Tuple[Column, ...] = (
+    Column("Time", "time"),
+    Column("Severity", "severity"),
+    Column("Kind", "kind"),
+    Column("Subject", "subject"),
+    Column("Change", "summary"),
+    Column("Detail", "detail"),
+)
+
+
+def tree_changes(changes: List[Any]) -> List[Card]:
+    """One card per minute, newest first; the nodes that changed in it inside."""
+    buckets: Dict[str, List[Any]] = {}
+    for change in changes:
+        buckets.setdefault(change.time[:5], []).append(change)
+    cards = []
+    for minute, members in buckets.items():
+        cards.append(
+            Card(
+                title=minute,
+                subtitle=", ".join(sorted({c.kind for c in members})),
+                icon="🕒",
+                state=_worst(_TONE.get(c.severity, "") for c in members),
+                label=_severity_label(_severity_of(_worst(_TONE.get(c.severity, "") for c in members))),
+                badge=_count(len(members), "change"),
+                entries=_entries(
+                    members,
+                    lambda c: Item(
+                        title=f"{c.kind} {c.subject}",
+                        state=_TONE.get(c.severity, ""),
+                        label=_severity_label(c.severity),
+                        details=(
+                            Detail("at", c.time),
+                            Detail("change", c.summary),
+                            *((Detail("detail", c.detail),) if c.detail and c.detail != c.summary else ()),
+                        ),
+                    ),
+                    "change",
+                    by_severity=True,
+                ),
+            )
+        )
+    return cards
+
+
+# --------------------------------------------------------------------------- #
 # the registry
 # --------------------------------------------------------------------------- #
 
 LENSES: Tuple[LensSpec, ...] = (
+    LensSpec(
+        name="incidents",
+        title="Incidents",
+        description=(
+            "Every check's findings grouped by root cause: a link that is down "
+            "together with the BGP, BFD and IGP sessions that went down over it, "
+            "a node that stopped answering with everything that points at it. "
+            "Start here to find out what is wrong."
+        ),
+        requires=REQUIRED_REPORTS,
+        columns=INCIDENT_COLUMNS,
+        run=lens_incidents,
+        tree=tree_incidents,
+        mcp_name="fabric_incidents",
+        group_by_node=False,
+    ),
+    LensSpec(
+        name="changes",
+        title="Changes",
+        description=(
+            "What changed in the fabric and when: sessions, ports, LLDP "
+            "neighbours, BFD and IGP adjacencies, designated forwarders, MAC "
+            "moves, route counts and findings raised or cleared. 'since' takes "
+            "a time span (15m, 2h) or 'baseline' for the drift from the fabric "
+            "as it was when the baseline was taken."
+        ),
+        # The timeline is kept by the server as it streams, not read here.
+        requires=(),
+        columns=CHANGE_COLUMNS,
+        run=lens_changes,
+        tree=tree_changes,
+        params=(
+            ParamSpec(
+                name="since",
+                label="Since",
+                placeholder="15m, 2h or baseline",
+                help="How far back to look, or 'baseline' for the drift from the baseline",
+            ),
+        ),
+        mcp_name="recent_changes",
+        # Only the live server keeps a timeline to answer from.
+        surfaces=frozenset({SERVER}),
+        group_by_node=False,
+    ),
     LensSpec(
         name="where",
         title="Where",

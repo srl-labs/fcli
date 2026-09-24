@@ -36,6 +36,19 @@ Subscriptions stream everything under their path (configuration and state alike)
 
 ---
 
+### 6. Evicting what the device stopped sending
+
+A SAMPLE subscription re-sends every leaf of its subtree on each tick and never reports a delete, so an entry that disappears on the device - a dynamic BGP neighbour whose link went down, an LLDP neighbour, a DF candidate - is recognised by no longer being refreshed. Each list entry is stamped when it is written, and a sweep drops the ones its envelope has had three sample intervals (at least 45 s) of newer data without. SR Linux names every element of an update with its YANG module (`srl_nokia-network-instance:network-instance[...]`); envelopes are matched with those prefixes taken off, which is what lets the sweep see an envelope as being refreshed at all.
+
+### 7. Staying within 36 paths per Subscribe
+
+SR Linux accepts at most 36 paths in one Subscribe request. One more, and it refuses the whole request with `OUT_OF_RANGE` (*"Exceeded the maximum of 36 subscribed paths per subscribe request"*), and every path of the node stops streaming. The request is therefore planned before it is sent:
+
+* a path another path of the request covers (same elements, keys at least as wide: `interface[name=*]/subinterface` covers `interface[name=irb*]/subinterface` and the ARP/ND neighbour lists under it) is left out; the updates for it arrive through the covering path, which is sampled as fast as the fastest path it stands in for;
+* if the request is still too long, the most slowly sampled paths are polled with a `Get` at their sample interval instead, e.g. the fan-tray and power-supply lists.
+
+`GET /api/status` shows each path as `covered_by` another or `polled`. A node that refuses a request with a lower limit is believed, and the request is planned again within it.
+
 ## Handling cold starts and pending paths
 
 SR Linux responds to a `Get` request for an empty subtree with an empty response, which does not reveal the YANG schema shape expected by the report getter. Control-plane tables often start empty (no MACs learned yet, no IPv6 neighbors, no Ethernet-Segment destinations, or a spine with no bridge table).

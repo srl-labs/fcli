@@ -18,6 +18,7 @@ import logging
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from ..connections.down_reason import clean_leaf
+from ..connections.health import HealthMixin
 from ..connections.ifstats import InterfaceStatsMixin
 from ..connections.interfaces import NetworkInstanceMixin
 from ..connections.layer2 import Layer2Mixin
@@ -25,7 +26,8 @@ from ..connections.neighbor_discovery import NeighborDiscoveryMixin
 from ..connections.routing import RoutingMixin
 from ..connections.system import SystemMixin
 from ..records import InterfaceStats
-from .stream import HostStream, _suppress_pygnmi_client_logging
+from ..connections.routing import _suppress_pygnmi_client_logging
+from .stream import HostStream
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,7 @@ class MixinDevice(
     NeighborDiscoveryMixin,
     SystemMixin,
     InterfaceStatsMixin,
+    HealthMixin,
 ):
     """All report getters, with ``get``/``capabilities`` supplied by subclasses."""
 

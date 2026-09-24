@@ -98,6 +98,16 @@
             ✕ Clear Filters <span id="filter-badge" class="badge"></span>
           </button>
           <button id="view-mode-btn" class="btn" type="button" hidden>🌲 Services View</button>
+          <!-- Changes lens only: keep the fabric as it is now as what it is compared against. -->
+          <button
+            id="baseline-btn"
+            class="btn"
+            type="button"
+            hidden
+            title="Keep the fabric as it is now as the baseline; 'since: baseline' then shows the drift from it"
+          >
+            📌 Set baseline
+          </button>
           <label class="field">
             <span class="muted">refresh</span>
             <select id="refresh" class="input">
@@ -137,6 +147,20 @@
 
         <div id="overview-dashboard" class="dashboard-wrap" hidden>
           <div class="kpi-grid">
+            <div class="kpi-card" id="kpi-card-health" style="cursor: pointer;" title="Click to view the incidents">
+              <div class="kpi-header">
+                <span class="kpi-title">Fabric Health</span>
+                <span class="kpi-icon">🩺</span>
+              </div>
+              <div class="kpi-value" id="kpi-health-value">—</div>
+              <div class="kpi-sub">
+                <span id="kpi-health-sub" class="muted">checking…</span>
+              </div>
+              <div class="kpi-sub kpi-health-worst" id="kpi-health-worst"></div>
+              <div class="kpi-sub">
+                <span id="kpi-health-changes" class="muted"></span>
+              </div>
+            </div>
             <div class="kpi-card" id="kpi-card-nodes">
               <div class="kpi-header">
                 <span class="kpi-title">Fabric Nodes</span>
@@ -220,6 +244,13 @@
         <div id="topology-view" class="topo-wrap" hidden>
           <div class="topo-bar">
             <div id="topo-legend" class="topo-legend"></div>
+            <label class="field topo-overlay-field" title="What the cables and nodes are coloured by">
+              <span class="muted">overlay</span>
+              <select id="topo-overlay" class="input topo-overlay">
+                <option value="traffic">traffic</option>
+                <option value="health">health</option>
+              </select>
+            </label>
             <label class="field topo-ports">
               <input id="topo-port-labels" type="checkbox" />
               <span class="muted">port labels</span>
@@ -291,6 +322,8 @@
             </button>
             <span id="topo-stats" class="muted"></span>
           </div>
+          <!-- The fabric in a few lines, and what is wrong with it. -->
+          <div id="topo-summary" class="topo-summary" hidden></div>
           <div id="topo-tabs" class="topo-tabs" role="tablist" aria-label="Fabrics" hidden></div>
           <div class="topo-body">
             <div id="topo-canvas" class="topo-canvas"></div>
@@ -351,7 +384,17 @@
             placeholder="Why is BGP down on the leaves?"
             autocomplete="off"
           ></textarea>
-          <button id="chat-send" class="btn" type="submit">Send</button>
+          <div class="chat-form-actions">
+            <button
+              id="chat-triage"
+              class="btn btn-ghost"
+              type="button"
+              title="Ask for a triage: what is wrong, what changed, the likely root cause and what to check next"
+            >
+              🩺 Triage
+            </button>
+            <button id="chat-send" class="btn" type="submit">Send</button>
+          </div>
         </form>
       </aside>
     </div>
