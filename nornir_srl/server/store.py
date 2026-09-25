@@ -777,6 +777,24 @@ class FabricStore:
         self._record_ack(incident.node, incident.title, "acknowledged", note or f"{len(made)} finding(s) acknowledged")
         return {"incident": incident.id, "acknowledged": len(made)}
 
+    def acknowledge_all(
+        self, note: str = "", inv_filter: Optional[Dict[str, str]] = None
+    ) -> Dict[str, Any]:
+        """Acknowledge every incident still open in the (filtered) fabric."""
+        acked = self.acks.keys()
+        done = []
+        for incident in mark_acknowledged(self.health(inv_filter).incidents, acked):
+            if incident.acknowledged:
+                continue
+            made = self.acks.acknowledge(
+                incident.findings, note=note, incident=incident.title, incident_id=incident.id
+            )
+            self._record_ack(
+                incident.node, incident.title, "acknowledged", note or f"{len(made)} finding(s) acknowledged"
+            )
+            done.append(incident.id)
+        return {"acknowledged": len(done), "incidents": done}
+
     def unacknowledge(
         self, incident_id: str, inv_filter: Optional[Dict[str, str]] = None
     ) -> Dict[str, Any]:

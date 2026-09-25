@@ -1188,7 +1188,7 @@ def mark_baseline(inv_filter: Optional[str] = None) -> str:
 
 
 @mcp.tool()
-def changes_since_baseline() -> str:
+def changes_since_baseline(watch_prefixes: Optional[str] = None) -> str:
     """What changed in the fabric since mark_baseline was called.
 
     Reads the fabric again, over the same nodes, and compares it with the
@@ -1198,15 +1198,25 @@ def changes_since_baseline() -> str:
     Returns {"baseline_at": ..., "changes": [...]}, each change with:
         time, node, kind ('bgp', 'bgp-routes', 'interface', 'lldp', 'bfd',
             'isis', 'ospf', 'es', 'es-df', 'mac', 'routes', 'hardware',
-            'optic' or 'finding'), subject (the peer, port, MAC or finding),
+            'optic', 'arp', 'nd', 'routes', 'route' or 'finding'), subject (the
+            peer, port, MAC, address, route table or prefix, or finding),
         before, after (empty where it did not exist on that side),
         severity ('error' something stopped working, 'warning', 'ok' something
             recovered, 'info' something new or gone that was not working
             anyway), detail.
+
+    Route tables are summarized, one change per table ('routes': how many
+    prefixes changed next-hops, were withdrawn or are new, with examples);
+    the default routes, the host routes to every node's system address and
+    *watch_prefixes* are reported one by one ('route'), ECMP width included.
+
+    Args:
+        watch_prefixes: Comma-separated prefixes or addresses to report one by
+            one as well, e.g. '10.1.4.16,6.6.6.1/32'.
     """
     import time as _time  # noqa: PLC0415
 
-    from .changes import as_row, diff_fabric, diff_findings  # noqa: PLC0415
+    from .changes import as_row, diff_fabric, diff_findings, normalize_prefix  # noqa: PLC0415
 
     if not _baseline:
         return json.dumps({"error": "no baseline: call mark_baseline first"}, indent=2)
@@ -1215,7 +1225,11 @@ def changes_since_baseline() -> str:
     target = nornir.filter(**i_filter) if i_filter else nornir
     state = collect_lens_state(target, WATCH_REPORTS)
     now = _time.time()
-    changes = diff_fabric(_baseline["state"], state, at=now) + diff_findings(
+    try:
+        watched = [normalize_prefix(p) for p in (watch_prefixes or "").split(",") if p.strip()]
+    except ValueError as exc:
+        return json.dumps({"error": str(exc)}, indent=2)
+    changes = diff_fabric(_baseline["state"], state, at=now, watched=watched) + diff_findings(
         _baseline["findings"], run_checks(state), at=now
     )
     return json.dumps(

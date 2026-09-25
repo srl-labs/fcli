@@ -23,7 +23,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from ..changes import (
     FLAP_WINDOW,
@@ -33,6 +33,7 @@ from ..changes import (
     diff_fabric,
     diff_findings,
     node_change,
+    normalize_prefix,
     settled_findings,
 )
 from ..checks import Finding, run_checks
@@ -75,11 +76,34 @@ class Timeline:
         self.latest: Optional[Reading] = None
         self.baseline: Optional[Reading] = None
         self.started = time.time()
+        #: Prefixes whose changes are reported one by one, beyond the defaults
+        #: and the system addresses every table has; see
+        #: :func:`nornir_srl.changes.diff_fabric`.
+        self._watched: Set[str] = set()
         #: Every cable LLDP has shown, by node and local port, as the
         #: (advertised system name, port) on the far end. Kept when LLDP loses
         #: it, so a link that went down is still drawn, down; replaced when
         #: another neighbour shows up on the same port.
         self.cabling: Dict[str, Dict[str, Tuple[str, str]]] = {}
+
+    def watch(self, prefix: str) -> str:
+        """Report changes to *prefix* one by one; returns it as tables spell it."""
+        normalized = normalize_prefix(prefix)
+        with self._lock:
+            self._watched.add(normalized)
+        return normalized
+
+    def unwatch(self, prefix: str) -> bool:
+        normalized = normalize_prefix(prefix)
+        with self._lock:
+            if normalized not in self._watched:
+                return False
+            self._watched.discard(normalized)
+        return True
+
+    def watched(self) -> List[str]:
+        with self._lock:
+            return sorted(self._watched)
 
     def learn_cabling(self, state: FabricState) -> bool:
         """Add what LLDP shows now to the cables known; whether anything was new."""
@@ -164,7 +188,7 @@ class Timeline:
         baseline, latest = self.baseline, self.latest
         if baseline is None or latest is None or baseline is latest:
             return []
-        changes = diff_fabric(baseline.state, latest.state, at=latest.at) + diff_findings(
+        changes = diff_fabric(baseline.state, latest.state, at=latest.at, watched=self.watched()) + diff_findings(
             baseline.findings, latest.findings, at=latest.at
         )
         for node in sorted(set(baseline.connected) | set(latest.connected)):
@@ -294,7 +318,7 @@ class Watcher:
             present = {(f.check, f.node, f.subject) for f in list(previous.findings) + list(findings)}
             for ack in self.store.acks.expire(self.store.acks.keys() - present):
                 logger.debug("acknowledgement of %s on %s ended: the finding cleared", ack.check, ack.node)
-            changes = diff_fabric(previous.state, state, at=now) + settled
+            changes = diff_fabric(previous.state, state, at=now, watched=self.timeline.watched()) + settled
             for node, connected in reading.connected.items():
                 was = previous.connected.get(node)
                 if was is not None and was != connected:

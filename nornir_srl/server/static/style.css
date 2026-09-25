@@ -55,20 +55,22 @@ body {
 
 .layout {
   display: grid;
-  grid-template-columns: 260px 1fr;
+  grid-template-columns: var(--side-width, 260px) minmax(0, 1fr);
   height: 100vh;
 }
 
 .layout:has(#chat-drawer:not([hidden])) {
-  grid-template-columns: 260px minmax(0, 1fr) var(--chat-width, 360px);
+  grid-template-columns: var(--side-width, 260px) minmax(0, 1fr) var(--chat-width, 360px);
 }
 
 /* ---------------------------------------------------------------- sidebar */
 
 .sidebar {
+  position: relative;
   display: flex;
   flex-direction: column;
   min-height: 0;
+  min-width: 0;
   background: var(--panel);
   border-right: 1px solid var(--border);
 }
@@ -257,6 +259,18 @@ body {
   display: flex;
   justify-content: space-between;
   align-items: center;
+}
+
+.side-link {
+  color: var(--muted);
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.side-link:hover,
+.side-link:focus-visible {
+  color: var(--accent);
+  text-decoration: underline;
 }
 
 /* ------------------------------------------------------------------- main */
@@ -990,7 +1004,8 @@ th.filtered::after {
     border-left: none;
     border-top: 1px solid var(--border);
   }
-  .chat-resizer {
+  .chat-resizer,
+  .side-resizer {
     display: none;
   }
 }
@@ -2661,4 +2676,60 @@ button.pill-jump:focus-visible {
 .topo-detail-row.is-conflict span:last-child {
   color: var(--err);
   font-weight: 600;
+}
+
+/* --------------------------------------------------------- watched prefixes */
+
+.watch-menu {
+  min-width: 260px;
+}
+
+.watch-note {
+  font-size: 11px;
+  margin: 2px 0 6px;
+}
+
+.watch-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.watch-add {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.watch-add .input {
+  flex: 1;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+/* ---------------------------------------------------- side pane resizing */
+
+/* The right edge of the side pane, dragged to widen it. */
+.side-resizer {
+  position: absolute;
+  right: -4px;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  z-index: 5;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.side-resizer:hover,
+.side-resizer:focus-visible,
+.sidebar.is-widening .side-resizer {
+  background: var(--accent);
+}
+
+.sidebar.is-widening {
+  user-select: none;
 }

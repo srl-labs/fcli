@@ -310,6 +310,9 @@ The global options are the same as for the CLI, so the server can be pointed at 
 │                                     [default: 15.0]                          │
 │ --persist-acks                      Keep acknowledged incidents across       │
 │                                     server restarts                          │
+│ --watch-prefix             TEXT     A prefix or address whose route changes  │
+│                                     the timeline reports one by one;         │
+│                                     repeatable                               │
 ╰──────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -327,7 +330,9 @@ The server binds to localhost by default. It has no authentication of its own, s
 * **Live updates**: cells that changed since the previous update flash, and new rows flash as a whole. **Pause** freezes the table without dropping the subscriptions.
 * **Columns** hides columns you do not need, **CSV** downloads exactly what the table currently shows (filters, column selection and all).
 * **Nodes** in the sidebar show per-node subscription state (`up` / unreachable / pending). Clicking a node jumps to details.
+* **Side pane**: drag its right edge to widen or narrow it (double-click resets). The width is remembered per browser.
 * **Theme** toggles light and dark.
+* **🐞 issues**, at the bottom of the sidebar, opens the [GitHub issues](https://github.com/srl-labs/fcli/issues) page to report a bug or ask for a feature.
 
 ### Topology
 
@@ -350,7 +355,8 @@ The server reads the fabric every `--watch-interval` seconds (15 by default) and
 
 * **Incidents**: every check's findings grouped by root cause. A link that goes down arrives as *one* incident, together with the BGP, BFD and IGP sessions that went down over it. A node that stopped answering becomes the root of everything that points at it. The same cause in many places folds into one pattern, e.g. *"BFD session down on 16 links: the far end has never answered — is BFD enabled there?"*.
 * **A timeline** of what changed: sessions, ports, LLDP neighbours, BFD and IGP adjacencies, DF elections, MAC moves, route counts that halved, nodes that stopped answering, and findings raised and cleared. It feeds the **flapping** check.
-* **Acknowledgements**: **✓ ACK** on an incident's card takes a known problem out of the Overview, the topology badges, colours and summary, with an optional note. It comes back on its own if a new finding joins it, and the acknowledgement ends when the fault clears. **↺ Un-ACK** undoes it. Acks last as long as the server runs; add `--persist-acks` to keep them across restarts.
+* **Acknowledgements**: **✓ ACK** on an incident's card takes a known problem out of the Overview, the topology badges, colours and summary, with an optional note. It comes back on its own if a new finding joins it, and the acknowledgement ends when the fault clears. **↺ Un-ACK** undoes it. **✓ ACK all** in the Incidents toolbar acknowledges every open incident in the current view at once, with one note. Acks last as long as the server runs; add `--persist-acks` to keep them across restarts.
+* **Route tables and neighbour caches**: one change per route table ("312 changed next-hops, 4 withdrawn …"), with the default routes, every node's system address and your **watched prefixes** (`--watch-prefix`, or 👁 Watched on the Changes page) reported one by one, ECMP width included; an IP that starts answering from another MAC.
 * **A baseline**: the fabric as it was once the server settled, or whenever you press **📌 Set baseline** on the Changes page. `since: baseline` shows the drift from it, which is what a maintenance window or a config push actually changed.
 
 ```
@@ -411,6 +417,8 @@ The UI is a client of a small JSON API, which is just as usable from scripts:
 | `GET /api/timeline` | How many changes the timeline holds, and when the latest reading and the baseline were taken |
 | `POST /api/baseline` | Keep the fabric as it is now as the baseline |
 | `GET /api/acks` | The acknowledged findings, with when and the note |
+| `GET /api/watch`; `POST /api/watch`, `POST /api/unwatch` | The watched prefixes; watch or stop watching one: `{"prefix": "10.1.4.16"}` |
+| `POST /api/ack-all` | Acknowledge every open incident: `{"note": "...", "inv_filter": "k=v"}` |
 | `POST /api/ack`, `POST /api/unack` | Acknowledge an incident, or take the acknowledgement off: `{"incident": "<id>", "note": "..."}` |
 | `POST /api/chat` | LLM troubleshooting turn (SSE: `start`, `token`, `tool`, `error`, `done`). Takes an optional `provider` (`openai`, `claude`, `grok`) and `effort`; 503 unless a provider key is set |
 

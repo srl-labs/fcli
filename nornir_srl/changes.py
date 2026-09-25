@@ -24,6 +24,7 @@ counted the same way whether it is a BGP session, a port, or a MAC address.
 
 from __future__ import annotations
 
+import ipaddress
 import time
 from dataclasses import dataclass
 from typing import (
@@ -43,8 +44,9 @@ from .checks import REQUIRED_REPORTS
 from .fabric import FabricState, out_of_band, text
 
 #: What a reading to diff is made of: what the checks read, plus the bridge
-#: tables, whose entries moving between ports is what a loop looks like.
-WATCH_REPORTS: Tuple[str, ...] = tuple(dict.fromkeys(REQUIRED_REPORTS + ("mac",)))
+#: tables and the neighbour caches, whose entries moving is what a loop, a
+#: duplicate address or a moved host looks like.
+WATCH_REPORTS: Tuple[str, ...] = tuple(dict.fromkeys(REQUIRED_REPORTS + ("mac", "arp", "nd")))
 
 #: A change that means something stopped working.
 ERROR = "error"
@@ -66,7 +68,12 @@ _GOOD = frozenset({"established", "up", "full", "two-way", "present"})
 
 #: Kinds whose disappearance is not a fault in itself. A bridge-table entry
 #: ages out, a VXLAN destination goes when its last MAC does.
-_TRANSIENT = frozenset({"mac", "vxlan"})
+_TRANSIENT = frozenset({"mac", "vxlan", "arp", "nd"})
+
+#: How a transient entry moving reads. A MAC moving between ports is the
+#: fabric following a host; an address answering from another MAC is a
+#: duplicate address, a spoof or a host replaced, and worth a look.
+_MOVE_SEVERITY = {"arp": "warning", "nd": "warning"}
 
 
 @dataclass(frozen=True)
@@ -193,11 +200,38 @@ def _vxlan(state: FabricState, node_ok: Callable[[str], bool]) -> Iterator[Tuple
             yield ("vxlan", node, f"{itf.name} {destination.vtep}"), "present"
 
 
+def _neighbors(state: FabricState, node_ok: Callable[[str], bool]) -> Iterator[Tuple[Tuple[str, str, str], str]]:
+    """ARP and ND entries, by network-instance and address: the MAC it resolves to, and where."""
+    for report, kind in (("arp", "arp"), ("nd", "nd")):
+        for node, cache, entry in state.sub_items(report, "entries"):
+            if node_ok(node) and entry.address and entry.mac:
+                ni = "/".join(cache.nis) or "-"
+                yield (kind, node, f"{ni} {entry.address}"), f"{entry.mac.lower()} on {cache.interface}"
+
+
+#: Separates the parts of a RIB observation's subject: instance, family, prefix.
+_RIB_SEP = "|"
+
+
 def _routes(state: FabricState, node_ok: Callable[[str], bool]) -> Iterator[Tuple[Tuple[str, str, str], str]]:
+    """Every route, by instance, family and prefix: the next-hops it has.
+
+    Not recorded as it is - a link flapping moves the next-hops of thousands
+    of prefixes at once - but summarized per route table, with only the
+    prefixes that matter reported one by one; see :func:`_diff_routes`.
+    """
     for report, family in (("ipv4_rib", "ipv4"), ("ipv6_rib", "ipv6")):
-        for node, table in state.items(report):
-            if node_ok(node):
-                yield ("routes", node, f"{table.ni} {family}"), str(len(table.routes))
+        for node, table, route in state.sub_items(report, "routes"):
+            if node_ok(node) and route.active:
+                yield ("rib", node, _RIB_SEP.join((table.ni, family, route.prefix))), _next_hops(route)
+
+
+def _next_hops(route: Any) -> str:
+    """A route's next-hops as one comparable value: sorted, one per ECMP member."""
+    hops = sorted(
+        {h.address or h.resolving_route or ",".join(e.label for e in h.egress) or h.type for h in route.next_hops}
+    )
+    return " ".join(hop for hop in hops if hop) or route.type
 
 
 def _hardware(state: FabricState, node_ok: Callable[[str], bool]) -> Iterator[Tuple[Tuple[str, str, str], str]]:
@@ -223,12 +257,13 @@ _OBSERVERS: Tuple[Tuple[Tuple[str, ...], Callable[..., Iterator[Tuple[Tuple[str,
     (("mac",), _macs),
     (("vxlan",), _vxlan),
     (("ipv4_rib", "ipv6_rib"), _routes),
+    (("arp", "nd"), _neighbors),
     (("components", "transceivers"), _hardware),
 )
 
 #: Kinds whose value is a count, compared by how much it moved rather than
 #: by whether it did.
-_COUNTS = frozenset({"bgp-routes", "routes"})
+_COUNTS = frozenset({"bgp-routes"})
 
 
 def observe(
@@ -264,13 +299,20 @@ COUNT_DROP_WARNING = 0.5
 
 
 def diff_fabric(
-    before: FabricState, after: FabricState, at: Optional[float] = None
+    before: FabricState,
+    after: FabricState,
+    at: Optional[float] = None,
+    watched: Iterable[str] = (),
 ) -> List[Change]:
     """What is different in *after* from *before*, worst first.
 
     Only what both readings could see is compared: a report a node did not
     answer on one side says nothing about that node, rather than everything
     on it having appeared or gone.
+
+    The route tables are summarized per table rather than diffed prefix by
+    prefix; the prefixes that are reported one by one are the defaults, the
+    host routes to every node's system address, and *watched* ones.
     """
     at = time.time() if at is None else at
 
@@ -282,13 +324,171 @@ def diff_fabric(
         )
 
     old, new = observe(before, both), observe(after, both)
+    old_rib = {k: old.pop(k) for k in [k for k in old if k[0] == "rib"]}
+    new_rib = {k: new.pop(k) for k in [k for k in new if k[0] == "rib"]}
+    changes_learned = _diff_neighbors(
+        {k: v for k, v in old.items() if k[0] in _NEIGHBOR_KINDS},
+        {k: v for k, v in new.items() if k[0] in _NEIGHBOR_KINDS},
+        at,
+    )
     changes = [
         change
         for key in sorted(set(old) | set(new))
         for change in _compare(key, old.get(key, ABSENT), new.get(key, ABSENT), at)
     ]
+    important = _important_prefixes(before, after, watched)
+    changes += _diff_routes(old_rib, new_rib, important, at)
+    changes += changes_learned
     changes.sort(key=change_order)
     return changes
+
+
+# --------------------------------------------------------------------------- #
+# neighbour caches: moves one by one, learning and ageing summarized
+# --------------------------------------------------------------------------- #
+
+_NEIGHBOR_KINDS = ("arp", "nd")
+
+
+def _diff_neighbors(old: Observations, new: Observations, at: float) -> List[Change]:
+    """ARP/ND entries learned and aged out, one change per node, cache and interface.
+
+    An entry moving is reported by :func:`_compare` on its own; this is the
+    rest of what happens to a neighbour cache - hosts appearing after a clear
+    or a reboot, entries timing out - which is news in aggregate and noise
+    one by one.
+    """
+    grouped: Dict[Tuple[str, str, str], Dict[str, List[str]]] = {}
+    for key in set(old) ^ set(new):
+        kind, node, subject = key
+        value = new.get(key) or old.get(key, "")
+        interface = value.rsplit(" on ", 1)[-1] if " on " in value else "-"
+        address = subject.rsplit(" ", 1)[-1]
+        what = "learned" if key in new else "aged out"
+        grouped.setdefault((node, kind, interface), {}).setdefault(what, []).append(address)
+    changes = []
+    for (node, kind, interface), moved in sorted(grouped.items()):
+        parts = []
+        for what in ("learned", "aged out"):
+            addresses = sorted(moved.get(what, []))
+            if addresses:
+                sample = ", ".join(addresses[:_SAMPLE]) + (
+                    f" and {len(addresses) - _SAMPLE} more" if len(addresses) > _SAMPLE else ""
+                )
+                parts.append(f"{len(addresses)} {what} ({sample})")
+        learned, aged = len(moved.get("learned", [])), len(moved.get("aged out", []))
+        counts = ", ".join(c for c in (f"+{learned} learned" if learned else "", f"-{aged} aged out" if aged else "") if c)
+        changes.append(Change(at, node, kind, interface, ABSENT, counts, INFO, "; ".join(parts)))
+    return changes
+
+
+# --------------------------------------------------------------------------- #
+# route tables: summarized, with the prefixes that matter one by one
+# --------------------------------------------------------------------------- #
+
+#: Prefixes named in a summary before it says "and N more".
+_SAMPLE = 4
+#: A table that lost this fraction of its routes in one go is a warning.
+ROUTES_WITHDRAWN_WARNING = 0.5
+_DEFAULTS = ("0.0.0.0/0", "::/0")
+
+
+def normalize_prefix(value: str) -> str:
+    """A prefix as a route table spells it: ``10.1.4.16`` is ``10.1.4.16/32``.
+
+    Raises :class:`ValueError` for something that is not an address or prefix.
+    """
+    try:
+        return str(ipaddress.ip_network(str(value).strip(), strict=False))
+    except ValueError:
+        raise ValueError(f"'{value}' is not an IP prefix or address") from None
+
+
+def _important_prefixes(before: FabricState, after: FabricState, watched: Iterable[str]) -> Callable[[str, str], str]:
+    """What makes a prefix worth reporting on its own, if anything: ``why(ni, prefix)``."""
+    from .checks import system_addresses  # noqa: PLC0415 - checks imports nothing of ours back
+
+    loopbacks = set()
+    for state in (before, after):
+        for node, addresses in system_addresses(state).items():
+            for address in addresses:
+                loopbacks.add(normalize_prefix(address))
+    pinned = {normalize_prefix(p) for p in watched}
+
+    def why(ni: str, prefix: str) -> str:
+        if prefix in pinned:
+            return "watched"
+        if prefix in _DEFAULTS:
+            return "default route"
+        if ni == "default" and prefix in loopbacks:
+            return "system address"
+        return ""
+
+    return why
+
+
+def _diff_routes(
+    old: Observations, new: Observations, why: Callable[[str, str], str], at: float
+) -> List[Change]:
+    tables: Dict[Tuple[str, str, str], Dict[str, List[str]]] = {}
+    sizes: Dict[Tuple[str, str, str], List[int]] = {}
+    changes: List[Change] = []
+    for key in set(old) | set(new):
+        _kind, node, subject = key
+        ni, family, prefix = subject.split(_RIB_SEP, 2)
+        table = (node, ni, family)
+        size = sizes.setdefault(table, [0, 0])
+        size[0] += key in old
+        size[1] += key in new
+        before, after = old.get(key, ABSENT), new.get(key, ABSENT)
+        if before == after:
+            continue
+        what = "new" if before == ABSENT else "withdrawn" if after == ABSENT else "changed"
+        tables.setdefault(table, {}).setdefault(what, []).append(prefix)
+        reason = why(ni, prefix)
+        if reason:
+            changes.append(_prefix_change(node, ni, prefix, before, after, reason, at))
+    for (node, ni, family), moved in sorted(tables.items()):
+        total_before, total_after = sizes[(node, ni, family)]
+        withdrawn = moved.get("withdrawn", [])
+        lost_default = any(p in _DEFAULTS for p in withdrawn)
+        big_loss = total_before and len(withdrawn) / total_before >= ROUTES_WITHDRAWN_WARNING
+        parts = []
+        for what, label in (("changed", "changed next-hops"), ("withdrawn", "withdrawn"), ("new", "new")):
+            prefixes = sorted(moved.get(what, []))
+            if prefixes:
+                sample = ", ".join(prefixes[:_SAMPLE]) + (f" and {len(prefixes) - _SAMPLE} more" if len(prefixes) > _SAMPLE else "")
+                parts.append(f"{len(prefixes)} {label} ({sample})")
+        changes.append(
+            Change(
+                at,
+                node,
+                "routes",
+                f"{ni} {family}",
+                f"{total_before} routes",
+                f"{total_after} routes",
+                WARNING if lost_default or big_loss else INFO,
+                "; ".join(parts),
+            )
+        )
+    return changes
+
+
+def _prefix_change(node: str, ni: str, prefix: str, before: str, after: str, reason: str, at: float) -> Change:
+    """One prefix that matters: gone, back, or its next-hops moved."""
+    subject = f"{ni} {prefix}"
+    if after == ABSENT:
+        return Change(at, node, "route", subject, before, after, ERROR, f"{reason} withdrawn, was via {before}")
+    if before == ABSENT:
+        return Change(at, node, "route", subject, before, after, OK, f"{reason} installed via {after}")
+    width_before, width_after = len(before.split()), len(after.split())
+    if width_after < width_before:
+        severity, detail = WARNING, f"{reason}: ECMP narrowed from {width_before} to {width_after} next-hops ({after})"
+    elif width_after > width_before:
+        severity, detail = OK, f"{reason}: ECMP widened from {width_before} to {width_after} next-hops ({after})"
+    else:
+        severity, detail = INFO, f"{reason}: next-hops moved from {before} to {after}"
+    return Change(at, node, "route", subject, before, after, severity, detail)
 
 
 def _compare(key: Tuple[str, str, str], before: str, after: str, at: float) -> Iterator[Change]:
@@ -303,7 +503,7 @@ def _compare(key: Tuple[str, str, str], before: str, after: str, at: float) -> I
         # fabric doing its job. Only a MAC moving is news.
         if before == ABSENT or after == ABSENT:
             return
-        yield Change(at, node, kind, subject, before, after, INFO, f"moved from {before} to {after}")
+        yield Change(at, node, kind, subject, before, after, _MOVE_SEVERITY.get(kind, INFO), f"moved from {before} to {after}")
         return
     yield Change(at, node, kind, subject, before, after, _severity(kind, before, after), _describe(kind, before, after))
 
@@ -450,7 +650,9 @@ def node_change(node: str, connected: bool, at: Optional[float] = None, error: s
 
 #: Kinds whose transitions count towards a flap. A route count moving is
 #: churn rather than flapping, and a finding is counted by what it is about.
-FLAP_KINDS = frozenset({"bgp", "interface", "lldp", "bfd", "isis", "ospf", "es", "es-df", "mac", "optic", "node"})
+FLAP_KINDS = frozenset(
+    {"bgp", "interface", "lldp", "bfd", "isis", "ospf", "es", "es-df", "mac", "arp", "nd", "route", "optic", "node"}
+)
 #: Transitions within :data:`FLAP_WINDOW` seconds that make a flap.
 FLAP_THRESHOLD = 3
 FLAP_WINDOW = 600.0
@@ -541,6 +743,7 @@ __all__ = [
     "change_order",
     "diff_fabric",
     "diff_findings",
+    "normalize_prefix",
     "flaps",
     "node_change",
     "settled_findings",
