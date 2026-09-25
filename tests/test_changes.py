@@ -224,3 +224,108 @@ def test_since_empty_means_everything_and_nonsense_is_an_error():
     assert parse_since(None) is None
     with pytest.raises(ValueError):
         parse_since("yesterday")
+
+
+# --------------------------------------------------------------------------- #
+# ARP / ND
+# --------------------------------------------------------------------------- #
+
+
+def _cache(*entries, interface="irb0.104", nis=("macvrf-104", "ipvrf-1")):
+    from nornir_srl.records import NeighborCache, NeighborEntry
+
+    return [NeighborCache(interface, nis, tuple(NeighborEntry(ip, mac, "dynamic") for ip, mac in entries))]
+
+
+def test_an_address_answering_from_another_mac_is_a_warning():
+    before = fabric(arp={"leaf5": _cache(("10.1.4.16", "1A:00:00:00:00:01"))})
+    after = fabric(arp={"leaf5": _cache(("10.1.4.16", "1A:00:00:00:00:02"))})
+    (change,) = diff_fabric(before, after, at=1)
+    assert (change.kind, change.subject, change.severity) == ("arp", "macvrf-104/ipvrf-1 10.1.4.16", WARNING)
+    assert change.before == "1a:00:00:00:00:01 on irb0.104"
+
+
+def test_neighbours_learned_and_aged_out_are_summarized_per_interface():
+    empty = fabric(nd={"leaf5": _cache()})
+    learned = fabric(nd={"leaf5": _cache(("2001:db8::16", "1A:00:00:00:00:01"), ("2001:db8::17", "1A:00:00:00:00:02"))})
+    (change,) = diff_fabric(empty, learned, at=1)
+    assert (change.kind, change.subject, change.severity) == ("nd", "irb0.104", INFO)
+    assert change.detail == "2 learned (2001:db8::16, 2001:db8::17)"
+    (gone,) = diff_fabric(learned, empty, at=1)
+    assert gone.detail == "2 aged out (2001:db8::16, 2001:db8::17)"
+    assert diff_fabric(learned, learned, at=1) == []
+
+
+# --------------------------------------------------------------------------- #
+# route tables
+# --------------------------------------------------------------------------- #
+
+
+def _rib(node_routes, ni="default"):
+    from nornir_srl.records import Route, RouteNextHop, RouteTable
+
+    return {
+        node: [RouteTable(ni, tuple(Route(prefix, "bgp", next_hops=tuple(RouteNextHop(address=h) for h in hops)) for prefix, hops in routes))]
+        for node, routes in node_routes.items()
+    }
+
+
+def _loopbacks(*pairs):
+    from nornir_srl.records import NetworkInstance, Subinterface
+
+    return {node: [NetworkInstance("default", "default", "up", interfaces=(Subinterface("system0.0", "up", (f"{ip}/32",)),))] for node, ip in pairs}
+
+
+def test_a_route_table_is_summarized_in_one_change():
+    ordinary = [(f"10.9.{i}.0/24", ["192.0.2.1", "192.0.2.2"]) for i in range(10)]
+    moved = [(p, ["192.0.2.1"]) for p, _ in ordinary[:6]] + ordinary[6:9]
+    before = fabric(ipv4_rib=_rib({"leaf1": ordinary}))
+    after = fabric(ipv4_rib=_rib({"leaf1": moved + [("10.8.0.0/24", ["192.0.2.1"])]}))
+    (change,) = diff_fabric(before, after, at=1)
+    assert (change.kind, change.subject, change.before, change.after) == ("routes", "default ipv4", "10 routes", "10 routes")
+    assert change.detail == (
+        "6 changed next-hops (10.9.0.0/24, 10.9.1.0/24, 10.9.2.0/24, 10.9.3.0/24 and 2 more); "
+        "1 withdrawn (10.9.9.0/24); 1 new (10.8.0.0/24)"
+    )
+    assert change.severity == INFO
+
+
+def test_losing_most_of_a_table_or_its_default_is_a_warning():
+    table = [("0.0.0.0/0", ["192.0.2.1"]), ("10.9.0.0/24", ["192.0.2.1"])]
+    before = fabric(ipv4_rib=_rib({"leaf1": table}))
+    after = fabric(ipv4_rib=_rib({"leaf1": table[1:]}))
+    changes = {c.kind: c for c in diff_fabric(before, after, at=1)}
+    assert changes["routes"].severity == WARNING
+    # the default route is reported on its own too
+    assert changes["route"].subject == "default 0.0.0.0/0" and changes["route"].severity == ERROR
+
+
+def test_a_system_address_losing_an_ecmp_member_is_reported_on_its_own():
+    rib = lambda hops: _rib({"leaf1": [("192.0.2.15/32", hops), ("10.9.0.0/24", hops)]})  # noqa: E731
+    loop = _loopbacks(("leaf5", "192.0.2.15"))
+    before = fabric(ipv4_rib=rib(["fe80::1", "fe80::2"]), ni=loop)
+    after = fabric(ipv4_rib=rib(["fe80::1"]), ni=loop)
+    route = next(c for c in diff_fabric(before, after, at=1) if c.kind == "route")
+    assert route.subject == "default 192.0.2.15/32"
+    assert route.severity == WARNING
+    assert route.detail == "system address: ECMP narrowed from 2 to 1 next-hops (fe80::1)"
+
+
+def test_a_watched_prefix_is_reported_on_its_own_in_any_instance():
+    rib = lambda hops: _rib({"leaf1": [("6.6.6.1/32", hops)]}, ni="ipvrf-1")  # noqa: E731
+    before, after = fabric(ipv4_rib=rib(["10.1.4.16"])), fabric(ipv4_rib=rib(["10.1.4.17"]))
+    assert [c.kind for c in diff_fabric(before, after, at=1)] == ["routes"]
+    watched = [c for c in diff_fabric(before, after, at=1, watched=["6.6.6.1"]) if c.kind == "route"]
+    assert [(c.subject, c.detail) for c in watched] == [
+        ("ipvrf-1 6.6.6.1/32", "watched: next-hops moved from 10.1.4.16 to 10.1.4.17")
+    ]
+
+
+def test_a_prefix_is_normalized_the_way_route_tables_spell_it():
+    from nornir_srl.changes import normalize_prefix
+
+    assert normalize_prefix("10.1.4.16") == "10.1.4.16/32"
+    assert normalize_prefix("2001:db8::1") == "2001:db8::1/128"
+    assert normalize_prefix("10.1.4.1/24") == "10.1.4.0/24"
+    with pytest.raises(ValueError):
+        normalize_prefix("leaf1")

@@ -108,6 +108,18 @@
           >
             📌 Set baseline
           </button>
+          <!-- Changes lens only: the prefixes whose route changes are reported one by one. -->
+          <div id="watch-wrap" class="menu" hidden>
+            <button
+              id="watch-btn"
+              class="btn"
+              type="button"
+              title="Prefixes whose changes - withdrawn, installed, next-hops, ECMP width - are reported one by one"
+            >
+              👁 Watched
+            </button>
+            <div id="watch-menu" class="menu-panel watch-menu" hidden></div>
+          </div>
           <label class="field">
             <span class="muted">refresh</span>
             <select id="refresh" class="input">

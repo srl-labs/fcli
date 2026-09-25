@@ -846,6 +846,13 @@ def server(
         "(in ~/.local/state/fcli/acks/, next to --snapshot-dir). "
         "By default they last as long as the server runs",
     ),
+    watch_prefix: Optional[List[str]] = typer.Option(
+        None,
+        "--watch-prefix",
+        help="A prefix or address whose changes - withdrawn, installed, next-hops "
+        "or ECMP width - the timeline reports one by one, in any network-instance. "
+        "Repeatable; more can be added in the browser",
+    ),
 ) -> None:
     """Serves live report tables over HTTP, fed by gNMI subscriptions"""
     from .server.app import serve
@@ -854,6 +861,13 @@ def server(
     if not target.inventory.hosts:
         typer.echo("No hosts in the inventory. Check your -c/-t and -i options.")
         raise typer.Exit(1)
+    from .changes import normalize_prefix
+
+    try:
+        watched = [normalize_prefix(prefix) for prefix in watch_prefix or []]
+    except ValueError as exc:
+        typer.echo(f"--watch-prefix: {exc}", err=True)
+        raise typer.Exit(1) from None
     typer.echo(
         f"fcli server on http://{listen}:{port} "
         f"({len(target.inventory.hosts)} node(s))"
@@ -872,6 +886,7 @@ def server(
         snapshot_dir=snapshot_dir,
         watch_interval=watch_interval,
         persist_acks=persist_acks,
+        watch_prefixes=watched,
     )
 
 

@@ -254,3 +254,14 @@ def test_the_correlation_uses_the_remembered_cabling():
     findings = [F("itf_down", "error", "leaf1", "ethernet-1/1.0", "down"), F("itf_down", "error", "spine1", "ethernet-1/1.0", "down")]
     (incident,) = correlate(findings, state)
     assert incident.kind == "link"
+
+
+def test_watched_prefixes_over_the_api(fabric, tmp_path):  # noqa: F811 - the fixture
+    nornir, _devices = fabric
+    app = create_app(nornir, resync_interval=0, snapshot_dir=tmp_path / "snapshots", watch_prefixes=["10.1.4.16"])
+    with TestClient(app) as client:
+        assert client.get("/api/watch").json() == {"watched": ["10.1.4.16/32"]}
+        assert client.post("/api/watch", json={"prefix": "6.6.6.0/24"}).json()["watched"] == ["10.1.4.16/32", "6.6.6.0/24"]
+        assert client.post("/api/watch", json={"prefix": "not-a-prefix"}).status_code == 400
+        assert client.post("/api/unwatch", json={"prefix": "10.1.4.16"}).json()["watched"] == ["6.6.6.0/24"]
+        assert client.post("/api/unwatch", json={"prefix": "10.1.4.16"}).status_code == 404

@@ -10,7 +10,7 @@ import json
 import logging
 import threading
 from pathlib import Path
-from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Sequence
 
 import anyio
 from nornir.core import Nornir
@@ -179,6 +179,7 @@ def create_app(
     snapshot_dir: Optional[Path] = None,
     watch_interval: float = 0.0,
     persist_acks: bool = False,
+    watch_prefixes: Sequence[str] = (),
     chat_client_factory: Optional[Callable[[], Any]] = None,
     jsonrpc_call: Optional[Callable[..., Any]] = None,
 ) -> Starlette:
@@ -211,6 +212,8 @@ def create_app(
             else None
         ),
     )
+    for prefix in watch_prefixes:
+        store.timeline.watch(prefix)
     chat_kwargs: Dict[str, Any] = {}
     if chat_client_factory is not None:
         chat_kwargs["client_factory"] = chat_client_factory
@@ -305,6 +308,29 @@ def create_app(
         except KeyError as exc:
             return JSONResponse({"error": exc.args[0] if exc.args else "no such incident"}, status_code=404)
         return JSONResponse(result)
+
+    async def watched(_request: Request) -> Response:
+        """The prefixes whose changes the timeline reports one by one."""
+        return JSONResponse({"watched": store.timeline.watched()})
+
+    async def watch_change(request: Request) -> Response:
+        """Watch a prefix, or stop: ``{"prefix": "10.1.4.16/32"}``; the path says which."""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - bad client body
+            return JSONResponse({"error": "invalid JSON body"}, status_code=400)
+        prefix = body.get("prefix") if isinstance(body, dict) else None
+        if not isinstance(prefix, str) or not prefix.strip():
+            return JSONResponse({"error": "give the 'prefix' to watch"}, status_code=400)
+        try:
+            if request.url.path.endswith("/unwatch"):
+                if not store.timeline.unwatch(prefix):
+                    return JSONResponse({"error": f"'{prefix}' is not watched"}, status_code=404)
+            else:
+                store.timeline.watch(prefix)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc)}, status_code=400)
+        return JSONResponse({"watched": store.timeline.watched()})
 
     async def baseline(_request: Request) -> Response:
         """Keep the fabric as it is now as the baseline it is compared against."""
@@ -535,6 +561,9 @@ def create_app(
         Route("/api/timeline", timeline),
         Route("/api/baseline", baseline, methods=["POST"]),
         Route("/api/acks", acks),
+        Route("/api/watch", watched),
+        Route("/api/watch", watch_change, methods=["POST"]),
+        Route("/api/unwatch", watch_change, methods=["POST"]),
         Route("/api/ack", ack_change, methods=["POST"]),
         Route("/api/unack", ack_change, methods=["POST"]),
         Route("/api/report/{name}", report_once),
@@ -577,6 +606,7 @@ def serve(
     snapshot_dir: Optional[Path] = None,
     watch_interval: float = 15.0,
     persist_acks: bool = False,
+    watch_prefixes: Sequence[str] = (),
 ) -> None:
     """Run the fcli server with uvicorn (blocking)."""
     import uvicorn
@@ -592,6 +622,7 @@ def serve(
         snapshot_dir=snapshot_dir,
         watch_interval=watch_interval,
         persist_acks=persist_acks,
+        watch_prefixes=watch_prefixes,
     )
     store = app.store
     config = uvicorn.Config(

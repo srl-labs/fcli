@@ -45,7 +45,10 @@ The server reads the fabric every `--watch-interval` seconds (15 by default; `0`
 | `lldp` | a neighbour appears, is lost, or is replaced on a port |
 | `es-df` | the designated forwarder of a segment moves |
 | `mac` | a MAC moves between ports, VTEPs or segments (learning and ageing out are not news) |
-| `bgp-routes`, `routes` | a count halves, or goes to or from zero (smaller moves are the echo of a change reported elsewhere) |
+| `arp`, `nd` | an address answers from another MAC or interface: a duplicate address, a spoof or a moved host, recorded as a warning (learning and ageing out are not news) |
+| `bgp-routes` | a session's received count halves, or goes to or from zero |
+| `routes` | one change per route table (node × network-instance × family) per reading: how many prefixes changed next-hops, were withdrawn or are new, with examples. A warning if half the table or a default route went |
+| `route` | one of the prefixes that matter changes: the default routes, the host routes to every node's system address (VTEPs, loopbacks) in `default`, and **watched prefixes**. Withdrawn is an error, an ECMP narrowing a warning, installed or widened is ok |
 | `node` | a node stops or starts answering |
 | `finding` | a finding is raised or cleared, once it has lasted two readings (so a single-sample blip never reaches the timeline) |
 
@@ -54,6 +57,16 @@ Severity reads as `error` (something stopped working), `warning`, `ok` (somethin
 The **flapping** check reads the timeline. Three or more transitions of one session, port, adjacency or MAC within 10 minutes is a finding, and a MAC moving back and forth between two ports is what a loop looks like.
 
 Some changes appear with a delay. A SAMPLE subscription never reports a delete, so an entry that disappears, such as a dynamic BGP neighbour whose link went down, is only noticed once the stream's stale-entry sweep drops it: up to three sample intervals of its path, and at least 45 s. An interface going down is seen on the next reading.
+
+### Watched prefixes
+
+A route table is summarized, because one link flapping moves the next-hops of thousands of prefixes at once, and a timeline listing each would bury the cause. The prefixes that matter are reported one by one instead. The defaults and the system addresses are always watched; add your own:
+
+* at startup: `fcli server --watch-prefix 10.1.4.16 --watch-prefix 6.6.6.0/24` (an address means its host route);
+* at runtime: **👁 Watched** on the Changes page, or `POST /api/watch` / `POST /api/unwatch` with `{"prefix": "..."}`;
+* over MCP: `changes_since_baseline(watch_prefixes="10.1.4.16,6.6.6.1/32")`.
+
+A watched prefix is matched exactly, in every network-instance, and its next-hops going back and forth count towards the flapping check. Watched prefixes added at runtime last as long as the server does.
 
 ## The baseline
 

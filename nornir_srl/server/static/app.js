@@ -95,6 +95,9 @@
     pathGraphView: el("path-graph-view"),
     viewModeBtn: el("view-mode-btn"),
     baselineBtn: el("baseline-btn"),
+    watchWrap: el("watch-wrap"),
+    watchBtn: el("watch-btn"),
+    watchMenu: el("watch-menu"),
     topoOverlay: el("topo-overlay"),
     topoSummary: el("topo-summary"),
     chatTriage: el("chat-triage"),
@@ -2373,6 +2376,11 @@
     dom.title.textContent = report.title;
     dom.desc.textContent = report.description;
     if (dom.baselineBtn) dom.baselineBtn.hidden = report.name !== "changes";
+    if (dom.watchWrap) {
+      dom.watchWrap.hidden = report.name !== "changes";
+      dom.watchMenu.hidden = true;
+      if (report.name === "changes") loadWatched();
+    }
     dom.body.replaceChildren();
     dom.headRow.replaceChildren();
     dom.filterRow.replaceChildren();
@@ -4791,6 +4799,82 @@
     return button;
   }
 
+  /* ------------------------------------------------------ watched prefixes */
+
+  /** The watched prefixes: counted on the button, listed in its menu when open. */
+  async function loadWatched({ open = false } = {}) {
+    let watched = [];
+    try {
+      const res = await fetch("/api/watch");
+      watched = (await res.json()).watched || [];
+    } catch (_err) {
+      return;
+    }
+    dom.watchBtn.textContent = watched.length ? `👁 Watched (${watched.length})` : "👁 Watched";
+    if (open || !dom.watchMenu.hidden) renderWatchMenu(watched);
+  }
+
+  function renderWatchMenu(watched) {
+    dom.watchMenu.replaceChildren();
+    const heading = document.createElement("div");
+    heading.className = "menu-heading";
+    heading.textContent = "Reported one by one, in every network-instance";
+    dom.watchMenu.append(heading);
+    const note = document.createElement("div");
+    note.className = "muted watch-note";
+    note.textContent = "Default routes and every node's system address are always watched.";
+    dom.watchMenu.append(note);
+    for (const prefix of watched) {
+      const row = document.createElement("div");
+      row.className = "watch-row";
+      const text = document.createElement("span");
+      text.textContent = prefix;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn btn-ghost";
+      remove.textContent = "✕";
+      remove.title = `Stop watching ${prefix}`;
+      remove.addEventListener("click", () => changeWatch("/api/unwatch", prefix));
+      row.append(text, remove);
+      dom.watchMenu.append(row);
+    }
+    const form = document.createElement("form");
+    form.className = "watch-add";
+    const input = document.createElement("input");
+    input.className = "input";
+    input.placeholder = "10.1.4.16 or 6.6.6.0/24";
+    input.spellcheck = false;
+    const add = document.createElement("button");
+    add.type = "submit";
+    add.className = "btn";
+    add.textContent = "Watch";
+    form.append(input, add);
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const value = input.value.trim();
+      if (value) changeWatch("/api/watch", value);
+    });
+    dom.watchMenu.append(form);
+    input.focus();
+  }
+
+  async function changeWatch(url, prefix) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ prefix }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        window.alert(body.error || `watching failed (${res.status})`);
+      }
+    } catch (_err) {
+      window.alert("watching failed: the server did not answer");
+    }
+    loadWatched({ open: true });
+  }
+
   // What a lens found, as cards: one per thing found, the nodes inside it,
   // and under each node what that node reports - the same fold the
   // services pages give a fabric.
@@ -5598,7 +5682,18 @@
     if (!dom.exportMenu.hidden && !event.target.closest(".menu")) {
       dom.exportMenu.hidden = true;
     }
+    if (dom.watchMenu && !dom.watchMenu.hidden && !event.target.closest(".menu")) {
+      dom.watchMenu.hidden = true;
+    }
   });
+
+  if (dom.watchBtn) {
+    dom.watchBtn.addEventListener("click", () => {
+      const opening = dom.watchMenu.hidden;
+      dom.watchMenu.hidden = !opening;
+      if (opening) loadWatched({ open: true });
+    });
+  }
 
   dom.compareBtn.addEventListener("click", () => {
     const opening = dom.compareMenu.hidden;
