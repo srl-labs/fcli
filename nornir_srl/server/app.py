@@ -309,6 +309,20 @@ def create_app(
             return JSONResponse({"error": exc.args[0] if exc.args else "no such incident"}, status_code=404)
         return JSONResponse(result)
 
+    async def ack_all(request: Request) -> Response:
+        """Acknowledge every open incident: ``{"note": "...", "inv_filter": "k=v"}``."""
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 - bad client body
+            body = {}
+        body = body if isinstance(body, dict) else {}
+        note = body.get("note") or ""
+        if not isinstance(note, str):
+            return JSONResponse({"error": "note must be a string"}, status_code=400)
+        inv_filter = parse_kv(body.get("inv_filter") or None)
+        result = await anyio.to_thread.run_sync(store.acknowledge_all, note, inv_filter)
+        return JSONResponse(result)
+
     async def watched(_request: Request) -> Response:
         """The prefixes whose changes the timeline reports one by one."""
         return JSONResponse({"watched": store.timeline.watched()})
@@ -566,6 +580,7 @@ def create_app(
         Route("/api/unwatch", watch_change, methods=["POST"]),
         Route("/api/ack", ack_change, methods=["POST"]),
         Route("/api/unack", ack_change, methods=["POST"]),
+        Route("/api/ack-all", ack_all, methods=["POST"]),
         Route("/api/report/{name}", report_once),
         Route("/api/stream/{name}", report_stream),
         Route("/api/diff/{name}", report_diff),

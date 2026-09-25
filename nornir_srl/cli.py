@@ -57,7 +57,7 @@ def _version_callback(value: bool):
         raise typer.Exit()
 
 
-app = typer.Typer(name="fcli", help="Nornir SRLinux CLI")
+app = typer.Typer(name="fcli", help="SR Linux Observability tool")
 logger = logging.getLogger(__name__)
 
 

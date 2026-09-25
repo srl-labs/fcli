@@ -95,6 +95,7 @@
     pathGraphView: el("path-graph-view"),
     viewModeBtn: el("view-mode-btn"),
     baselineBtn: el("baseline-btn"),
+    ackAllBtn: el("ack-all-btn"),
     watchWrap: el("watch-wrap"),
     watchBtn: el("watch-btn"),
     watchMenu: el("watch-menu"),
@@ -125,6 +126,7 @@
     chatProvider: el("chat-provider"),
     chatEffort: el("chat-effort"),
     chatResizer: el("chat-resizer"),
+    sideResizer: el("side-resizer"),
     // KPI elements
     kpiCardNodes: el("kpi-card-nodes"),
     kpiCardBgp: el("kpi-card-bgp"),
@@ -2376,6 +2378,11 @@
     dom.title.textContent = report.title;
     dom.desc.textContent = report.description;
     if (dom.baselineBtn) dom.baselineBtn.hidden = report.name !== "changes";
+    if (dom.ackAllBtn) {
+      dom.ackAllBtn.hidden = report.name !== "incidents";
+      dom.ackAllBtn.disabled = true; // until the incidents are in
+      dom.ackAllBtn.textContent = "✓ ACK all";
+    }
     if (dom.watchWrap) {
       dom.watchWrap.hidden = report.name !== "changes";
       dom.watchMenu.hidden = true;
@@ -2545,6 +2552,7 @@
     state.rows = table.rows;
     state.tree = table.tree || null;
     state.records = table.records || null;
+    if (state.report && state.report.name === "incidents") renderAckAll();
     state.graph = table.graph || null;
     state.errors = table.errors || [];
     if (columnsChanged) {
@@ -4753,6 +4761,37 @@
     return el;
   }
 
+  /** The ACK all button, with how many incidents it would acknowledge. */
+  function renderAckAll() {
+    if (!dom.ackAllBtn) return;
+    const open = (state.tree || []).filter((card) => card.action === "ack").length;
+    dom.ackAllBtn.textContent = open ? `✓ ACK all (${open})` : "✓ ACK all";
+    dom.ackAllBtn.disabled = !open;
+  }
+
+  async function ackAll() {
+    const open = (state.tree || []).filter((card) => card.action === "ack").length;
+    if (!open) return;
+    const note = window.prompt(`Acknowledge all ${open} open incident(s) in this view?\n\nNote (optional):`, "");
+    if (note === null) return; // cancelled
+    dom.ackAllBtn.disabled = true;
+    try {
+      const res = await fetch("/api/ack-all", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ note, inv_filter: dom.invFilter.value.trim() }),
+      });
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        window.alert(`ACK all failed: ${body.error || res.status}`);
+      }
+    } catch (_err) {
+      window.alert("ACK all failed: the server did not answer");
+    } finally {
+      connect(); // the answer changes at once, not at the next refresh
+    }
+  }
+
   /**
    * ACK / un-ACK on an incident's card. Acknowledging takes the incident out
    * of the overview, the badges and the colours until a finding it did not
@@ -5520,6 +5559,7 @@
   }
 
   if (dom.chatTriage) dom.chatTriage.addEventListener("click", triage);
+  if (dom.ackAllBtn) dom.ackAllBtn.addEventListener("click", ackAll);
 
   if (dom.kpiCardBd) {
     dom.kpiCardBd.addEventListener("click", () => {
@@ -6007,6 +6047,76 @@
     }
   }
 
+  /* ---------------------------------------------------- side pane width */
+
+  const SIDE_WIDTH_DEFAULT = 260;
+  const SIDE_WIDTH_MIN = 180;
+  let sideWidth = SIDE_WIDTH_DEFAULT;
+
+  /** Set the side pane's width, kept between a readable minimum and half the window. */
+  function applySideWidth(px, persist) {
+    const max = Math.max(SIDE_WIDTH_MIN, Math.round(window.innerWidth * 0.5));
+    sideWidth = Math.round(Math.min(max, Math.max(SIDE_WIDTH_MIN, px)));
+    document.documentElement.style.setProperty("--side-width", sideWidth + "px");
+    if (dom.sideResizer) dom.sideResizer.setAttribute("aria-valuenow", String(sideWidth));
+    if (persist) {
+      try {
+        localStorage.setItem("fcli-side-width", String(sideWidth));
+      } catch (_err) {
+        /* storage may be unavailable */
+      }
+    }
+  }
+
+  function initSideResize() {
+    let stored = NaN;
+    try {
+      stored = parseInt(localStorage.getItem("fcli-side-width"), 10);
+    } catch (_err) {
+      /* storage may be unavailable */
+    }
+    applySideWidth(stored > 0 ? stored : SIDE_WIDTH_DEFAULT, false);
+    const resizer = dom.sideResizer;
+    if (!resizer) return;
+    const sidebar = resizer.parentElement;
+
+    resizer.addEventListener("pointerdown", (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      resizer.setPointerCapture(event.pointerId);
+      sidebar.classList.add("is-widening");
+      const left = sidebar.getBoundingClientRect().left;
+      const onMove = (move) => applySideWidth(move.clientX - left, false);
+      const onUp = () => {
+        resizer.removeEventListener("pointermove", onMove);
+        resizer.removeEventListener("pointerup", onUp);
+        resizer.removeEventListener("pointercancel", onUp);
+        sidebar.classList.remove("is-widening");
+        applySideWidth(sideWidth, true);
+        // The topology fits itself to the space it has.
+        if (state.topoFit) applyTopoZoom();
+      };
+      resizer.addEventListener("pointermove", onMove);
+      resizer.addEventListener("pointerup", onUp);
+      resizer.addEventListener("pointercancel", onUp);
+    });
+
+    resizer.addEventListener("dblclick", () => applySideWidth(SIDE_WIDTH_DEFAULT, true));
+
+    resizer.addEventListener("keydown", (event) => {
+      let next = sideWidth;
+      if (event.key === "ArrowRight") next += 20;
+      else if (event.key === "ArrowLeft") next -= 20;
+      else if (event.key === "Home") next = SIDE_WIDTH_MIN;
+      else if (event.key === "End") next = window.innerWidth * 0.5;
+      else return;
+      event.preventDefault();
+      applySideWidth(next, true);
+    });
+
+    window.addEventListener("resize", () => applySideWidth(sideWidth, false));
+  }
+
   function initChatResize() {
     let stored = NaN;
     try {
@@ -6429,6 +6539,7 @@
   }
 
   initChatResize();
+  initSideResize();
 
   if (dom.chatOpen) dom.chatOpen.addEventListener("click", openChat);
   if (dom.chatClose) dom.chatClose.addEventListener("click", closeChat);

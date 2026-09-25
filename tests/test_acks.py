@@ -181,3 +181,19 @@ def test_an_acknowledgement_comes_off_even_once_the_incident_changed_shape(fabri
             store.unacknowledge("never|acknowledged")
     finally:
         store.stop()
+
+
+def test_acknowledging_every_open_incident_at_once(fabric, tmp_path):  # noqa: F811 - the fixture
+    nornir, devices = fabric
+    neighbor = devices["leaf1"].responses["/network-instance[name=*]/protocols/bgp/neighbor"][0]
+    neighbor["network-instance"][0]["protocols"]["bgp"]["neighbor"][0]["session-state"] = "active"
+    with _client(nornir, tmp_path) as client:
+        before = client.get("/api/overview").json()["health"]
+        assert before["incidents"] >= 1
+        answer = client.post("/api/ack-all", json={"note": "maintenance"}).json()
+        assert answer["acknowledged"] == before["incidents"]
+        after = client.get("/api/overview").json()["health"]
+        assert after["incidents"] == 0 and after["acknowledged"] == before["incidents"]
+        assert all(card["action"] == "unack" for card in client.get("/api/report/incidents").json()["tree"])
+        # nothing left open: a second press acknowledges nothing
+        assert client.post("/api/ack-all", json={}).json()["acknowledged"] == 0

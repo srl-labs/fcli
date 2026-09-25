@@ -30,6 +30,7 @@ Within an anchor, the root is chosen by precedence: a node gone, then hardware, 
 A known problem, such as a link waiting for a technician or BFD due to be enabled in the next change window, keeps drawing the eye on every page until it is fixed. **✓ ACK** on an incident's card acknowledges it, with an optional note:
 
 * it leaves the Overview's health card, the node badges, the link colours of the health overlay and the summary line;
+* **✓ ACK all** in the Incidents toolbar does the same for every open incident in the current view at once, under one note;
 * it stays at the bottom of Incidents, greyed and marked, with **↺ Un-ACK**, and its findings stay listed (marked) in the topology's detail panels;
 * acknowledging and un-acknowledging are events on the timeline (`kind: ack`), with the note.
 
