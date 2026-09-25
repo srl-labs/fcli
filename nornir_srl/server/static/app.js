@@ -284,6 +284,26 @@
     }
   }
 
+  /** Status a BGP RIB table starts filtered on: routes marked used (u). */
+  const BGP_RIB_USED_FILTER = "^u";
+
+  /**
+   * Column filters a report starts with. Each is applied once per report, on
+   * top of whatever filters were saved before; clearing it afterwards is
+   * saved like any other change, so a cleared default stays cleared.
+   */
+  function applyDefaultFilters() {
+    if (!state.report.name.startsWith("bgp_rib")) return;
+    const key = `fcli-default-filters-${state.report.name}`;
+    if (localStorage.getItem(key) === BGP_RIB_USED_FILTER) return;
+    state.colFilters.set("st", BGP_RIB_USED_FILTER);
+    localStorage.setItem(key, BGP_RIB_USED_FILTER);
+    localStorage.setItem(
+      `fcli-filters-${state.report.name}`,
+      JSON.stringify([...state.colFilters.entries()])
+    );
+  }
+
   function loadReportPreferences() {
     if (!state.report || isPanelReport(state.report.name)) return;
     state.hidden.clear();
@@ -301,6 +321,7 @@
       if (filtersData) {
         JSON.parse(filtersData).forEach(([col, val]) => state.colFilters.set(col, val));
       }
+      applyDefaultFilters();
       const widthsData = localStorage.getItem(`fcli-colwidths-${state.report.name}`);
       if (widthsData) {
         const parsed = JSON.parse(widthsData);
@@ -2711,9 +2732,17 @@
       input.placeholder = "filter";
       input.dataset.column = column;
       input.value = state.colFilters.get(column) || "";
+      const showDefaultHint = () => {
+        input.title =
+          column === "st" && input.value === BGP_RIB_USED_FILTER
+            ? "Only used routes (u). Clear to show all routes."
+            : "";
+      };
+      showDefaultHint();
       input.addEventListener(
         "input",
         debounce(() => {
+          showDefaultHint();
           const value = input.value.trim();
           if (value) state.colFilters.set(column, value);
           else state.colFilters.delete(column);

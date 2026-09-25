@@ -4,7 +4,7 @@
 [![SR Linux](https://img.shields.io/badge/SR%20Linux-25.3.2%20%7C%2025.10.3%20%7C%2026.3.1%20%7C%2026.7.1-blue)](#tested-sr-linux-releases)
 [![PyPI](https://img.shields.io/pypi/v/nornir-srl)](https://pypi.org/project/nornir-srl/)
 
-**fcli** is a fabric observability tool for Nokia SR Linux. It talks gNMI to every node in the inventory and presents the same reports on three surfaces:
+**fcli** is a fabric observability tool for Nokia [SR Linux](https://www.nokia.com/ip-networks/service-router-linux-NOS/). It talks gNMI to every node in the inventory and presents the same reports on three surfaces:
 
 1. **`fcli server`** — a live web UI, kept current by gNMI subscriptions (the primary way to use it)
 2. **`fcli <report>`** — one-shot CLI tables, JSON, YAML or CSV

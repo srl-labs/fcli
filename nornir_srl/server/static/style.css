@@ -96,6 +96,17 @@ body {
   color: var(--muted);
 }
 
+.brand-sub a {
+  color: inherit;
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+.brand-sub a:hover {
+  color: var(--accent);
+  text-decoration-style: solid;
+}
+
 .topo-badge {
   font-size: 11px;
   font-family: var(--mono);
