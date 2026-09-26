@@ -192,6 +192,10 @@
     topoOverlay: "traffic",
     collapsedCards: new Set(),
     collapsedNodes: new Set(),
+    // Incident cards already given their starting collapse, by incident and
+    // whether it is acknowledged: a card starts collapsed, and collapses again
+    // when it is acknowledged.
+    seenIncidentCards: new Set(),
     collapsedSections: new Set(),
     navStack: [],
     navIndex: -1,
@@ -4716,7 +4720,17 @@
   }
 
   function lensCard(card, index) {
-    const cardKey = `lens:${state.report.name}:${index}:${card.title}`;
+    // An incident keeps its key as others come and go; its place does not.
+    const cardKey = card.key
+      ? `lens:${state.report.name}:key:${card.key}`
+      : `lens:${state.report.name}:${index}:${card.title}`;
+    if (state.report.name === "incidents" && card.key) {
+      const seenKey = `${card.key}|${card.action === "unack" ? "acked" : "open"}`;
+      if (!state.seenIncidentCards.has(seenKey)) {
+        state.seenIncidentCards.add(seenKey);
+        state.collapsedCards.add(cardKey);
+      }
+    }
     const collapsed = state.collapsedCards.has(cardKey);
     const el = document.createElement("div");
     el.className = `bd-card bd-state-${LENS_CARD_STATE[card.state] || "unknown"}`;
