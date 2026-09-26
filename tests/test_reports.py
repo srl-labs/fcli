@@ -11,8 +11,16 @@ import pytest
 from nornir_srl.connections.helpers import clean_structured_key
 from nornir_srl.connections.interfaces import NetworkInstanceMixin
 from nornir_srl.connections.routing import RoutingMixin
-from nornir_srl.records import Egress
-from nornir_srl.reports import ES_TABLE, IP_RIB_TABLE, LAG_TABLE, TUNNEL_TABLE, bgp_rib_table
+from nornir_srl.records import BgpRib, BgpRoute, Egress
+from nornir_srl.reports import (
+    ES_TABLE,
+    IP_RIB_TABLE,
+    LAG_TABLE,
+    TUNNEL_TABLE,
+    bgp_rib_table,
+    coerce_params,
+    get_report,
+)
 
 # --------------------------------------------------------------------------- #
 # clean_structured_key
@@ -3050,3 +3058,77 @@ def test_get_arp_reads_a_single_interface_dict_on_the_network_instance():
     (cache,) = device.get_arp()["arp"]
     assert cache.nis == ("vrf1",)
     assert cache.interface == "irb1.100"
+
+
+def test_received_routes_takes_a_link_local_peer_scoped_to_its_interface():
+    """An unnumbered peer is fe80::…%<interface>: a peer, if not an IP address."""
+    peer = "fe80::1863:eff:feff:1%ethernet-1/29.0"
+    other = "fe80::1863:eff:feff:1%ethernet-1/30.0"
+
+    class Device:
+        def get_bgp_rib(self, route_fam, route_type=None, rib="in"):
+            routes = (BgpRoute(peer, prefix="10.0.0.1/32"), BgpRoute(other), BgpRoute("0.0.0.0"))
+            return {"bgp_rib": [BgpRib("default", route_fam, route_type or "", routes)]}
+
+    spec = get_report("bgp_received_routes")
+    params = coerce_params(spec, {"peer": peer, "family": "ipv4"})
+    assert params == {"peer": peer, "family": "ipv4"}
+    (rib,) = spec.getter(Device(), **params)["bgp_rib"]
+    assert [r.neighbor for r in rib.routes] == [peer]
+    # Without a peer: what every peer sent, and nothing originated locally.
+    ribs = spec.getter(Device())["bgp_rib"]
+    assert len(ribs) == 9  # five EVPN route types and four other families
+    assert {r.neighbor for rib in ribs for r in rib.routes} == {peer, other}
+
+
+def test_get_bgp_rib_out_reads_what_was_sent_to_each_peer():
+    """rib='out' is the rib-out-post: keyed by the peer a route went to, with
+    the attributes it was sent with, and not the local-rib."""
+    attr_sets, _ = _ip_rib_payloads("ipv4-unicast", "10.10.0.0/24", {"community": ["65000:100"]})
+    sent = [
+        {
+            "network-instance": [
+                {
+                    "name": "default",
+                    "bgp-rib": {
+                        "afi-safi": [
+                            {
+                                "afi-safi-name": "ipv4-unicast",
+                                "ipv4-unicast": {
+                                    "rib-in-out": {
+                                        "rib-out-post": {
+                                            "route": [
+                                                {"prefix": "192.0.2.11/32", "neighbor": "10.0.0.6", "attr-id": 1}
+                                            ]
+                                        }
+                                    }
+                                },
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+    ]
+    dev = _FakeRouting({"attr-sets/attr-set": attr_sets, "rib-in-out/rib-out-post/route": sent})
+    (rib,) = dev.get_bgp_rib(route_fam="ipv4", rib="out")["bgp_rib"]
+    (route,) = rib.routes
+    assert (route.prefix, route.neighbor, route.communities) == ("192.0.2.11/32", "10.0.0.6", ("65000:100",))
+    assert not (route.used or route.valid or route.best)
+    with pytest.raises(ValueError):
+        dev.get_bgp_rib(route_fam="ipv4", rib="sideways")
+
+
+@pytest.mark.parametrize("name,rib", [("bgp_received_routes", "in"), ("bgp_advertised_routes", "out")])
+def test_peer_routes_read_their_own_side_of_the_rib(name, rib):
+    asked = []
+
+    class Device:
+        def get_bgp_rib(self, route_fam, route_type=None, rib="in"):
+            asked.append(rib)
+            return {"bgp_rib": [BgpRib("default", route_fam, route_type or "", (BgpRoute("10.0.0.6"),))]}
+
+    ribs = get_report(name).getter(Device(), peer="10.0.0.6", family="evpn")["bgp_rib"]
+    assert [r.route_type for r in ribs] == ["1", "2", "3", "4", "5"]
+    assert set(asked) == {rib}
+    assert ("st" in get_report(name).table_for({}).column_names) == (rib == "in")

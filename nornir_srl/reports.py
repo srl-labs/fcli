@@ -32,11 +32,12 @@ column name is written.
 from __future__ import annotations
 
 import ipaddress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Tuple, Union
 
 from .connections.routing import BGP_RIB_ROUTE_FAM_ALIASES
 from .records import (
+    BgpRib,
     BgpRoute,
     EthernetSegment,
     IrbAddress,
@@ -1024,6 +1025,114 @@ def _bgp_rib_variants() -> List[ReportSpec]:
     return variants
 
 
+#: The families a peer's received routes can be asked for, by the name the
+#: BGP peers table gives them, and what the RIB getter calls each.
+_RECEIVED_FAMILIES: Dict[str, str] = {
+    "evpn": "evpn",
+    "ipv4-unicast": "ipv4",
+    "ipv6-unicast": "ipv6",
+    "l3vpn-ipv4-unicast": "l3vpn-ipv4-unicast",
+    "l3vpn-ipv6-unicast": "l3vpn-ipv6-unicast",
+}
+_RECEIVED_ALIASES = {"ipv4": "ipv4-unicast", "ipv6": "ipv6-unicast"}
+
+
+def _same_address(a: str, b: str) -> bool:
+    """Whether two peer addresses are one, however each is written.
+
+    A link-local peer carries the interface it is scoped to, which is part of
+    which peer it is: compared as written when either does not parse.
+    """
+    try:
+        return ipaddress.ip_address(a) == ipaddress.ip_address(b)
+    except ValueError:
+        return a.strip().lower() == b.strip().lower()
+
+
+def _peer_rib(rib: str) -> Callable[..., Dict[str, Any]]:
+    """A getter for the routes exchanged with one BGP peer, in one direction.
+
+    *rib* ``in`` is what peers sent, read out of the same RIB the BGP RIB
+    reports show; ``out`` is what was sent to them, out of the rib-out-post.
+    Either keeps the routes whose neighbor is *peer*, or without one every
+    peer's. Without a *family* every family is read - which is also what the
+    server discovers the paths to stream from, as it calls a getter without
+    arguments - and EVPN is every route type.
+    """
+
+    def getter(device: Any, peer: Optional[str] = None, family: Optional[str] = None) -> Dict[str, Any]:
+        if family:
+            wanted = _RECEIVED_ALIASES.get(family.lower(), family.lower())
+            if wanted not in _RECEIVED_FAMILIES:
+                raise ValueError(
+                    f"family: '{family}' is not one of {', '.join(_RECEIVED_FAMILIES)}"
+                )
+            families = [wanted]
+        else:
+            families = list(_RECEIVED_FAMILIES)
+        ribs: List[BgpRib] = []
+        for name in families:
+            route_fam = _RECEIVED_FAMILIES[name]
+            for route_type in ("1", "2", "3", "4", "5") if name == "evpn" else (None,):
+                kwargs: Dict[str, Any] = {"route_fam": route_fam, "rib": rib}
+                if route_type is not None:
+                    kwargs["route_type"] = route_type
+                for table in device.get_bgp_rib(**kwargs).get("bgp_rib", []):
+                    routes = tuple(
+                        route
+                        for route in table.routes
+                        # A locally originated route names no peer.
+                        if route.neighbor not in ("", "0.0.0.0", "::")
+                        and (not peer or _same_address(route.neighbor, peer))
+                    )
+                    if routes:
+                        ribs.append(replace(table, routes=routes))
+        return {"bgp_rib": ribs}
+
+    return getter
+
+
+#: One layout for every family, so a peer's routes read as one table: the
+#: NLRI fields a family or route type does not have stay empty.
+BGP_RECEIVED_TABLE = Table(
+    columns=(
+        Column("NI", "ni"),
+        Column("family", "family"),
+        # The EVPN route type, 1 to 5; empty for the other families.
+        Column("type", "route_type"),
+    ),
+    each="routes",
+    each_columns=(
+        Column("peer", "neighbor"),
+        Column("st", _route_status),
+        Column("RD", "rd"),
+        Column("Prefix", "prefix"),
+        Column("MAC", "mac"),
+        Column("IP", "ip"),
+        Column("ESI", "esi"),
+        Column("Tag", "tag"),
+        Column("next-hop", "next_hop"),
+        Column("vni", "vni"),
+        Column("RT", lambda r: _joined(r.route_targets)),
+        Column("as-path", lambda r: _listed(r.as_path)),
+        Column(
+            "communities",
+            lambda r: _joined([*r.communities, *r.large_communities, *r.ext_communities]),
+        ),
+        Column("lpref", "local_pref"),
+        Column("med", "med"),
+        Column("origin", "origin"),
+    ),
+)
+
+#: What was sent carries no used/valid/best flags, and names the peer it went to.
+BGP_ADVERTISED_TABLE = Table(
+    columns=BGP_RECEIVED_TABLE.columns,
+    each="routes",
+    each_columns=tuple(c for c in BGP_RECEIVED_TABLE.each_columns if c.name != "st"),
+)
+
+
 REPORTS: List[ReportSpec] = [
     ReportSpec(
         name="overview",
@@ -1213,6 +1322,41 @@ REPORTS: List[ReportSpec] = [
         surfaces=INTERACTIVE,
     ),
     *_bgp_rib_variants(),
+    *(
+        ReportSpec(
+            name=f"bgp_{direction}_routes",
+            resource="bgp_rib",
+            title=f"BGP {direction.capitalize()} Routes",
+            description=description,
+            getter=_peer_rib(rib),
+            table=table,
+            category="BGP RIB",
+            surfaces=STREAMING,
+            params=(
+                ParamSpec(
+                    name="peer",
+                    label="Peer",
+                    placeholder="10.0.0.1",
+                    help="The peer address whose routes to list; empty lists every peer's",
+                    # Not 'address': an unnumbered peer is a link-local address
+                    # scoped to its interface, fe80::1%ethernet-1/1.0, which does
+                    # not parse as one.
+                ),
+                ParamSpec(
+                    name="family",
+                    label="Family",
+                    placeholder="all",
+                    help="evpn, ipv4-unicast, ipv6-unicast, l3vpn-ipv4-unicast or l3vpn-ipv6-unicast; empty is every family",
+                ),
+            ),
+        )
+        for direction, rib, table, description in (
+            ("received", "in", BGP_RECEIVED_TABLE,
+             "Routes a BGP peer sent, in every family or the one chosen, from the RIB-in-post."),
+            ("advertised", "out", BGP_ADVERTISED_TABLE,
+             "Routes sent to a BGP peer, in every family or the one chosen, from the RIB-out-post."),
+        )
+    ),
     ReportSpec(
         name="ipv4_rib",
         table=IP_RIB_TABLE,

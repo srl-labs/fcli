@@ -630,8 +630,10 @@ One registry drives all three surfaces, so a report cannot drift between CLI, MC
 | Sub-Interfaces | `subif` | yes | Type, addresses, oper-state |
 | LAGs | `lag` | yes | LAG members and LACP |
 | Network Instances | `ni` | yes | NIs, their EVPN EVI and the interfaces bound to them |
-| BGP Peers | `bgp-peers` | yes | Session state and per-AF Rx/Act/Tx route counts |
+| BGP Peers | `bgp-peers` | yes | Session state and per-AF Rx/Act/Tx route counts; Rx links to the routes the peer sent, Tx to the ones sent to it |
 | BGP RIB | `bgp-rib -r …` | split per family / EVPN type | RIB-in-post with path attributes |
+| BGP Received Routes | | yes | The routes one peer sent, in one family or all of them, from the RIB-in-post |
+| BGP Advertised Routes | | yes | The routes sent to one peer, in one family or all of them, from the RIB-out-post |
 | IPv4 / IPv6 RIB | `ipv4-rib`, `ipv6-rib` | yes | Route table with resolved next-hops; `-a` for LPM |
 | Static Routes | `static-routes` | yes | Configured statics and their state |
 | Tunnel Table | `tunnel-table` | yes | VXLAN, LDP, SR-ISIS, RSVP, … |

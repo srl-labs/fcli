@@ -2566,8 +2566,32 @@
           /* non-JSON error payload */
         }
       }
+      // A stream the server refused - a parameter it cannot use, a report it
+      // does not offer - is closed for good rather than retried, and the
+      // browser keeps the reason from us: ask for it once, the same way.
+      if (source.readyState === EventSource.CLOSED) {
+        setLive("error", "refused");
+        explainRefusal(source, params);
+        return;
+      }
       setLive("error", "reconnecting");
     });
+  }
+
+  async function explainRefusal(source, params) {
+    let reason = "the server refused the stream";
+    try {
+      const res = await fetch(`/api/report/${encodeURIComponent(state.report.name)}?${params}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        reason = body.error || `${reason} (HTTP ${res.status})`;
+      }
+    } catch (_err) {
+      reason = "the server did not answer";
+    }
+    if (state.source !== source) return; // moved on meanwhile
+    showErrors([{ node: "server", error: reason }]);
+    dom.rowCount.textContent = "not loaded";
   }
 
   function ingest(table) {
@@ -3137,6 +3161,13 @@
     for (const [column, pattern] of Object.entries(state.pendingFilters.filters || {})) {
       if (pattern) state.colFilters.set(column, pattern);
     }
+    // A jump can ask the report something too, not only filter what it says.
+    if (state.pendingFilters.params) {
+      state.reportParams.clear();
+      for (const [name, value] of Object.entries(state.pendingFilters.params)) {
+        if (value) state.reportParams.set(name, value);
+      }
+    }
     state.pendingFilters = null;
     saveReportPreferences();
   }
@@ -3169,19 +3200,23 @@
     return `(?:^|[^0-9])${e}(?=$|[^0-9])`;
   }
 
-  function jumpToFilteredReport(reportName, niNames, nodeNames, extraFilters) {
+  function jumpToFilteredReport(reportName, niNames, nodeNames, extraFilters, params) {
     const filters = {};
     const ni = tokenMatchPattern(niNames);
     const nodes = exactMatchPattern(nodeNames);
     if (ni) filters.NI = ni;
     if (nodes) filters.Node = nodes;
     Object.assign(filters, extraFilters || {});
-    state.pendingFilters = { report: reportName, filters };
+    state.pendingFilters = { report: reportName, filters, params: params || null };
 
     if (state.report && state.report.name === reportName) {
       syncCurrentVisit();
       applyPendingFilters();
       updateFilterUI();
+      if (params) {
+        renderReportParams();
+        connect();
+      }
       renderHead();
       renderBody();
       recordVisit();
@@ -3222,6 +3257,47 @@
     const nh = nextHopMatchPattern(ip);
     if (!report || !nh) return;
     jumpToFilteredReport(report, niName ? [niName] : [], [], { "next-hop": nh });
+  }
+
+  /**
+   * The routes exchanged with a peer in one family, as the node that peers
+   * with it holds them: *direction* ``received`` or ``advertised``.
+   */
+  function jumpToPeerRoutes(direction, nodeName, niName, peerAddress, family) {
+    jumpToFilteredReport(`bgp_${direction}_routes`, [niName], [nodeName], {}, { peer: peerAddress, family });
+  }
+
+  /**
+   * A BGP peers 'Rx/Act/Tx' cell with its Rx count linked to the routes the
+   * peer sent and its Tx count to the ones sent to it, or null for a cell
+   * that is not one. A count of 0 has no routes behind it and stays text.
+   */
+  function peerRoutesCell(row, column, value) {
+    const peer = String(row.peer ?? "").trim();
+    const family = (/^(\S+) Rx\/Act\/Tx$/.exec(column) || [])[1];
+    const counts = /^(\d+)\/(\d+)\/(\d+)$/.exec(String(value));
+    if (!peer || !row.Node || !family || !counts) return null;
+    const [, rx, act, tx] = counts;
+    const part = (count, direction, title) => {
+      if (count === "0") return document.createTextNode(count);
+      const link = document.createElement("a");
+      link.className = "vrf-link";
+      link.href = "#";
+      link.textContent = count;
+      link.title = title;
+      link.addEventListener("click", (event) => {
+        event.preventDefault();
+        jumpToPeerRoutes(direction, row.Node, row.NI, peer, family);
+      });
+      return link;
+    };
+    const cell = document.createDocumentFragment();
+    cell.append(
+      part(rx, "received", `Show the ${family} routes ${peer} sent to ${row.Node}`),
+      document.createTextNode(`/${act}/`),
+      part(tx, "advertised", `Show the ${family} routes ${row.Node} sent to ${peer}`)
+    );
+    return cell;
   }
 
   function jumpToBgpPeer(nodeName, niName, peerAddress) {
@@ -5218,7 +5294,12 @@
       for (const column of columns) {
         const value = row[column] ?? "";
         const td = document.createElement("td");
-        td.textContent = value;
+        const linked =
+          !state.diff && state.report && state.report.name === "bgp_peers"
+            ? peerRoutesCell(row, column, value)
+            : null;
+        if (linked) td.append(linked);
+        else td.textContent = value;
         if (tone && column === toned.column) td.classList.add("tone-cell");
         const changes = state.diff ? row["_changes"] : null;
         if (changes && changes[column]) td.classList.add("diff-cell");

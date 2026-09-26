@@ -296,13 +296,20 @@ class RoutingMixin:
         route_type: Optional[str] = "2",
         network_instance: str = "*",
         detail: bool = False,
+        rib: str = "in",
     ) -> Dict[str, Any]:
         """The BGP RIB of one family, as records carrying every path attribute.
 
         *detail* is accepted for the callers that used to ask for the extra
         attributes: a record carries all of them, and the table declared for
         the report decides which to show.
+
+        *rib* ``out`` reads the rib-out-post instead: the routes sent to each
+        peer, keyed by the peer they went to, with the attributes they were
+        sent with and none of the used/valid/best flags a received route has.
         """
+        if rib not in ("in", "out"):
+            raise ValueError(f"Invalid rib {rib}: 'in' or 'out'")
         del detail
         mod_version = model_version(
             self.capabilities, "bgp-rib", "urn:nokia.com:srlinux:bgp:rib-bgp"
@@ -329,18 +336,26 @@ class RoutingMixin:
             raise ValueError(f"Invalid route type {route_type}")
 
         # The rib-in-post of an EVPN route type, or the local-rib of an IP
-        # family. Up to 24.7 the family sits directly under bgp-rib and the
+        # family; or for *rib* ``out``, the rib-out-post of either. Up to 24.7 the family sits directly under bgp-rib and the
         # containers are named in the plural; from 24.10 it sits under an
         # afi-safi list entry, and the containers are singular.
         under_afi_safi = f"/bgp-rib/afi-safi[afi-safi-name={family}]/{family}"
         if family == "evpn":
             container = _EVPN_ROUTE_CONTAINERS[str(route_type)]
+            post = "rib-out-post" if rib == "out" else "rib-in-post"
             path = (
                 f"/network-instance[name={network_instance}]"
                 + (under_afi_safi if evpn_path_version == 2 else f"/bgp-rib/{family}")
-                + f"/rib-in-out/rib-in-post/{container}{'' if evpn_path_version == 2 else 's'}"
+                + f"/rib-in-out/{post}/{container}{'' if evpn_path_version == 2 else 's'}"
             )
-            steps = ("rib-in-out", "rib-in-post", container)
+            steps = ("rib-in-out", post, container)
+        elif rib == "out":
+            path = (
+                f"/network-instance[name={network_instance}]"
+                + (under_afi_safi if ip_path_version > 1 else f"/bgp-rib/{family}")
+                + f"/rib-in-out/rib-out-post/route{'s' if ip_path_version < 3 else ''}"
+            )
+            steps = ("rib-in-out", "rib-out-post", "route")
         else:
             path = (
                 f"/network-instance[name={network_instance}]"
@@ -362,12 +377,13 @@ class RoutingMixin:
             for attr_set in ni.get("bgp-rib", {}).get("attr-sets", {}).get("attr-set", []):
                 attribs[ni_name][attr_set.get("index")] = attr_set
 
-        if family in ("l3vpn-ipv4-unicast", "l3vpn-ipv6-unicast"):
+        # Leaves / platforms without IP-VPN have no l3vpn-* RIB path, and a
+        # release that keeps no rib-out-post has none for what was sent.
+        if family in ("l3vpn-ipv4-unicast", "l3vpn-ipv6-unicast") or rib == "out":
             with _suppress_pygnmi_client_logging():
                 try:
                     resp = self.get(paths=[path], datatype="state")
                 except BaseException as e:
-                    # Leaves / platforms without IP-VPN have no l3vpn-* RIB path; skip instead of failing.
                     if _gnmi_path_missing(e):
                         logger.debug(
                             "%s: no %s RIB on this node, reporting it empty: %s",
