@@ -26,6 +26,7 @@ import glob
 import json
 import logging
 import os
+import sys
 import tempfile
 from typing import Any, Dict, List, Optional, Literal
 
@@ -35,7 +36,7 @@ from nornir import InitNornir
 from nornir.core import Nornir
 from nornir.core.task import Result, Task
 
-from . import clab
+from . import DEPRECATION_NOTICE, clab
 from .changes import WATCH_REPORTS
 from .checks import CHECKS, collect_fabric_state, run_checks
 from .connections.srlinux import CONNECTION_NAME
@@ -1729,6 +1730,7 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+    print(DEPRECATION_NOTICE, file=sys.stderr)
 
     if args.topo_file and args.config_file:
         parser.error("--topo-file and --config-file are mutually exclusive")

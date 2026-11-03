@@ -4,6 +4,18 @@
 [![SR Linux](https://img.shields.io/badge/SR%20Linux-25.3.2%20%7C%2025.10.3%20%7C%2026.3.1%20%7C%2026.7.1-blue)](docs/reports.md#tested-sr-linux-releases)
 [![PyPI](https://img.shields.io/pypi/v/nornir-srl)](https://pypi.org/project/nornir-srl/)
 
+> [!WARNING]
+> **fcli is deprecated and no longer maintained. Use [fcling](https://github.com/srl-labs/fcling) instead.**
+> fcling is a ground-up rewrite of fcli: asyncio throughout, no Nornir, no blocking gNMI calls. It covers what fcli does, with the same containerlab topologies, and adds a streaming engine with history.
+>
+> ```bash
+> uv tool uninstall nornir-srl      # or: pip uninstall nornir-srl
+> uv tool install fcling            # or: pipx install fcling
+> fcling -t topo.clab.yml --help    # run fcling where you ran fcli
+> ```
+>
+> Report issues and ask for features on [srl-labs/fcling](https://github.com/srl-labs/fcling/issues). This repository will be archived.
+
 **fcli** shows a network engineer what a Nokia [SR Linux](https://www.nokia.com/ip-networks/service-router-linux-NOS/) fabric looks like, what is wrong with it, and what changed. It answers those questions from live gNMI state, with no agents or controller on the nodes.
 
 Point it at a [containerlab](https://containerlab.dev/) topology or a [Nornir](https://nornir.readthedocs.io/) inventory, and you get:

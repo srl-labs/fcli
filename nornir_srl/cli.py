@@ -34,7 +34,7 @@ from .records import as_dict
 from .reports import ReportSpec, fabric_args, get_report
 from .rows import NodeRows, Row, Table as ReportTable, cell, clean_columns, extract, pass_filter
 from .utils.logging_config import setup_logging
-from . import __version__
+from . import DEPRECATION_NOTICE, __version__
 
 
 class LogLevel(str, Enum):
@@ -393,6 +393,7 @@ def main(
         help="Show version and exit",
     ),
 ) -> None:
+    typer.secho(DEPRECATION_NOTICE, fg=typer.colors.YELLOW, err=True)
     setup_logging(log_level.value, str(log_file) if log_file else None)
     ctx.ensure_object(dict)
     if _is_help_requested():
